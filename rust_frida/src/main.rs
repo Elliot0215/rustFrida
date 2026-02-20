@@ -52,6 +52,14 @@ fn complete_state() -> &'static (Mutex<Option<Vec<String>>>, Condvar) {
     COMPLETE_RESULT.get_or_init(|| (Mutex::new(None), Condvar::new()))
 }
 
+/// Shared state for synchronous jseval request/response.
+/// The Condvar is notified when the agent returns an EVAL: or EVAL_ERR: response.
+static EVAL_RESULT: OnceLock<(Mutex<Option<std::result::Result<String, String>>>, Condvar)> = OnceLock::new();
+
+fn eval_state() -> &'static (Mutex<Option<std::result::Result<String, String>>>, Condvar) {
+    EVAL_RESULT.get_or_init(|| (Mutex::new(None), Condvar::new()))
+}
+
 /// 定义需要获取偏移的函数列表
 macro_rules! define_libc_functions {
     ($($name:ident),*) => {
@@ -571,6 +579,28 @@ fn handle_socket_connection(mut stream: UnixStream) {
                 let (lock, cvar) = complete_state();
                 if let Ok(mut guard) = lock.lock() {
                     *guard = Some(candidates);
+                    cvar.notify_all();
+                }
+            } else if trimmed.contains("EVAL_ERR:") {
+                let err_part = if let Some(pos) = trimmed.find("EVAL_ERR:") {
+                    &trimmed[pos + "EVAL_ERR:".len()..]
+                } else {
+                    ""
+                };
+                let (lock, cvar) = eval_state();
+                if let Ok(mut guard) = lock.lock() {
+                    *guard = Some(Err(err_part.to_string()));
+                    cvar.notify_all();
+                }
+            } else if trimmed.contains("EVAL:") {
+                let eval_part = if let Some(pos) = trimmed.find("EVAL:") {
+                    &trimmed[pos + "EVAL:".len()..]
+                } else {
+                    ""
+                };
+                let (lock, cvar) = eval_state();
+                if let Ok(mut guard) = lock.lock() {
+                    *guard = Some(Ok(eval_part.to_string()));
                     cvar.notify_all();
                 }
             } else {
@@ -1171,10 +1201,46 @@ fn run_js_repl(sender: &Sender<String>) {
                     println!("{DIM}退出 JS REPL 模式{RESET}");
                     break;
                 }
-                let cmd = format!("loadjs {}", line);
+                // 发送前清空 eval 状态
+                {
+                    let (lock, _) = eval_state();
+                    if let Ok(mut guard) = lock.lock() {
+                        *guard = None;
+                    }
+                }
+                let cmd = format!("jseval {}", line);
                 if let Err(e) = sender.send(cmd) {
                     log_error!("发送 JS 命令失败: {}", e);
                     break;
+                }
+                // 同步等待 agent 返回结果（最长 5 秒）
+                let (lock, cvar) = eval_state();
+                let timeout = std::time::Duration::from_secs(5);
+                let result = {
+                    let guard = match lock.lock() {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    cvar.wait_timeout_while(guard, timeout, |val| val.is_none())
+                };
+                match result {
+                    Ok((guard, timeout_result)) => {
+                        if timeout_result.timed_out() {
+                            println!("\x1b[33m[timeout] 等待执行结果超时\x1b[0m");
+                        } else if let Some(eval_result) = guard.as_ref() {
+                            match eval_result {
+                                Ok(output) => {
+                                    if !output.is_empty() {
+                                        println!("\x1b[32m=> {}\x1b[0m", output);
+                                    }
+                                },
+                                Err(err) => {
+                                    println!("\x1b[31m[JS error] {}\x1b[0m", err);
+                                }
+                            }
+                        }
+                    },
+                    Err(_) => {},
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {

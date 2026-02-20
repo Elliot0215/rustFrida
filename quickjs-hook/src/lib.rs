@@ -135,16 +135,23 @@ pub fn get_or_init_engine() -> Result<(), String> {
     Ok(())
 }
 
-/// Load and execute a JavaScript script using the global engine
-pub fn load_script(script: &str) -> Result<(), String> {
+/// Load and execute a JavaScript script using the global engine.
+/// Returns the string representation of the result, or an empty string for `undefined`.
+pub fn load_script(script: &str) -> Result<String, String> {
     let mut engine = JS_ENGINE.lock().map_err(|e| format!("Failed to lock JS engine: {}", e))?;
     if engine.is_none() {
         *engine = Some(JSEngine::new().ok_or_else(|| "Failed to create JS engine".to_string())?);
     }
     let engine = engine.as_ref().ok_or("JS engine not initialized")?;
-    engine.eval(script)?;
+    let value = engine.eval(script)?;
     engine.run_pending_jobs();
-    Ok(())
+    let result = if value.is_undefined() {
+        String::new()
+    } else {
+        value.to_string(engine.context().as_ptr()).unwrap_or_default()
+    };
+    value.free(engine.context().as_ptr());
+    Ok(result)
 }
 
 /// Cleanup the global JS engine

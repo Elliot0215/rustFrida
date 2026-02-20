@@ -233,3 +233,10 @@ JSValue qjs_exception(void) {
 JSValue qjs_uninitialized(void) {
     return JS_UNINITIALIZED;
 }
+
+/* Update stack top for cross-thread usage */
+void qjs_update_stack_top(JSContext *ctx) {
+    JSRuntime *rt = JS_GetRuntime(ctx);
+    JS_UpdateStackTop(rt);
+}
+

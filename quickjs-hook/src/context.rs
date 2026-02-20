@@ -39,6 +39,9 @@ impl JSContext {
         let cscript = CString::new(script).map_err(|e| format!("Invalid script: {}", e))?;
         let cfilename = CString::new(filename).map_err(|e| format!("Invalid filename: {}", e))?;
 
+        // Update stack top for cross-thread usage (prevents false stack overflow detection)
+        unsafe { ffi::qjs_update_stack_top(self.ptr.as_ptr()) };
+
         let val = unsafe {
             ffi::JS_Eval(
                 self.ptr.as_ptr(),

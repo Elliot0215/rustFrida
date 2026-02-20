@@ -91,6 +91,7 @@ pub fn init() -> Result<(), String> {
     });
 
     log_msg("[quickjs] Initialized successfully\n".to_string());
+
     Ok(())
 }
 
@@ -100,9 +101,9 @@ pub fn init() -> Result<(), String> {
 /// * `script` - The JavaScript code to execute
 ///
 /// # Returns
-/// * `Ok(())` on success
+/// * `Ok(String)` with the result string (empty for `undefined`) on success
 /// * `Err(String)` with error message on failure
-pub fn execute_script(script: &str) -> Result<(), String> {
+pub fn execute_script(script: &str) -> Result<String, String> {
     // Ensure engine is initialized
     if EXEC_MEM.get().is_none() {
         init()?;

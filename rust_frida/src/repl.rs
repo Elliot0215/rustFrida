@@ -1,0 +1,322 @@
+#![cfg(all(target_os = "android", target_arch = "aarch64"))]
+
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config, Context, Editor, Helper};
+use std::sync::mpsc::Sender;
+
+use crate::communication::{complete_state, eval_state};
+use crate::{log_error};
+
+/// 支持的命令列表及其说明
+pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
+    ("trace",      "[tid]",            "ptrace 指令追踪"),
+    ("jhook",      "",                 "Java/JNI hooking"),
+    ("stalker",    "[tid]",            "Frida Stalker 追踪"),
+    ("hfl",        "<module> <offset>","Interceptor hook 指定偏移"),
+    ("qfl",        "<module> <offset>","QBDI 追踪指定偏移"),
+    ("jsinit",     "",                 "初始化 QuickJS 引擎"),
+    ("loadjs",     "<script>",         "执行 JavaScript 代码"),
+    ("jsclean",    "",                 "清理 QuickJS 引擎"),
+    ("jsrepl",     "",                 "进入 JS REPL 模式（Tab 动态补全）"),
+    ("help",       "",                 "显示此帮助信息"),
+];
+
+/// Tab 补全器：仅补全第一个 token（命令名）
+pub(crate) struct CommandCompleter;
+
+impl CommandCompleter {
+    pub(crate) fn new() -> Self {
+        CommandCompleter
+    }
+}
+
+impl Completer for CommandCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        // 只在光标处于第一个 token 范围内时补全
+        let before_cursor = &line[..pos];
+        if before_cursor.contains(' ') {
+            return Ok((pos, vec![]));
+        }
+        let prefix = before_cursor;
+        let candidates: Vec<Pair> = COMMANDS
+            .iter()
+            .filter(|(cmd, _, _)| cmd.starts_with(prefix))
+            .map(|(cmd, _, _)| Pair {
+                display: cmd.to_string(),
+                replacement: cmd.to_string(),
+            })
+            .collect();
+        Ok((0, candidates))
+    }
+}
+
+impl Hinter for CommandCompleter {
+    type Hint = String;
+}
+impl Highlighter for CommandCompleter {}
+impl Validator for CommandCompleter {}
+impl Helper for CommandCompleter {}
+
+/// JS REPL 补全器：通过 socket 向 agent 发送 jscomplete 请求，同步等待结果。
+struct JsReplCompleter {
+    sender: Sender<String>,
+    /// Cache the last completion results for the hinter to display
+    last_candidates: std::cell::RefCell<(String, Vec<String>)>,
+}
+
+impl JsReplCompleter {
+    fn new(sender: Sender<String>) -> Self {
+        JsReplCompleter {
+            sender,
+            last_candidates: std::cell::RefCell::new((String::new(), vec![])),
+        }
+    }
+
+    /// Send a jscomplete request and block until the agent replies (≤2000 ms timeout).
+    fn fetch_completions(&self, prefix: &str) -> Vec<String> {
+        let (lock, cvar) = complete_state();
+
+        // 持有锁的同时 clear + send + wait，避免竞态
+        let mut guard = match lock.lock() {
+            Ok(g) => g,
+            Err(_) => return vec![],
+        };
+        *guard = None;
+
+        // Send the request
+        let cmd = format!("jscomplete {}", prefix);
+        if self.sender.send(cmd).is_err() {
+            return vec![];
+        }
+
+        // Wait for the response (up to 2000 ms)
+        // wait_timeout 会原子释放锁并等待，被唤醒后重新获取锁
+        let timeout = std::time::Duration::from_millis(2000);
+        let result = cvar.wait_timeout_while(guard, timeout, |val| val.is_none());
+        match result {
+            Ok((guard, timeout_result)) => {
+                if timeout_result.timed_out() {
+                    vec![]
+                } else {
+                    guard.clone().unwrap_or_default()
+                }
+            },
+            Err(_) => vec![],
+        }
+    }
+}
+
+impl Completer for JsReplCompleter {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let before_cursor = &line[..pos];
+
+        // Determine the replacement start position.  After the last '.' we only
+        // replace the property fragment, but we send the *full* before_cursor
+        // (e.g. "console.l") so the agent can resolve the object and enumerate
+        // its properties.
+        let (start, query) = if let Some(dot_pos) = before_cursor.rfind('.') {
+            // start is right after the dot so rustyline replaces only the property part
+            (dot_pos + 1, before_cursor)
+        } else {
+            (0, before_cursor)
+        };
+
+        let names = self.fetch_completions(query);
+        // Cache for hinter
+        *self.last_candidates.borrow_mut() = (before_cursor.to_string(), names.clone());
+
+        let candidates: Vec<Pair> = names
+            .into_iter()
+            .map(|name| Pair {
+                display: name.clone(),
+                replacement: name,
+            })
+            .collect();
+
+        Ok((start, candidates))
+    }
+}
+
+impl Hinter for JsReplCompleter {
+    type Hint = String;
+    fn hint(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        let before_cursor = &line[..pos];
+        let cache = self.last_candidates.borrow();
+        let (ref cached_prefix, ref candidates) = *cache;
+
+        // Only show hint if the current input is a prefix of the cached query
+        // and there are multiple candidates
+        if candidates.len() <= 1 || cached_prefix.is_empty() {
+            return None;
+        }
+
+        // Check if current input matches the cached prefix context
+        if !cached_prefix.starts_with(before_cursor) && !before_cursor.starts_with(cached_prefix.as_str()) {
+            return None;
+        }
+
+        // Get the property fragment after the last dot
+        let prop_part = if let Some(dot_pos) = before_cursor.rfind('.') {
+            &before_cursor[dot_pos + 1..]
+        } else {
+            before_cursor
+        };
+
+        // Filter candidates that match current typing
+        let matching: Vec<&String> = candidates.iter()
+            .filter(|c| c.starts_with(prop_part) && c.as_str() != prop_part)
+            .collect();
+
+        if matching.is_empty() {
+            return None;
+        }
+
+        // Build hint: show as " [debug|error|info|log|warn]"
+        let hint_list = matching.iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join("|");
+        Some(format!(" [{}]", hint_list))
+    }
+}
+impl Highlighter for JsReplCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        // Gray text for hint
+        std::borrow::Cow::Owned(format!("\x1b[38;5;245m{}\x1b[0m", hint))
+    }
+    fn highlight_candidate<'c>(
+        &self,
+        candidate: &'c str,
+        completion: CompletionType,
+    ) -> std::borrow::Cow<'c, str> {
+        if completion == CompletionType::List {
+            std::borrow::Cow::Owned(format!("\x1b[48;5;238m\x1b[38;5;255m{}\x1b[0m", candidate))
+        } else {
+            std::borrow::Cow::Borrowed(candidate)
+        }
+    }
+}
+impl Validator for JsReplCompleter {}
+impl Helper for JsReplCompleter {}
+
+/// 打印命令帮助表
+pub(crate) fn print_help() {
+    use crate::logger::{BOLD, CYAN, GREEN, RESET, YELLOW, DIM};
+    println!("\n{BOLD}{CYAN}可用命令:{RESET}");
+    println!("{DIM}  {:<10} {:<22} {}{RESET}", "命令", "参数", "说明");
+    println!("{DIM}  {:-<10} {:-<22} {:-<20}{RESET}", "", "", "");
+    for (cmd, args, desc) in COMMANDS {
+        println!(
+            "  {BOLD}{GREEN}{:<10}{RESET} {YELLOW}{:<22}{RESET} {}",
+            cmd, args, desc
+        );
+    }
+    println!();
+}
+
+/// Enter an interactive JS REPL mode.
+///
+/// Every line is sent as `loadjs <line>` to the agent.  Tab completion
+/// queries the live QuickJS global scope via `jscomplete`.
+/// Type `exit` or press Ctrl-D / Ctrl-C to return to the main prompt.
+pub(crate) fn run_js_repl(sender: &Sender<String>) {
+    use crate::logger::{BOLD, CYAN, DIM, RESET};
+    println!("\n{BOLD}{CYAN}进入 JS REPL 模式{RESET} {DIM}(输入 exit 或按 Ctrl-D 退出){RESET}\n");
+
+    // Clone the sender so JsReplCompleter can own it
+    let sender_clone = sender.clone();
+    let config = Config::builder()
+        .completion_type(CompletionType::Circular)
+        .build();
+    let mut rl: Editor<JsReplCompleter, _> = match Editor::with_config(config) {
+        Ok(e) => e,
+        Err(e) => {
+            log_error!("初始化 JS REPL 行编辑器失败: {}", e);
+            return;
+        }
+    };
+    rl.set_helper(Some(JsReplCompleter::new(sender_clone)));
+
+    loop {
+        match rl.readline("js> ") {
+            Ok(line) => {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(&line);
+                if line == "exit" || line == "quit" {
+                    println!("{DIM}退出 JS REPL 模式{RESET}");
+                    break;
+                }
+                // 发送前清空 eval 状态
+                {
+                    let (lock, _) = eval_state();
+                    if let Ok(mut guard) = lock.lock() {
+                        *guard = None;
+                    }
+                }
+                let cmd = format!("jseval {}", line);
+                if let Err(e) = sender.send(cmd) {
+                    log_error!("发送 JS 命令失败: {}", e);
+                    break;
+                }
+                // 同步等待 agent 返回结果（最长 5 秒）
+                let (lock, cvar) = eval_state();
+                let timeout = std::time::Duration::from_secs(5);
+                let result = {
+                    let guard = match lock.lock() {
+                        Ok(g) => g,
+                        Err(_) => continue,
+                    };
+                    cvar.wait_timeout_while(guard, timeout, |val| val.is_none())
+                };
+                match result {
+                    Ok((guard, timeout_result)) => {
+                        if timeout_result.timed_out() {
+                            println!("\x1b[33m[timeout] 等待执行结果超时\x1b[0m");
+                        } else if let Some(eval_result) = guard.as_ref() {
+                            match eval_result {
+                                Ok(output) => {
+                                    if !output.is_empty() {
+                                        println!("\x1b[32m=> {}\x1b[0m", output);
+                                    }
+                                },
+                                Err(err) => {
+                                    println!("\x1b[31m[JS error] {}\x1b[0m", err);
+                                }
+                            }
+                        }
+                    },
+                    Err(_) => {},
+                }
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                println!("{DIM}退出 JS REPL 模式{RESET}");
+                break;
+            }
+            Err(e) => {
+                log_error!("读取 JS REPL 输入失败: {}", e);
+                break;
+            }
+        }
+    }
+}

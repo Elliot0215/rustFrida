@@ -67,6 +67,9 @@ int qjs_to_index(JSContext *ctx, uint64_t *pres, JSValue val);
 int qjs_to_float64(JSContext *ctx, double *pres, JSValue val);
 int qjs_to_big_int64(JSContext *ctx, int64_t *pres, JSValue val);
 
+/* Stack top update for cross-thread usage */
+void qjs_update_stack_top(JSContext *ctx);
+
 /* Constants */
 JSValue qjs_null(void);
 JSValue qjs_undefined(void);

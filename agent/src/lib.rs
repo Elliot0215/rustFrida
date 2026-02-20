@@ -744,7 +744,11 @@ fn process_cmd(command: &str) {
                 // Run in a separate thread to avoid blocking
                 std::thread::spawn(move || {
                     match quickjs_loader::execute_script(&script) {
-                        Ok(_) => log_msg("[quickjs] Script executed successfully\n".to_string()),
+                        Ok(result) => {
+                            if !result.is_empty() {
+                                log_msg(format!("\x1b[32m=> {}\x1b[0m\n", result));
+                            }
+                        },
                         Err(e) => log_msg(format!("[quickjs] Script error: {}\n", e)),
                     }
                 });
@@ -754,6 +758,28 @@ fn process_cmd(command: &str) {
         Some("jsclean") => {
             quickjs_loader::cleanup();
             log_msg("[quickjs] Cleaned up\n".to_string());
+        },
+        #[cfg(feature = "quickjs")]
+        Some("jseval") => {
+            let script = command.strip_prefix("jseval").unwrap_or("").trim().to_string();
+            if script.is_empty() {
+                if let Some(mut stream) = GLOBAL_STREAM.get() {
+                    let _ = stream.write_all(b"EVAL_ERR:[quickjs] Error: empty script\n");
+                }
+            } else {
+                match quickjs_loader::execute_script(&script) {
+                    Ok(result) => {
+                        if let Some(mut stream) = GLOBAL_STREAM.get() {
+                            let _ = stream.write_all(format!("EVAL:{}\n", result).as_bytes());
+                        }
+                    },
+                    Err(e) => {
+                        if let Some(mut stream) = GLOBAL_STREAM.get() {
+                            let _ = stream.write_all(format!("EVAL_ERR:{}\n", e).as_bytes());
+                        }
+                    }
+                }
+            }
         },
         #[cfg(feature = "quickjs")]
         Some("jscomplete") => {
