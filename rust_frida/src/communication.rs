@@ -111,6 +111,31 @@ pub(crate) fn eval_state() -> &'static SyncChannel<std::result::Result<String, S
 pub(crate) static GLOBAL_SENDER: OnceLock<Sender<String>> = OnceLock::new();
 pub(crate) static mut AGENT_STAT: Lazy<RwLock<bool>> = Lazy::new(|| RwLock::new(false));
 
+/// 检查抽象 socket "rust_frida_socket" 是否已有监听者（表示另一个 rustfrida 实例正在运行）。
+/// 在 start_socket_listener 之前调用，连接成功则说明已有 agent 会话。
+/// 检查抽象 socket "rust_frida_socket" 是否已有监听者（表示另一个 rustfrida 实例正在运行）。
+/// 在 start_socket_listener 之前调用，连接成功则说明已有 agent 会话。
+pub(crate) fn check_agent_running() -> bool {
+    use libc::{c_char, connect, socket, AF_UNIX, SOCK_STREAM};
+    unsafe {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if fd < 0 {
+            return false;
+        }
+        let name = b"rust_frida_socket";
+        let mut addr: sockaddr_un = zeroed();
+        addr.sun_family = AF_UNIX as u16;
+        addr.sun_path[0] = 0; // abstract namespace
+        for (i, &b) in name.iter().enumerate() {
+            addr.sun_path[i + 1] = b as c_char;
+        }
+        let addr_len = (size_of_val(&addr.sun_family) + 1 + name.len()) as u32;
+        let ret = connect(fd, &addr as *const _ as *const _, addr_len);
+        libc::close(fd);
+        ret == 0
+    }
+}
+
 pub(crate) fn send_fd_over_unix_socket(
     stream: &UnixStream,
     fd_to_send: RawFd,
@@ -163,7 +188,7 @@ pub(crate) fn handle_socket_connection(mut stream: UnixStream) {
                         *(AGENT_STAT.write().unwrap()) = true;
                     }
                     while let Ok(msg) = rx.recv() {
-                        match stream_clone.write_all(msg.as_bytes()) {
+                        match stream_clone.write_all(format!("{}\n", msg).as_bytes()) {
                             Ok(_) => {}
                             Err(e) => {
                                 log_error!("stream 写入失败: {}", e);

@@ -31,6 +31,7 @@ use std::os::unix::net::UnixStream;
 use std::process;
 use std::ptr;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -242,6 +243,9 @@ fn connect_socket() -> Result<UnixStream> {
     let stream = unsafe { UnixStream::from_raw_fd(fd) };
     Ok(stream)
 }
+
+/// agent 主循环退出标志，由 shutdown 命令设置
+static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 
 static GLOBAL_STREAM: OnceLock<UnixStream> = OnceLock::new();
 static CACHE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -670,16 +674,25 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
     std::thread::sleep(Duration::from_secs(2));
     flush_cached_logs();
 
-    // 循环等待stream发送命令
+    // Fix #3: 循环等待命令，按 \n 逐行分割避免粘包
     let mut buffer = [0u8; 1024];
     loop {
         match stream.read(&mut buffer) {
             Ok(size) if size > 0 => {
-                // 处理接收到的命令
-                let command = std::str::from_utf8(&buffer[0..size]).unwrap_or("无效命令");
-                // let _ = stream.write(format!("收到命令: {}", command).as_bytes()).unwrap();
-                // 可以在这里添加命令处理逻辑
-                process_cmd(command);
+                let data = std::str::from_utf8(&buffer[0..size]).unwrap_or("");
+                for line in data.split('\n') {
+                    let line = line.trim();
+                    if !line.is_empty() {
+                        process_cmd(line);
+                    }
+                    // Fix #4: shutdown 命令设置 SHOULD_EXIT，退出主循环
+                    if SHOULD_EXIT.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                if SHOULD_EXIT.load(Ordering::Relaxed) {
+                    break;
+                }
             }
             Ok(_) => {
                 // 连接关闭
@@ -687,9 +700,7 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
             }
             Err(e) => {
                 // 读取错误
-                stream
-                    .write_all(format!("读取命令错误: {}", e).as_bytes())
-                    .unwrap();
+                let _ = stream.write_all(format!("读取命令错误: {}", e).as_bytes());
                 break;
             }
         }
@@ -790,10 +801,21 @@ fn process_cmd(command: &str) {
             log_msg("[agent] 当前构建不支持该命令，需要 qbdi feature\n".to_string());
         }
         #[cfg(feature = "quickjs")]
-        Some("jsinit") => match quickjs_loader::init() {
-            Ok(_) => log_msg("[quickjs] Engine initialized\n".to_string()),
-            Err(e) => log_msg(format!("[quickjs] Init error: {}\n", e)),
-        },
+        Some("jsinit") => {
+            // Fix #2: 通过 EVAL:/EVAL_ERR: 协议应答，host 可用 eval_state 同步等待
+            match quickjs_loader::init() {
+                Ok(_) => {
+                    if let Some(mut stream) = GLOBAL_STREAM.get() {
+                        let _ = stream.write_all(b"EVAL:initialized\n");
+                    }
+                }
+                Err(e) => {
+                    if let Some(mut stream) = GLOBAL_STREAM.get() {
+                        let _ = stream.write_all(format!("EVAL_ERR:{}\n", e).as_bytes());
+                    }
+                }
+            }
+        }
         #[cfg(feature = "quickjs")]
         Some("jsclean") => {
             if !quickjs_loader::is_initialized() {
@@ -864,6 +886,14 @@ fn process_cmd(command: &str) {
             if let Some(mut stream) = GLOBAL_STREAM.get() {
                 let _ = stream.write_all(format!("COMPLETE:{}\n", result).as_bytes());
             }
+        }
+        // Fix #4: shutdown — 清理资源并退出 agent 主循环
+        Some("shutdown") => {
+            #[cfg(feature = "quickjs")]
+            if quickjs_loader::is_initialized() {
+                quickjs_loader::cleanup();
+            }
+            SHOULD_EXIT.store(true, Ordering::Relaxed);
         }
         _ => {
             let cmd_name = command.split_whitespace().next().unwrap_or("(empty)");

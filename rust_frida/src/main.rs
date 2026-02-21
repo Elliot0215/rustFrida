@@ -10,7 +10,9 @@ mod types;
 
 use args::Args;
 use clap::Parser;
-use communication::{eval_state, start_socket_listener, AGENT_MEMFD, AGENT_STAT, GLOBAL_SENDER};
+use communication::{
+    check_agent_running, eval_state, start_socket_listener, AGENT_MEMFD, AGENT_STAT, GLOBAL_SENDER,
+};
 use injection::{create_memfd_with_data, inject_to_process, watch_and_inject, AGENT_SO};
 use libc::{close, sleep};
 use repl::{print_help, run_js_repl, CommandCompleter};
@@ -20,8 +22,10 @@ use std::sync::atomic::Ordering;
 use types::get_string_table_names;
 
 fn main() {
-    logger::print_banner();
+    // Fix #8: 先解析参数（--help/--version 在此退出），再打印 banner
     let args = Args::parse();
+    logger::print_banner();
+
     // 初始化 verbose 模式
     logger::VERBOSE.store(args.verbose, Ordering::Relaxed);
 
@@ -35,6 +39,12 @@ fn main() {
             log_error!("创建 agent.so memfd 失败: {}", e);
             std::process::exit(1);
         }
+    }
+
+    // Fix #5: 注入前检测是否已有 agent 连接（另一个 rustfrida 实例正在运行）
+    if check_agent_running() {
+        log_warn!("警告: 检测到已有 agent 连接，目标进程可能已被注入！");
+        log_warn!("继续注入可能导致多个 agent 并存，建议先终止旧会话");
     }
 
     // 启动抽象套接字监听
@@ -69,15 +79,12 @@ fn main() {
     }
 
     // 根据参数选择注入方式
+    // Fix #9: pid 已由 args.rs value_parser 验证为正整数，无需重复检查
     let result = if let Some(so_pattern) = &args.watch_so {
         // 使用 eBPF 监听 SO 加载
         watch_and_inject(so_pattern, args.timeout, &string_overrides)
     } else if let Some(pid) = args.pid {
         // 直接附加到指定 PID
-        if pid <= 0 {
-            log_error!("PID必须是正整数");
-            std::process::exit(1);
-        }
         inject_to_process(pid, &string_overrides)
     } else {
         log_error!("必须指定 --pid 或 --watch-so");
@@ -90,28 +97,53 @@ fn main() {
     }
 
     unsafe {
-        while *(AGENT_STAT.read().unwrap()) == false {
+        while !*(AGENT_STAT.read().unwrap()) {
             sleep(1);
             log_info!("等待 agent 连接...");
         }
     }
     let sender = GLOBAL_SENDER.get().unwrap();
 
-    // If a script file was specified, load and send it
+    // Fix #2 & #7: --load-script 用 eval_state 等待 jsinit/loadjs 确认，而非 sleep(1)
     if let Some(script_path) = &args.load_script {
         match std::fs::read_to_string(script_path) {
             Ok(script) => {
                 log_info!("加载脚本: {}", script_path);
-                // First initialize the JS engine
+
+                // 等待 jsinit 确认引擎就绪
+                eval_state().clear();
                 if let Err(e) = sender.send("jsinit".to_string()) {
                     log_error!("发送 jsinit 失败: {}", e);
-                }
-                // Wait a bit for initialization
-                unsafe { sleep(1) };
-                // Send the script
-                let cmd = format!("loadjs {}", script);
-                if let Err(e) = sender.send(cmd) {
-                    log_error!("发送 loadjs 失败: {}", e);
+                } else {
+                    match eval_state().recv_timeout(std::time::Duration::from_secs(10)) {
+                        None => log_warn!("等待引擎初始化超时"),
+                        Some(Err(e)) => log_error!("引擎初始化失败: {}", e),
+                        Some(Ok(_)) => {
+                            // 引擎就绪，发送脚本
+                            // 用 \r 替换 \n 避免按行分割协议误判（JS 将 \r 视为行终止符）
+                            let script_line = script.replace('\n', "\r");
+                            eval_state().clear();
+                            let cmd = format!("loadjs {}", script_line);
+                            if let Err(e) = sender.send(cmd) {
+                                log_error!("发送 loadjs 失败: {}", e);
+                            } else {
+                                // 等待脚本执行结果
+                                match eval_state()
+                                    .recv_timeout(std::time::Duration::from_secs(30))
+                                {
+                                    None => log_warn!("等待脚本执行结果超时"),
+                                    Some(Ok(output)) => {
+                                        if !output.is_empty() {
+                                            println!("\x1b[32m=> {}\x1b[0m", output);
+                                        }
+                                    }
+                                    Some(Err(err)) => {
+                                        println!("\x1b[31m[JS error] {}\x1b[0m", err)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -133,6 +165,13 @@ fn main() {
         crate::logger::DIM,
         crate::logger::RESET
     );
+
+    // 发送 shutdown 到 agent 并短暂等待消息送达
+    let send_shutdown = |s: &std::sync::mpsc::Sender<String>| {
+        let _ = s.send("shutdown".to_string());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    };
+
     loop {
         match rl.readline("rustfrida> ") {
             Ok(line) => {
@@ -147,6 +186,8 @@ fn main() {
                 }
                 if line == "exit" || line == "quit" {
                     log_info!("退出交互模式");
+                    // Fix #4: 退出前通知 agent 清理并退出
+                    send_shutdown(sender);
                     break;
                 }
                 if line == "jsrepl" {
@@ -163,8 +204,10 @@ fn main() {
                         continue;
                     }
                 }
-                let is_jseval = line.starts_with("jseval ");
-                if is_jseval {
+                // Fix #1: loadjs 和 jseval 都等待 EVAL:/EVAL_ERR: 响应并显示结果
+                let is_eval_cmd =
+                    line.starts_with("jseval ") || line.starts_with("loadjs ");
+                if is_eval_cmd {
                     eval_state().clear();
                 }
                 match sender.send(line) {
@@ -174,7 +217,7 @@ fn main() {
                         break;
                     }
                 }
-                if is_jseval {
+                if is_eval_cmd {
                     match eval_state().recv_timeout(std::time::Duration::from_secs(5)) {
                         None => println!("\x1b[33m[timeout] 等待执行结果超时\x1b[0m"),
                         Some(Ok(output)) => {
@@ -188,6 +231,7 @@ fn main() {
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                 log_info!("退出交互模式");
+                send_shutdown(sender);
                 break;
             }
             Err(e) => {
@@ -196,6 +240,7 @@ fn main() {
             }
         }
     }
+
     // 等待监听线程退出
     handle.unwrap().join().unwrap();
 

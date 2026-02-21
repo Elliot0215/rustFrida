@@ -7,25 +7,40 @@ use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use std::sync::mpsc::Sender;
+use std::sync::OnceLock;
 
 use crate::communication::{complete_state, eval_state};
 use crate::log_error;
 
-/// 支持的命令列表及其说明
-pub(crate) const COMMANDS: &[(&str, &str, &str)] = &[
-    ("trace", "[tid]", "ptrace 指令追踪"),
-    ("jhook", "", "Java/JNI hooking"),
-    ("stalker", "[tid]", "Frida Stalker 追踪"),
-    ("hfl", "<module> <offset>", "Interceptor hook 指定偏移"),
-    ("qfl", "<module> <offset>", "QBDI 追踪指定偏移"),
-    ("jsinit", "", "初始化 QuickJS 引擎"),
-    ("loadjs", "<script>", "执行 JavaScript 代码"),
-    ("jsclean", "", "清理 QuickJS 引擎"),
-    ("jsrepl", "", "进入 JS REPL 模式（Tab 动态补全）"),
-    ("help", "", "显示此帮助信息"),
-    ("exit", "", "退出程序"),
-    ("quit", "", "退出程序"),
-];
+/// 当前构建实际可用的命令列表（编译时由 feature 控制）
+pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)] {
+    static CMDS: OnceLock<Vec<(&'static str, &'static str, &'static str)>> = OnceLock::new();
+    CMDS.get_or_init(|| {
+        #[allow(unused_mut)]
+        let mut v: Vec<(&'static str, &'static str, &'static str)> = vec![
+            ("trace", "[tid]", "ptrace 指令追踪"),
+            ("jhook", "", "Java/JNI hooking"),
+            ("jsinit", "", "初始化 QuickJS 引擎"),
+            ("loadjs", "<script>", "执行 JavaScript 代码"),
+            ("jseval", "<expr>", "求值 JS 表达式并显示结果"),
+            ("jsclean", "", "清理 QuickJS 引擎"),
+            ("jsrepl", "", "进入 JS REPL 模式（Tab 动态补全）"),
+            ("help", "", "显示此帮助信息"),
+            ("exit", "", "退出程序"),
+            ("quit", "", "退出程序"),
+        ];
+        #[cfg(feature = "frida-gum")]
+        {
+            v.push(("stalker", "[tid]", "Frida Stalker 追踪"));
+            v.push(("hfl", "<module> <offset>", "Interceptor hook 指定偏移"));
+        }
+        #[cfg(feature = "qbdi")]
+        {
+            v.push(("qfl", "<module> <offset>", "QBDI 追踪指定偏移"));
+        }
+        v
+    })
+}
 
 /// Tab 补全器：仅补全第一个 token（命令名）
 pub(crate) struct CommandCompleter;
@@ -51,7 +66,7 @@ impl Completer for CommandCompleter {
             return Ok((pos, vec![]));
         }
         let prefix = before_cursor;
-        let candidates: Vec<Pair> = COMMANDS
+        let candidates: Vec<Pair> = commands()
             .iter()
             .filter(|(cmd, _, _)| cmd.starts_with(prefix))
             .map(|(cmd, _, _)| Pair {
@@ -209,7 +224,7 @@ pub(crate) fn print_help() {
     println!("\n{BOLD}{CYAN}可用命令:{RESET}");
     println!("{DIM}  {:<10} {:<22} {}{RESET}", "命令", "参数", "说明");
     println!("{DIM}  {:-<10} {:-<22} {:-<20}{RESET}", "", "", "");
-    for (cmd, args, desc) in COMMANDS {
+    for (cmd, args, desc) in commands() {
         println!(
             "  {BOLD}{GREEN}{:<10}{RESET} {YELLOW}{:<22}{RESET} {}",
             cmd, args, desc

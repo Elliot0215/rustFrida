@@ -2,12 +2,26 @@
 
 use clap::Parser;
 
+fn parse_pid(s: &str) -> std::result::Result<i32, String> {
+    match s.parse::<i32>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err("PID 必须是正整数".to_string()),
+    }
+}
+
 /// 命令行参数结构体
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Args {
     /// 目标进程的PID（与 --watch-so 互斥）
-    #[arg(short, long, required_unless_present = "watch_so", conflicts_with = "watch_so")]
+    #[arg(
+        short,
+        long,
+        required_unless_present = "watch_so",
+        conflicts_with = "watch_so",
+        allow_hyphen_values = true,
+        value_parser = parse_pid
+    )]
     pub(crate) pid: Option<i32>,
 
     /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程

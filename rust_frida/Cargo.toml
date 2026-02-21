@@ -1,3 +1,7 @@
+[features]
+frida-gum = []
+qbdi = []
+
 [package]
 name = "rust_frida"
 version = "0.1.0"
