@@ -529,8 +529,18 @@ void arm64_writer_put_add_reg_reg_imm(Arm64Writer* w, Arm64Reg dst, Arm64Reg src
         /* ADD with shift=1 (LSL #12) */
         uint32_t insn = (sf << 31) | 0x11400000 | ((uint32_t)(imm >> 12) << 10) | (rn << 5) | rd;
         arm64_writer_put_insn(w, insn);
+    } else if ((imm >> 12) <= 0xFFF) {
+        /* Both hi12 and lo12 are non-zero: emit two ADD instructions.
+         * First:  ADD Xd, Xn, #hi12, LSL #12
+         * Second: ADD Xd, Xd, #lo12           (note: src for 2nd is rd, not rn) */
+        uint32_t hi12 = (uint32_t)(imm >> 12) & 0xFFF;
+        uint32_t lo12 = (uint32_t)(imm & 0xFFF);
+        uint32_t insn1 = (sf << 31) | 0x11400000 | (hi12 << 10) | (rn << 5) | rd;
+        uint32_t insn2 = (sf << 31) | 0x11000000 | (lo12 << 10) | (rd << 5) | rd;
+        arm64_writer_put_insn(w, insn1);
+        arm64_writer_put_insn(w, insn2);
     }
-    /* TODO: Handle larger immediates with multiple instructions */
+    /* Immediates > 24 bits are not handled; callers must use register form. */
 }
 
 void arm64_writer_put_add_reg_reg_reg(Arm64Writer* w, Arm64Reg dst, Arm64Reg left, Arm64Reg right) {
@@ -557,7 +567,18 @@ void arm64_writer_put_sub_reg_reg_imm(Arm64Writer* w, Arm64Reg dst, Arm64Reg src
         /* SUB with shift=1 (LSL #12) */
         uint32_t insn = (sf << 31) | 0x51400000 | ((uint32_t)(imm >> 12) << 10) | (rn << 5) | rd;
         arm64_writer_put_insn(w, insn);
+    } else if ((imm >> 12) <= 0xFFF) {
+        /* Both hi12 and lo12 are non-zero: emit two SUB instructions.
+         * First:  SUB Xd, Xn, #hi12, LSL #12
+         * Second: SUB Xd, Xd, #lo12           (note: src for 2nd is rd, not rn) */
+        uint32_t hi12 = (uint32_t)(imm >> 12) & 0xFFF;
+        uint32_t lo12 = (uint32_t)(imm & 0xFFF);
+        uint32_t insn1 = (sf << 31) | 0x51400000 | (hi12 << 10) | (rn << 5) | rd;
+        uint32_t insn2 = (sf << 31) | 0x51000000 | (lo12 << 10) | (rd << 5) | rd;
+        arm64_writer_put_insn(w, insn1);
+        arm64_writer_put_insn(w, insn2);
     }
+    /* Immediates > 24 bits are not handled; callers must use register form. */
 }
 
 void arm64_writer_put_sub_reg_reg_reg(Arm64Writer* w, Arm64Reg dst, Arm64Reg left, Arm64Reg right) {
