@@ -70,25 +70,38 @@ unsafe extern "C" fn hook_callback_wrapper(
 
     let target_addr = user_data as u64;
 
-    // Get the stored callback — use ok() to avoid panic on mutex poison in signal context
-    let guard = match HOOK_REGISTRY.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let registry = match guard.as_ref() {
-        Some(r) => r,
-        None => return,
-    };
+    // Copy callback data then release the lock before QuickJS operations.
+    // Holding the registry lock during JS_Call risks deadlock if the JS callback
+    // itself tries to hook/unhook. Also avoids holding a lock during potentially
+    // blocking QuickJS execution.
+    let (ctx_usize, callback_bytes) = {
+        let guard = match HOOK_REGISTRY.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let registry = match guard.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let hook_data = match registry.get(&target_addr) {
+            Some(d) => d,
+            None => return,
+        };
+        (hook_data.ctx, hook_data.callback_bytes)
+    }; // HOOK_REGISTRY lock released here
 
-    let hook_data = match registry.get(&target_addr) {
-        Some(d) => d,
-        None => return,
-    };
-
-    let ctx = hook_data.ctx as *mut ffi::JSContext;
+    let ctx = ctx_usize as *mut ffi::JSContext;
     // Reconstruct JSValue from bytes
     let callback: ffi::JSValue =
-        std::ptr::read(hook_data.callback_bytes.as_ptr() as *const ffi::JSValue);
+        std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
+
+    // CRITICAL: Update QuickJS stack top before ANY QuickJS operations.
+    // This hook callback fires in the hooked thread's context, which has a
+    // different stack than the JS-init thread. Without this call, QuickJS's
+    // stack-overflow check compares the current SP against the JS thread's
+    // stack_top, sees a huge difference, falsely detects overflow, tries to
+    // throw an exception, recurses, and crashes with SIGSEGV.
+    ffi::qjs_update_stack_top(ctx);
 
     // Create context object for JS callback
     let js_ctx = ffi::JS_NewObject(ctx);
