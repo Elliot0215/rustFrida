@@ -222,25 +222,32 @@ fn process_cmd(command: &str) {
         },
         #[cfg(feature = "quickjs")]
         Some("jsinit") => {
+            // Fix #2: 通过 EVAL:/EVAL_ERR: 协议应答，host 可用 eval_state 同步等待
             match quickjs_loader::init() {
-                Ok(_) => log_msg("[quickjs] Engine initialized\n".to_string()),
-                Err(e) => log_msg(format!("[quickjs] Init error: {}\n", e)),
+                Ok(_) => write_stream(b"EVAL:initialized\n"),
+                Err(e) => write_stream(format!("EVAL_ERR:{}\n", e).as_bytes()),
             }
         },
         #[cfg(feature = "quickjs")]
         Some("loadjs") => {
-            // Extract the script (everything after "loadjs ")
-            let script = command.strip_prefix("loadjs").unwrap_or("").trim().to_string();
+            // 同步执行并通过 EVAL:/EVAL_ERR: 协议返回结果
+            let script = command
+                .strip_prefix("loadjs")
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if script.is_empty() {
-                log_msg("[quickjs] Error: empty script\n".to_string());
+                write_stream(b"EVAL_ERR:[quickjs] Error: empty script\n");
+            } else if !quickjs_loader::is_initialized() {
+                write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes());
             } else {
-                // Run in a separate thread to avoid blocking
-                std::thread::spawn(move || {
-                    match quickjs_loader::execute_script(&script) {
-                        Ok(_) => log_msg("[quickjs] Script executed successfully\n".to_string()),
-                        Err(e) => log_msg(format!("[quickjs] Script error: {}\n", e)),
+                match quickjs_loader::execute_script(&script) {
+                    Ok(result) => write_stream(format!("EVAL:{}\n", result).as_bytes()),
+                    Err(e) => {
+                        let e = e.replace('\n', "\r");
+                        write_stream(format!("EVAL_ERR:{}\n", e).as_bytes());
                     }
-                });
+                }
             }
         },
         #[cfg(feature = "quickjs")]
@@ -274,9 +281,13 @@ fn process_cmd(command: &str) {
         }
         #[cfg(feature = "quickjs")]
         Some("jsclean") => {
-            quickjs_loader::cleanup();
-            log_msg("[quickjs] Cleaned up\n".to_string());
-        },
+            if !quickjs_loader::is_initialized() {
+                write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化\n".as_bytes());
+            } else {
+                quickjs_loader::cleanup();
+                write_stream(b"EVAL:cleaned up\n");
+            }
+        }
         // shutdown — 清理资源并退出 agent 主循环
         Some("shutdown") => {
             #[cfg(feature = "quickjs")]
