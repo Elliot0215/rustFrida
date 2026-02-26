@@ -1,7 +1,8 @@
 /* QBDI 动态二进制插装功能模块 */
 #![cfg(feature = "qbdi")]
 
-use crate::{log_msg, OUTPUT_PATH};
+use crate::communication::log_msg;
+use crate::OUTPUT_PATH;
 use crossbeam_channel::{bounded, Sender};
 use lazy_static::lazy_static;
 use prost::Message;
@@ -13,17 +14,17 @@ use std::ptr::null_mut;
 use std::sync::OnceLock;
 use std::thread;
 
+use qbdi::{FPRState, GPRState, RWord, VMAction, VirtualStack, VM, VMRef};
 use qbdi::ffi::{
-    InstPosition_QBDI_PREINST, MemoryAccessType_QBDI_MEMORY_READ, VMAction_QBDI_CONTINUE,
-    VMEvent_QBDI_EXEC_TRANSFER_RETURN, VMInstanceRef,
+    InstPosition_QBDI_PREINST, VMAction_QBDI_CONTINUE, VMInstanceRef,
+    MemoryAccessType_QBDI_MEMORY_READ, VMEvent_QBDI_EXEC_TRANSFER_RETURN,
 };
-use qbdi::{FPRState, GPRState, RWord, VMAction, VMRef, VirtualStack, VM};
 
 // 条件编译：仅在同时启用 frida-gum 时才引入这些依赖
 #[cfg(feature = "frida-gum")]
-use crate::stalker::{get_interceptor, GLOBAL_ORIGINAL, GLOBAL_TARGET, GUM};
-#[cfg(feature = "frida-gum")]
 use frida_gum::{NativePointer, Process};
+#[cfg(feature = "frida-gum")]
+use crate::stalker::{get_interceptor, GUM, GLOBAL_TARGET, GLOBAL_ORIGINAL};
 
 // 内存访问记录
 #[derive(Clone, PartialEq, Message)]
@@ -60,126 +61,85 @@ pub static GLOBAL_TARGET: OnceLock<usize> = OnceLock::new();
 #[cfg(not(feature = "frida-gum"))]
 pub static GLOBAL_ORIGINAL: OnceLock<usize> = OnceLock::new();
 
+/// 通用文件日志通道：创建一个有界通道和后台写入线程
+///
+/// - `filename`: 日志文件名（拼接到 OUTPUT_PATH 下）
+/// - `desc`: 日志描述（用于错误消息）
+/// - `encode`: 将消息 T 编码为字节的闭包
+///
+/// 返回 Sender<T>，发送端用于回调中投递消息
+fn file_log_channel<T: Send + 'static>(
+    filename: &'static str,
+    desc: &'static str,
+    encode: fn(&T) -> Option<Vec<u8>>,
+) -> Sender<T> {
+    let (sender, receiver) = bounded::<T>(100000);
+
+    thread::spawn(move || {
+        let log_path = match OUTPUT_PATH.get() {
+            Some(base) => format!("{}/{}", base, filename),
+            None => {
+                log_msg(format!("错误: OUTPUT_PATH 未设置，无法创建{}日志文件", desc));
+                return;
+            }
+        };
+
+        let mut log_file = match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log_msg(format!("无法打开{}日志文件 {}: {}", desc, log_path, e));
+                return;
+            }
+        };
+
+        while let Ok(msg) = receiver.recv() {
+            match encode(&msg) {
+                Some(buf) => {
+                    if let Err(e) = log_file.write_all(&buf) {
+                        log_msg(format!("写入{}日志失败: {}", desc, e));
+                    }
+                }
+                None => {
+                    log_msg(format!("{} 编码失败", desc));
+                }
+            }
+        }
+        let _ = log_file.flush();
+    });
+
+    sender
+}
+
+/// 将 protobuf Message 编码为 length-delimited 字节
+fn encode_protobuf<M: Message>(msg: &M) -> Option<Vec<u8>> {
+    let mut buf = Vec::new();
+    msg.encode_length_delimited(&mut buf).ok()?;
+    Some(buf)
+}
+
 lazy_static! {
     // QBDI 地址发送通道
     static ref QBDI_ADDR_SENDER: Sender<RWord> = {
-        let (sender, receiver) = bounded::<RWord>(100000);
-
-        thread::spawn(move || {
-            let log_path = match OUTPUT_PATH.get() {
-                Some(base) => format!("{}/trace.pb", base),
-                None => {
-                    log_msg("错误: OUTPUT_PATH 未设置，无法创建 QBDI 日志文件".to_string());
-                    return;
-                }
-            };
-
-            let mut log_file = match OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&log_path)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    log_msg(format!("无法打开 QBDI 日志文件 {}: {}", log_path, e));
-                    return;
-                }
-            };
-
-            while let Ok(addr) = receiver.recv() {
-                if let Err(e) = log_file.write_all(&addr.to_le_bytes()) {
-                    log_msg(format!("写入 QBDI 日志失败: {}", e));
-                }
-            }
-            let _ = log_file.flush();
-        });
-
-        sender
+        file_log_channel(
+            "trace.pb",
+            "QBDI",
+            |addr: &RWord| Some(addr.to_le_bytes().to_vec()),
+        )
     };
 
     // 内存访问记录通道
     static ref MEM_ACCESS_SENDER: Sender<MemAccess> = {
-        let (sender, receiver) = bounded::<MemAccess>(100000);
-
-        thread::spawn(move || {
-            let log_path = match OUTPUT_PATH.get() {
-                Some(base) => format!("{}/mem_access.pb", base),
-                None => {
-                    log_msg("错误: OUTPUT_PATH 未设置，无法创建内存访问日志文件".to_string());
-                    return;
-                }
-            };
-
-            let mut log_file = match OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&log_path)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    log_msg(format!("无法打开内存访问日志文件 {}: {}", log_path, e));
-                    return;
-                }
-            };
-
-            while let Ok(mem_acc) = receiver.recv() {
-                let mut buf = Vec::new();
-                if let Err(e) = mem_acc.encode_length_delimited(&mut buf) {
-                    log_msg(format!("MemAccess 编码失败: {}", e));
-                    continue;
-                }
-                if let Err(e) = log_file.write_all(&buf) {
-                    log_msg(format!("写入内存访问日志失败: {}", e));
-                }
-            }
-            let _ = log_file.flush();
-        });
-
-        sender
+        file_log_channel("mem_access.pb", "内存访问", encode_protobuf)
     };
 
     // 外部调用返回记录通道
     static ref EXTERNAL_RETURN_SENDER: Sender<ExternalReturn> = {
-        let (sender, receiver) = bounded::<ExternalReturn>(100000);
-
-        thread::spawn(move || {
-            let log_path = match OUTPUT_PATH.get() {
-                Some(base) => format!("{}/external_return.pb", base),
-                None => {
-                    log_msg("错误: OUTPUT_PATH 未设置，无法创建外部返回日志文件".to_string());
-                    return;
-                }
-            };
-
-            let mut log_file = match OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&log_path)
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    log_msg(format!("无法打开外部返回日志文件 {}: {}", log_path, e));
-                    return;
-                }
-            };
-
-            while let Ok(ext_ret) = receiver.recv() {
-                let mut buf = Vec::new();
-                if let Err(e) = ext_ret.encode_length_delimited(&mut buf) {
-                    log_msg(format!("ExternalReturn 编码失败: {}", e));
-                    continue;
-                }
-                if let Err(e) = log_file.write_all(&buf) {
-                    log_msg(format!("写入外部返回日志失败: {}", e));
-                }
-            }
-            let _ = log_file.flush();
-        });
-
-        sender
+        file_log_channel("external_return.pb", "外部返回", encode_protobuf)
     };
 }
 
@@ -257,9 +217,7 @@ extern "C" fn exec_transfer_return_cb(
 /// QBDI 替换回调（需要 frida-gum 支持时使用）
 #[cfg(feature = "frida-gum")]
 pub extern "C" fn replaceq(jenv: RWord, jobj: RWord) -> RWord {
-    get_interceptor().revert(NativePointer(
-        GLOBAL_TARGET.get().unwrap().clone() as *mut c_void
-    ));
+    get_interceptor().revert(NativePointer(GLOBAL_TARGET.get().unwrap().clone() as *mut c_void));
     log_msg(format!("replaceq: arg1=0x{:x}, arg2=0x{:x}\n", jenv, jobj));
 
     let value: u64;
@@ -301,8 +259,9 @@ pub extern "C" fn replaceq(jenv: RWord, jobj: RWord) -> RWord {
                 ret
             } else {
                 log_msg("QBDI vm.run() also failed, calling original".to_string());
-                let orig: extern "C" fn(RWord, RWord) -> RWord =
-                    unsafe { std::mem::transmute(*GLOBAL_ORIGINAL.get().unwrap()) };
+                let orig: extern "C" fn(RWord, RWord) -> RWord = unsafe {
+                    std::mem::transmute(*GLOBAL_ORIGINAL.get().unwrap())
+                };
                 orig(jenv, jobj)
             }
         }
@@ -326,17 +285,8 @@ pub fn qfollow(lib: &str, addr: usize) {
 
     // 添加回调
     vm.add_code_cb(InstPosition_QBDI_PREINST, Some(qbdicb), null_mut(), 0);
-    vm.add_mem_access_cb(
-        MemoryAccessType_QBDI_MEMORY_READ,
-        Some(mem_acc_cb),
-        null_mut(),
-        0,
-    );
-    vm.add_vm_event_cb(
-        VMEvent_QBDI_EXEC_TRANSFER_RETURN,
-        Some(exec_transfer_return_cb),
-        null_mut(),
-    );
+    vm.add_mem_access_cb(MemoryAccessType_QBDI_MEMORY_READ, Some(mem_acc_cb), null_mut(), 0);
+    vm.add_vm_event_cb(VMEvent_QBDI_EXEC_TRANSFER_RETURN, Some(exec_transfer_return_cb), null_mut());
 
     // 存储 VM 到全局变量
     let _ = GLOBAL_VM.set(VMCell(UnsafeCell::new(vm)));
@@ -345,7 +295,7 @@ pub fn qfollow(lib: &str, addr: usize) {
     match interceptor.replace(
         NativePointer(target as *mut c_void),
         NativePointer(replaceq as *mut c_void),
-        NativePointer(null_mut()),
+        NativePointer(null_mut())
     ) {
         Ok(original) => {
             let _ = GLOBAL_ORIGINAL.set(original.0 as usize);

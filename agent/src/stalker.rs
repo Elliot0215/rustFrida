@@ -1,7 +1,8 @@
 /* frida-gum stalker 功能模块 */
 #![cfg(feature = "frida-gum")]
 
-use crate::{log_msg, write_stream, OUTPUT_PATH};
+use crate::communication::{log_msg, write_stream};
+use crate::OUTPUT_PATH;
 use crossbeam_channel::{bounded, Sender};
 use frida_gum::interceptor::{Interceptor, InvocationContext, InvocationListener, ProbeListener};
 use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
@@ -11,12 +12,12 @@ use prost::Message;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::ffi::CString;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::ptr::null_mut;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::ffi::CString;
 
 // Android log priority levels
 const ANDROID_LOG_INFO: i32 = 4;
@@ -66,38 +67,6 @@ struct InstrMessage {
     bytes: Vec<u8>,
     #[prost(message, repeated, tag = "3")]
     ctx: Vec<RegChange>,
-}
-
-// 内存区域信息
-#[derive(Clone, PartialEq, Message)]
-struct MemoryRegion {
-    #[prost(uint64, tag = "1")]
-    start_addr: u64,
-    #[prost(uint64, tag = "2")]
-    end_addr: u64,
-    #[prost(string, tag = "3")]
-    permissions: String,
-    #[prost(uint64, tag = "4")]
-    offset: u64,
-    #[prost(string, tag = "5")]
-    dev: String,
-    #[prost(uint64, tag = "6")]
-    inode: u64,
-    #[prost(string, tag = "7")]
-    pathname: String,
-    #[prost(bytes, tag = "8")]
-    data: Vec<u8>,
-}
-
-// 内存快照头部信息
-#[derive(Clone, PartialEq, Message)]
-struct SnapshotHeader {
-    #[prost(uint64, tag = "1")]
-    timestamp: u64,
-    #[prost(uint32, tag = "2")]
-    pid: u32,
-    #[prost(uint32, tag = "3")]
-    region_count: u32,
 }
 
 // 全局 Stalker 包装器
@@ -163,185 +132,21 @@ lazy_static! {
     };
 }
 
-// 解析 /proc/self/maps 中的单行
-fn parse_maps_line(line: &str) -> Option<(u64, u64, String, u64, String, u64, String)> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() < 5 {
-        return None;
-    }
-
-    let addr_range: Vec<&str> = parts[0].split('-').collect();
-    if addr_range.len() != 2 {
-        return None;
-    }
-    let start_addr = u64::from_str_radix(addr_range[0], 16).ok()?;
-    let end_addr = u64::from_str_radix(addr_range[1], 16).ok()?;
-    let permissions = parts[1].to_string();
-    let offset = u64::from_str_radix(parts[2], 16).ok()?;
-    let dev = parts[3].to_string();
-    let inode = parts[4].parse::<u64>().ok()?;
-    let pathname = if parts.len() > 5 {
-        parts[5..].join(" ")
-    } else {
-        String::new()
-    };
-
-    Some((
-        start_addr,
-        end_addr,
-        permissions,
-        offset,
-        dev,
-        inode,
-        pathname,
-    ))
-}
-
-const MEMORY_CHUNK_SIZE: usize = 4 * 1024 * 1024;
-
-fn write_memory_region_chunked<W: Write>(
-    output: &mut W,
-    start_addr: u64,
-    end_addr: u64,
-    permissions: &str,
-    offset: u64,
-    pathname: &str,
-) -> std::io::Result<()> {
-    let total_size = (end_addr - start_addr) as usize;
-    let mut current_addr = start_addr;
-    let mut current_offset = offset;
-    let mut chunk_index = 0u32;
-
-    while current_addr < end_addr {
-        let remaining = (end_addr - current_addr) as usize;
-        let chunk_size = remaining.min(MEMORY_CHUNK_SIZE);
-        let chunk_end = current_addr + chunk_size as u64;
-
-        let data = unsafe {
-            let ptr = current_addr as *const u8;
-            let slice = std::slice::from_raw_parts(ptr, chunk_size);
-            slice.to_vec()
-        };
-
-        let region = MemoryRegion {
-            start_addr: current_addr,
-            end_addr: chunk_end,
-            permissions: permissions.to_string(),
-            offset: current_offset,
-            dev: String::new(),
-            inode: chunk_index as u64,
-            pathname: if total_size > MEMORY_CHUNK_SIZE {
-                format!("{}#chunk{}", pathname, chunk_index)
-            } else {
-                pathname.to_string()
-            },
-            data,
-        };
-
-        let mut region_buf = Vec::with_capacity(chunk_size + 256);
-        region
-            .encode_length_delimited(&mut region_buf)
-            .map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, format!("Region 编码失败: {}", e))
-            })?;
-        output.write_all(&region_buf)?;
-
-        current_addr = chunk_end;
-        current_offset += chunk_size as u64;
-        chunk_index += 1;
-    }
-
-    Ok(())
-}
-
-fn dump_memory_snapshot(output_path: &str) -> std::io::Result<()> {
-    use std::io::BufRead;
-
-    let maps_file = File::open("/proc/self/maps")?;
-    let reader = std::io::BufReader::new(maps_file);
-
-    let mut regions_to_dump: Vec<(u64, u64, String, u64, String, u64, String)> = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if let Some((start_addr, end_addr, permissions, offset, dev, inode, pathname)) =
-            parse_maps_line(&line)
-        {
-            if ((pathname.contains(".so") && pathname.contains("/data"))
-                || pathname.contains("base.apk"))
-                && permissions.contains('r')
-            {
-                regions_to_dump.push((
-                    start_addr,
-                    end_addr,
-                    permissions,
-                    offset,
-                    dev,
-                    inode,
-                    pathname,
-                ));
-            }
-        }
-    }
-
-    let mut output_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(output_path)?;
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let pid = std::process::id();
-
-    let header = SnapshotHeader {
-        timestamp,
-        pid,
-        region_count: regions_to_dump.len() as u32,
-    };
-    let mut header_buf = Vec::new();
-    header
-        .encode_length_delimited(&mut header_buf)
-        .map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("Header 编码失败: {}", e))
-        })?;
-    output_file.write_all(&header_buf)?;
-
-    for (start_addr, end_addr, permissions, offset, _dev, _inode, pathname) in regions_to_dump {
-        if let Err(e) = write_memory_region_chunked(
-            &mut output_file,
-            start_addr,
-            end_addr,
-            &permissions,
-            offset,
-            &pathname,
-        ) {
-            log_msg(format!(
-                "写入内存区域失败 0x{:x}-0x{:x}: {}",
-                start_addr, end_addr, e
-            ));
-            continue;
-        }
-    }
-
-    output_file.flush()?;
-    Ok(())
-}
-
 /// 获取全局 Stalker
 #[inline]
 pub fn get_stalker() -> &'static mut Stalker {
-    let cell = GLOBAL_STALKER.get_or_init(|| StalkerCell(UnsafeCell::new(Stalker::new(&GUM))));
+    let cell = GLOBAL_STALKER.get_or_init(|| {
+        StalkerCell(UnsafeCell::new(Stalker::new(&GUM)))
+    });
     unsafe { &mut *cell.0.get() }
 }
 
 /// 获取全局 Interceptor
 #[inline]
 pub fn get_interceptor() -> &'static mut Interceptor {
-    let cell = GLOBAL_INTERCEPTOR
-        .get_or_init(|| InterceptorCell(UnsafeCell::new(Interceptor::obtain(&GUM))));
+    let cell = GLOBAL_INTERCEPTOR.get_or_init(|| {
+        InterceptorCell(UnsafeCell::new(Interceptor::obtain(&GUM)))
+    });
     unsafe { &mut *cell.0.get() }
 }
 
@@ -375,36 +180,10 @@ impl EventSink for SampleEventSink {
     fn query_mask(&mut self) -> EventMask {
         EventMask::None
     }
-    fn start(&mut self) {
-        println!("start");
-    }
-    fn process(&mut self, _event: &Event) {
-        println!("process");
-    }
-    fn flush(&mut self) {
-        println!("flush");
-    }
-    fn stop(&mut self) {
-        println!("stop");
-    }
-}
-
-pub fn spawn_memory_dump_thread(output_path: String) -> thread::JoinHandle<()> {
-    thread::spawn(move || match dump_memory_snapshot(&output_path) {
-        Ok(_) => log_msg(format!("内存快照已保存到: {}\n", output_path)),
-        Err(e) => log_msg(format!("内存快照保存失败: {}\n", e)),
-    })
-}
-
-pub fn start_dump_mem() {
-    let snapshot_path = match OUTPUT_PATH.get() {
-        Some(base) => format!("{}/memory_snapshot.pb", base),
-        None => {
-            log_msg("错误: OUTPUT_PATH 未设置，无法保存内存快照\n".to_string());
-            return;
-        }
-    };
-    let _dump_handle = spawn_memory_dump_thread(snapshot_path);
+    fn start(&mut self) { println!("start"); }
+    fn process(&mut self, _event: &Event) { println!("process"); }
+    fn flush(&mut self) { println!("flush"); }
+    fn stop(&mut self) { println!("stop"); }
 }
 
 pub fn follow(tid: usize) {
@@ -420,20 +199,14 @@ pub fn follow(tid: usize) {
 
             if module_info.is_none() {
                 let (md_path, module_base, module_name) = match mdmap.find(addr) {
-                    Some(m) => (
-                        m.path().to_string(),
-                        m.range().base_address().0 as u64,
-                        m.name().to_string(),
-                    ),
+                    Some(m) => (m.path().to_string(), m.range().base_address().0 as u64, m.name().to_string()),
                     None => ("unknown".to_string(), 0u64, "unknown".to_string()),
                 };
 
-                should_trace = Some(
-                    !(md_path.contains("apex")
-                        || md_path.contains("system")
-                        || md_path.contains("unknown")
-                        || md_path.contains("memfd")),
-                );
+                should_trace = Some(!(md_path.contains("apex") ||
+                                     md_path.contains("system") ||
+                                     md_path.contains("unknown") ||
+                                     md_path.contains("memfd")));
 
                 module_info = Some((md_path, module_base, module_name));
             }
@@ -500,7 +273,9 @@ impl ProbeListener for Blistener {
 pub extern "C" fn replacecb(arg1: usize) -> usize {
     log_msg("start !".to_string());
     let original = *GLOBAL_ORIGINAL.get().unwrap();
-    let original_fn: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(original) };
+    let original_fn: extern "C" fn(usize) -> usize = unsafe {
+        std::mem::transmute(original)
+    };
     original_fn(arg1)
 }
 
@@ -518,14 +293,11 @@ pub fn hfollow(_lib: &str, addr: usize) {
     match interceptor.replace(
         NativePointer(target as *mut c_void),
         NativePointer(replacecb as *mut c_void),
-        NativePointer(null_mut()),
+        NativePointer(null_mut())
     ) {
         Ok(original) => {
             let _ = GLOBAL_ORIGINAL.set(original.0 as usize);
-            log_msg(format!(
-                "replace success, original trampoline: {:x}",
-                original.0 as usize
-            ));
+            log_msg(format!("replace success, original trampoline: {:x}", original.0 as usize));
         }
         Err(e) => {
             log_msg(format!("replace failed: {:?}", e));

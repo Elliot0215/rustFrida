@@ -4,6 +4,7 @@ pub mod console;
 pub mod hook_api;
 pub mod memory;
 pub mod ptr;
+pub(crate) mod util;
 
 pub use console::register_console;
 pub use hook_api::register_hook_api;

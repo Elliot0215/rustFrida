@@ -5,21 +5,18 @@
 
 #![cfg(feature = "quickjs")]
 
-use libc::{
-    mmap, munmap, sysconf, MAP_ANONYMOUS, MAP_PRIVATE, PROT_EXEC, PROT_READ, PROT_WRITE,
-    _SC_PAGESIZE,
-};
 use quickjs_hook::{
     cleanup_engine, cleanup_hook_engine, cleanup_hooks, complete_script, get_or_init_engine,
     init_hook_engine, load_script, set_console_callback,
 };
+use libc::{mmap, munmap, PROT_READ, PROT_WRITE, PROT_EXEC, MAP_PRIVATE, MAP_ANONYMOUS, sysconf, _SC_PAGESIZE};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
-static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
+use crate::communication::{write_stream, log_msg};
 
-use crate::write_stream;
+static ENGINE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Executable memory for hooks
 static EXEC_MEM: OnceLock<ExecMemory> = OnceLock::new();
@@ -105,13 +102,6 @@ pub fn init() -> Result<(), String> {
 }
 
 /// Load and execute a JavaScript script
-///
-/// # Arguments
-/// * `script` - The JavaScript code to execute
-///
-/// # Returns
-/// * `Ok(String)` with the result string (empty for `undefined`) on success
-/// * `Err(String)` with error message on failure
 pub fn execute_script(script: &str) -> Result<String, String> {
     if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
         return Err("JS 引擎未初始化，请先执行 jsinit".to_string());
@@ -121,9 +111,6 @@ pub fn execute_script(script: &str) -> Result<String, String> {
 }
 
 /// Get tab-completion candidates for the given prefix from the live JS engine.
-///
-/// Returns a newline-joined string of matching property names, or an empty string
-/// if the engine is not initialised.
 pub fn complete(prefix: &str) -> String {
     if !ENGINE_INITIALIZED.load(Ordering::SeqCst) {
         return String::new();
@@ -140,27 +127,10 @@ pub fn is_initialized() -> bool {
 /// Cleanup QuickJS resources
 pub fn cleanup() {
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    // Unhook all hooks first while the JS context (ctx) is still valid, so that
-    // qjs_free_value() in cleanup_hooks() can safely decrement callback refcounts.
-    // If cleanup_engine() ran first, JS_FreeContext would free the context, making
-    // the stored ctx pointers in HookData dangle → SIGSEGV in qjs_free_value.
+    // Unhook all hooks first while the JS context (ctx) is still valid
     cleanup_hooks();
-    // Destroy JSEngine (JS_FreeContext + JS_FreeRuntime). JSEngine::Drop also calls
-    // cleanup_hooks() as a safety net, which is a no-op here since the registry is
-    // already empty after the explicit call above.
+    // Destroy JSEngine (JS_FreeContext + JS_FreeRuntime)
     cleanup_engine();
-    // Reset hook engine state (clears g_engine.hooks/free_list, destroys mutex).
-    // All hook entries were already removed by cleanup_hooks(), so no bytes are
-    // restored here; this only resets the pool cursor and the engine initialized flag.
+    // Reset hook engine state
     cleanup_hook_engine();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_init() {
-        // Test initialization (may fail without proper environment)
-    }
 }

@@ -5,6 +5,7 @@ use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_message;
 use crate::jsapi::ptr::get_native_pointer_addr;
+use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
 use std::collections::HashMap;
 use std::ffi::CString;
@@ -57,26 +58,6 @@ fn init_registry() {
     let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Some(HashMap::new());
-    }
-}
-
-/// Check if [addr, addr+size) is accessible using mincore(2).
-fn is_addr_accessible(addr: u64, size: usize) -> bool {
-    if addr == 0 || size == 0 {
-        return false;
-    }
-    unsafe {
-        const PAGE_SIZE: usize = 0x1000;
-        let page_addr = (addr as usize) & !(PAGE_SIZE - 1);
-        let end = (addr as usize).wrapping_add(size);
-        let region_len = end.saturating_sub(page_addr);
-        let pages = (region_len + PAGE_SIZE - 1) / PAGE_SIZE;
-        let mut vec = vec![0u8; pages];
-        libc::mincore(
-            page_addr as *mut libc::c_void,
-            region_len,
-            vec.as_mut_ptr() as *mut _,
-        ) == 0
     }
 }
 

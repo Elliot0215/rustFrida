@@ -3,30 +3,10 @@
 use crate::context::JSContext;
 use crate::ffi;
 use crate::jsapi::ptr::{create_native_pointer, get_native_pointer_addr};
+use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
 use std::ffi::CString;
 use libc;
-
-/// Check if [addr, addr+size) is readable using mincore(2).
-/// Returns false for null/zero or unmapped pages.
-fn is_addr_accessible(addr: u64, size: usize) -> bool {
-    if addr == 0 || size == 0 {
-        return false;
-    }
-    unsafe {
-        const PAGE_SIZE: usize = 0x1000;
-        let page_addr = (addr as usize) & !(PAGE_SIZE - 1);
-        let end = (addr as usize).wrapping_add(size);
-        let region_len = end.saturating_sub(page_addr);
-        let pages = (region_len + PAGE_SIZE - 1) / PAGE_SIZE;
-        let mut vec = vec![0u8; pages];
-        libc::mincore(
-            page_addr as *mut libc::c_void,
-            region_len,
-            vec.as_mut_ptr() as *mut _,
-        ) == 0
-    }
-}
 
 /// Helper to get address from argument
 unsafe fn get_addr_from_arg(ctx: *mut ffi::JSContext, val: JSValue) -> Option<u64> {

@@ -13,6 +13,7 @@ use std::path::Path;
 use std::process;
 
 use crate::log_success;
+use crate::log_warn;
 use crate::types::UserRegs;
 
 /// 获取指定库的基址
@@ -289,4 +290,63 @@ pub(crate) fn write_memory<T>(pid: i32, addr: usize, data: &T) -> Result<(), Str
 /// * `data` - 要写入的字节数组
 pub(crate) fn write_bytes(pid: i32, addr: usize, data: &[u8]) -> Result<(), String> {
     write_remote_mem(pid, addr, data.as_ptr(), data.len())
+}
+
+/// 通过读 /proc/*/cmdline 按进程名查找 PID。
+/// 精确匹配（含末路径组件）；多匹配列出并返回错误。
+pub(crate) fn find_pid_by_name(name: &str) -> Result<i32, String> {
+    use std::fs;
+
+    let mut matches: Vec<i32> = Vec::new();
+    let proc_dir = fs::read_dir("/proc").map_err(|e| format!("读取 /proc 失败: {}", e))?;
+
+    for entry in proc_dir.flatten() {
+        let fname = entry.file_name();
+        let fname_str = fname.to_string_lossy();
+        if !fname_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: i32 = match fname_str.parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        if let Ok(data) = fs::read(&cmdline_path) {
+            let proc_name = data
+                .split(|&b| b == 0)
+                .next()
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .unwrap_or("");
+            let base_name = proc_name.rsplit('/').next().unwrap_or(proc_name);
+            if proc_name == name || base_name == name {
+                matches.push(pid);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Err(format!("未找到进程名匹配 '{}'", name)),
+        1 => Ok(matches[0]),
+        _ => {
+            log_warn!("找到多个匹配进程，请使用 --pid 指定:");
+            for pid in &matches {
+                let cmdline_path = format!("/proc/{}/cmdline", pid);
+                let display = if let Ok(data) = std::fs::read(&cmdline_path) {
+                    data.split(|&b| b == 0)
+                        .filter(|s| !s.is_empty())
+                        .take(2)
+                        .flat_map(|s| std::str::from_utf8(s))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    "?".to_string()
+                };
+                println!("  PID {:6}: {}", pid, display);
+            }
+            Err(format!(
+                "找到 {} 个匹配进程，请使用 --pid <n> 精确指定",
+                matches.len()
+            ))
+        }
+    }
 }
