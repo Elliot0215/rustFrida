@@ -109,6 +109,11 @@ typedef struct {
     Arm64RegionLabel region_labels[ARM64_RELOC_MAX_REGION];
     int region_label_count;  /* number of valid entries */
     uint64_t region_end;     /* one-past-last byte of the hook region (src) */
+
+    /* Bitmask of GPRs written by relocated instructions (bit N = XN written).
+     * Used to dynamically select a scratch register for the jump-back sequence
+     * that won't clobber a value set by the relocated code. */
+    uint32_t written_regs;
 } Arm64Relocator;
 
 /* ============================================================================

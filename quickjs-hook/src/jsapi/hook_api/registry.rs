@@ -1,5 +1,6 @@
 //! Hook registry: HookData, HOOK_REGISTRY, error constants
 
+use crate::jsapi::callback_util::ensure_registry_initialized;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -35,6 +36,7 @@ pub(crate) fn hook_error_message(code: i32) -> &'static [u8] {
 pub(crate) struct HookData {
     pub(crate) ctx: usize,               // Store as usize to avoid Send/Sync issues
     pub(crate) callback_bytes: [u8; 16], // JSValue is 16 bytes (u64 + i64)
+    pub(crate) trampoline: u64,          // Trampoline address for callOriginal (replace mode)
 }
 
 // SAFETY: HookData only contains Copy types now (usize, [u8; 16])
@@ -47,8 +49,5 @@ pub(crate) static HOOK_REGISTRY: Mutex<Option<HashMap<u64, HookData>>> = Mutex::
 
 /// Initialize hook registry
 pub(crate) fn init_registry() {
-    let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = Some(HashMap::new());
-    }
+    ensure_registry_initialized(&HOOK_REGISTRY);
 }

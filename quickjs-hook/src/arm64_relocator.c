@@ -6,27 +6,8 @@
  */
 
 #include "arm64_relocator.h"
+#include "arm64_common.h"
 #include <string.h>
-
-/* ============================================================================
- * Helper Macros and Functions
- * ============================================================================ */
-
-#define GET_BITS(x, hi, lo) (((x) >> (lo)) & ((1u << ((hi) - (lo) + 1)) - 1))
-#define SET_BITS(orig, hi, lo, v) \
-    (((orig) & ~(((1u << ((hi) - (lo) + 1)) - 1) << (lo))) | \
-     (((v) & ((1u << ((hi) - (lo) + 1)) - 1)) << (lo)))
-
-static inline int64_t sign_extend(uint64_t value, int bits) {
-    int shift = 64 - bits;
-    return ((int64_t)(value << shift)) >> shift;
-}
-
-static inline int fits_signed(int64_t v, int bits) {
-    int64_t min_val = -(1LL << (bits - 1));
-    int64_t max_val = (1LL << (bits - 1)) - 1;
-    return v >= min_val && v <= max_val;
-}
 
 /* ============================================================================
  * Initialization / Cleanup
@@ -44,6 +25,7 @@ void arm64_relocator_init(Arm64Relocator* r, const void* input, uint64_t input_p
     r->region_label_count = 0;
     r->region_end = 0;
     memset(r->region_labels, 0, sizeof(r->region_labels));
+    r->written_regs = 0;
 }
 
 void arm64_relocator_reset(Arm64Relocator* r, const void* input, uint64_t input_pc) {
@@ -57,6 +39,7 @@ void arm64_relocator_reset(Arm64Relocator* r, const void* input, uint64_t input_
     r->region_label_count = 0;
     r->region_end = 0;
     memset(r->region_labels, 0, sizeof(r->region_labels));
+    r->written_regs = 0;
 }
 
 void arm64_relocator_clear(Arm64Relocator* r) {
@@ -514,6 +497,58 @@ Arm64RelocResult arm64_relocator_relocate_insn(uint64_t src_pc, uint64_t dst_pc,
  * Writing Instructions
  * ============================================================================ */
 
+/* Track which GPRs are written by the current instruction.
+ *
+ * For PC-relative instructions (which the relocator modifies), we precisely
+ * track the destination register.  For OTHER instructions (copied as-is),
+ * we conservatively check if bits[4:0] (Rd/Rt) is X16 or X17 and the
+ * instruction is not a store (where Rt is a source, not destination).
+ *
+ * Only X16/X17 matter for scratch register selection, but we track all
+ * PC-relative dst_regs for completeness. */
+static void track_written_regs(Arm64Relocator* r, uint32_t insn, const Arm64InsnInfo* info) {
+    switch (info->type) {
+        case ARM64_INSN_ADR:
+        case ARM64_INSN_ADRP:
+        case ARM64_INSN_LDR_LITERAL:
+        case ARM64_INSN_LDRSW_LITERAL:
+        case ARM64_INSN_LDR_LITERAL_FP:
+            r->written_regs |= (1u << (info->dst_reg & 31));
+            break;
+        case ARM64_INSN_BL:
+            r->written_regs |= (1u << 30);  /* X30 (LR) */
+            break;
+        case ARM64_INSN_OTHER: {
+            /* For non-PC-relative instructions, only check if X16 or X17
+             * might be written (our scratch register candidates).
+             * Rd/Rt is typically in bits[4:0]. */
+            uint32_t rd = insn & 0x1F;
+            if (rd == 16 || rd == 17) {
+                /* Exclude store instructions where Rt in bits[4:0] is a source.
+                 * Load/store encoding: bits[27:25] indicate the major group.
+                 * Group 4 (0b0100): load/store — bit 22 (L) distinguishes load vs store.
+                 * Group 6 (0b0110): load/store pair — bit 22 (L) distinguishes.
+                 * For stores (L=0), Rt is read, not written. */
+                uint32_t op0 = (insn >> 25) & 0xF;
+                if (op0 == 0x4 || op0 == 0x6 || op0 == 0xC || op0 == 0xE) {
+                    /* Load/store group: check L bit (bit 22) */
+                    if ((insn >> 22) & 1) {
+                        /* L=1: load — Rt IS written */
+                        r->written_regs |= (1u << rd);
+                    }
+                    /* L=0: store — Rt is read, not written → don't mark */
+                } else {
+                    /* Non-load/store instruction: Rd in bits[4:0] is likely written */
+                    r->written_regs |= (1u << rd);
+                }
+            }
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 /* Look up the writer label for a source address within the hook region.
  * Returns the label_id if found, 0 if not found (0 is never a valid label ID
  * because arm64_writer_init sets next_label_id = 1). */
@@ -528,6 +563,9 @@ static uint64_t find_region_label(const Arm64Relocator* r, uint64_t src_target) 
 Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
     uint64_t src_pc = r->input_pc + (uint64_t)(r->input_cur - r->input_start - 4);
     uint64_t dst_pc = arm64_writer_pc(r->output);
+
+    /* Track which GPRs this instruction writes (for scratch register selection) */
+    track_written_regs(r, r->current_insn, &r->current_info);
 
     if (!r->current_info.is_pc_relative) {
         /* Non-PC-relative instruction, just copy it */
@@ -667,14 +705,23 @@ Arm64RelocResult arm64_relocator_write_one(Arm64Relocator* r) {
             return ARM64_RELOC_OK;
         }
 
-        case ARM64_INSN_LDR_LITERAL:
-        case ARM64_INSN_LDRSW_LITERAL: {
-            /* Load target address into register, then load from there */
-            /* Use X16 as scratch, then load into destination */
-            arm64_writer_put_ldr_reg_address(r->output, ARM64_REG_X16,
+        case ARM64_INSN_LDR_LITERAL: {
+            /* Self-load mode: use dst_reg itself as address intermediate.
+             * Avoids clobbering X16 which may be needed by subsequent code.
+             * Sequence: LDR Xd, =literal_addr → LDR Xd, [Xd] */
+            arm64_writer_put_ldr_reg_address(r->output, r->current_info.dst_reg,
                                               r->current_info.target);
             arm64_writer_put_ldr_reg_reg_offset(r->output, r->current_info.dst_reg,
-                                                 ARM64_REG_X16, 0);
+                                                 r->current_info.dst_reg, 0);
+            return ARM64_RELOC_OK;
+        }
+
+        case ARM64_INSN_LDRSW_LITERAL: {
+            /* Self-load mode for LDRSW: LDR Xd, =literal_addr → LDRSW Xd, [Xd] */
+            arm64_writer_put_ldr_reg_address(r->output, r->current_info.dst_reg,
+                                              r->current_info.target);
+            arm64_writer_put_ldrsw_reg_reg_offset(r->output, r->current_info.dst_reg,
+                                                    r->current_info.dst_reg, 0);
             return ARM64_RELOC_OK;
         }
 

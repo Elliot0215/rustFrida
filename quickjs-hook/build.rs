@@ -9,6 +9,10 @@ fn main() {
     // Compile hook_engine.c, arm64_writer.c, and arm64_relocator.c
     cc::Build::new()
         .file(src_path.join("hook_engine.c"))
+        .file(src_path.join("hook_engine_mem.c"))
+        .file(src_path.join("hook_engine_inline.c"))
+        .file(src_path.join("hook_engine_redir.c"))
+        .file(src_path.join("hook_engine_art.c"))
         .file(src_path.join("arm64_writer.c"))
         .file(src_path.join("arm64_relocator.c"))
         .include(&src_path)
@@ -130,6 +134,11 @@ fn main() {
     println!("cargo:rustc-link-lib=static=hook_engine");
     println!("cargo:rerun-if-changed=src/hook_engine.c");
     println!("cargo:rerun-if-changed=src/hook_engine.h");
+    println!("cargo:rerun-if-changed=src/hook_engine_internal.h");
+    println!("cargo:rerun-if-changed=src/hook_engine_mem.c");
+    println!("cargo:rerun-if-changed=src/hook_engine_inline.c");
+    println!("cargo:rerun-if-changed=src/hook_engine_redir.c");
+    println!("cargo:rerun-if-changed=src/hook_engine_art.c");
     println!("cargo:rerun-if-changed=src/arm64_writer.c");
     println!("cargo:rerun-if-changed=src/arm64_writer.h");
     println!("cargo:rerun-if-changed=src/arm64_relocator.c");

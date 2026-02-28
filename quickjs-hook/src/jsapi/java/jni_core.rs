@@ -43,6 +43,8 @@ pub(super) const K_ACC_CRITICAL_NATIVE: u32 = 0x00200000;
 pub(super) const K_ACC_SKIP_ACCESS_CHECKS: u32 = 0x00080000;
 /// kAccNterpEntryPointFastPath — nterp fast path (must clear for native conversion)
 pub(super) const K_ACC_NTERP_ENTRY_POINT_FAST_PATH: u32 = 0x00100000;
+/// kAccXposedHookedMethod — Xposed framework hooked method marker
+pub(super) const K_ACC_XPOSED_HOOKED_METHOD: u32 = 0x10000000;
 
 /// Cached entry_point offset, determined at runtime.
 /// Android 12 emulator uses 24 (no separate data_ field, 32-byte ArtMethod).

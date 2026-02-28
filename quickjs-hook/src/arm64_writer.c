@@ -5,35 +5,9 @@
  */
 
 #include "arm64_writer.h"
+#include "arm64_common.h"
 #include <string.h>
 #include <stdlib.h>
-
-/* ============================================================================
- * Helper Macros
- * ============================================================================ */
-
-#define GET_BITS(x, hi, lo) (((x) >> (lo)) & ((1u << ((hi) - (lo) + 1)) - 1))
-#define SET_BITS(orig, hi, lo, v) \
-    (((orig) & ~(((1u << ((hi) - (lo) + 1)) - 1) << (lo))) | \
-     (((v) & ((1u << ((hi) - (lo) + 1)) - 1)) << (lo)))
-
-/* Sign extend a value */
-static inline int64_t sign_extend(uint64_t value, int bits) {
-    int shift = 64 - bits;
-    return ((int64_t)(value << shift)) >> shift;
-}
-
-/* Check if value fits in signed range */
-static inline int fits_signed(int64_t v, int bits) {
-    int64_t min_val = -(1LL << (bits - 1));
-    int64_t max_val = (1LL << (bits - 1)) - 1;
-    return v >= min_val && v <= max_val;
-}
-
-/* Check if value fits in unsigned range */
-static inline int fits_unsigned(uint64_t v, int bits) {
-    return v < (1ULL << bits);
-}
 
 /* ============================================================================
  * Initialization / Cleanup
@@ -833,17 +807,89 @@ void arm64_writer_put_pop_all_regs(Arm64Writer* w) {
     arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 256);
 }
 
+void arm64_writer_put_branch_address_reg(Arm64Writer* w, uint64_t target, Arm64Reg scratch) {
+    arm64_writer_put_mov_reg_imm(w, scratch, target);
+    arm64_writer_put_br_reg(w, scratch);
+}
+
+void arm64_writer_put_call_address_reg(Arm64Writer* w, uint64_t target, Arm64Reg scratch) {
+    arm64_writer_put_mov_reg_imm(w, scratch, target);
+    arm64_writer_put_blr_reg(w, scratch);
+}
+
 void arm64_writer_put_branch_address(Arm64Writer* w, uint64_t target) {
-    /* Use MOVZ/MOVK sequence to load address into X16, then BR X16
-     * This generates 4-5 instructions (16-20 bytes) depending on address
-     * but is more reliable than LDR literal for relocation scenarios
-     */
-    arm64_writer_put_mov_reg_imm(w, ARM64_REG_X16, target);
-    arm64_writer_put_br_reg(w, ARM64_REG_X16);
+    arm64_writer_put_branch_address_reg(w, target, ARM64_REG_X16);
 }
 
 void arm64_writer_put_call_address(Arm64Writer* w, uint64_t target) {
-    /* Use MOVZ/MOVK sequence to load address into X16, then BLR X16 */
-    arm64_writer_put_mov_reg_imm(w, ARM64_REG_X16, target);
-    arm64_writer_put_blr_reg(w, ARM64_REG_X16);
+    arm64_writer_put_call_address_reg(w, target, ARM64_REG_X16);
+}
+
+/* ============================================================================
+ * FP/SIMD Pair Instructions
+ * ============================================================================ */
+
+/* STP Dt1, Dt2, [Xn, #offset] — signed offset mode
+ * Encoding: opc=01 V=1 L=0 imm7 Rt2 Rn Rt1
+ * opc=01 → 64-bit (D registers), V=1 → SIMD/FP
+ * imm7 is offset / 8 (scale factor for 64-bit) */
+void arm64_writer_put_fp_stp_offset(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
+                                     Arm64Reg base, int32_t offset) {
+    int32_t imm7 = offset / 8;
+    uint32_t insn = (0x6D << 24)   /* opc=01 1 01 (STP, signed offset, V=1) */
+                  | ((imm7 & 0x7F) << 15)
+                  | (dt2 << 10)
+                  | (ARM64_REG_NUM(base) << 5)
+                  | dt1;
+    arm64_writer_put_insn(w, insn);
+}
+
+/* STP Dt1, Dt2, [Xn, #offset]! — pre-index mode */
+void arm64_writer_put_fp_stp_pre(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
+                                  Arm64Reg base, int32_t offset) {
+    int32_t imm7 = offset / 8;
+    uint32_t insn = 0x6D800000
+                  | ((imm7 & 0x7F) << 15)
+                  | (dt2 << 10)
+                  | (ARM64_REG_NUM(base) << 5)
+                  | dt1;
+    arm64_writer_put_insn(w, insn);
+}
+
+/* LDP Dt1, Dt2, [Xn, #offset] — signed offset mode */
+void arm64_writer_put_fp_ldp_offset(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
+                                     Arm64Reg base, int32_t offset) {
+    int32_t imm7 = offset / 8;
+    uint32_t insn = (0x6D << 24)   /* opc=01 1 01 (signed offset, V=1) */
+                  | (1u << 22)     /* L=1 → load */
+                  | ((imm7 & 0x7F) << 15)
+                  | (dt2 << 10)
+                  | (ARM64_REG_NUM(base) << 5)
+                  | dt1;
+    arm64_writer_put_insn(w, insn);
+}
+
+/* LDP Dt1, Dt2, [Xn], #offset — post-index mode */
+void arm64_writer_put_fp_ldp_post(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
+                                   Arm64Reg base, int32_t offset) {
+    int32_t imm7 = offset / 8;
+    uint32_t insn = 0x6CC00000     /* post-index LDP FP: 0110 1100 1 1 */
+                  | ((imm7 & 0x7F) << 15)
+                  | (dt2 << 10)
+                  | (ARM64_REG_NUM(base) << 5)
+                  | dt1;
+    arm64_writer_put_insn(w, insn);
+}
+
+/* ============================================================================
+ * Comparison Instructions
+ * ============================================================================ */
+
+/* CMP Xn, Xm — alias for SUBS XZR, Xn, Xm
+ * Sets NZCV flags based on Xn - Xm. */
+void arm64_writer_put_cmp_reg_reg(Arm64Writer* w, Arm64Reg rn, Arm64Reg rm) {
+    uint32_t insn = 0xEB00001F
+                  | (ARM64_REG_NUM(rm) << 16)
+                  | (ARM64_REG_NUM(rn) << 5);
+    arm64_writer_put_insn(w, insn);
 }

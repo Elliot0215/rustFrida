@@ -2,7 +2,8 @@
  * hook_engine_mem.c - Memory pool management, XOM-safe read, wxshadow, cache flush
  *
  * Contains: pool permission management, entry allocation/free, wxshadow patching,
- * hook_write_jump, hook_alloc, hook_relocate_instructions, hook_flush_cache.
+ * write_jump_back, hook_write_jump, hook_alloc, hook_relocate_instructions,
+ * hook_flush_cache.
  */
 
 #include "hook_engine_internal.h"
@@ -163,6 +164,55 @@ int wxshadow_release(void* addr) {
 
 /* --- Jump writing and allocation --- */
 
+/* BRK 填充 + 清理 writer，返回写入字节数 */
+static int finalize_jump_writer(Arm64Writer* w) {
+    while (arm64_writer_offset(w) < MIN_HOOK_SIZE && arm64_writer_can_write(w, 4)) {
+        arm64_writer_put_brk_imm(w, 0xFFFF);
+    }
+    int bytes_written = (int)arm64_writer_offset(w);
+    arm64_writer_clear(w);
+    return bytes_written;
+}
+
+/*
+ * Write a trampoline jump-back using a dynamically chosen scratch register.
+ *
+ * Analyzes which GPRs are written by the relocated instructions (via
+ * written_regs bitmask) and picks a scratch register that won't be
+ * clobbered:
+ *   - Prefer X17 (IP1, intra-procedure-call scratch)
+ *   - Fall back to X16 (IP0) if X17 is written
+ *   - If both are written, still use X17 (extremely rare edge case)
+ */
+int write_jump_back(void* dst, void* target, uint32_t written_regs) {
+    if (!dst || !target) {
+        return HOOK_ERROR_INVALID_PARAM;
+    }
+
+    Arm64Reg scratch;
+    if (!(written_regs & (1u << 17))) {
+        scratch = ARM64_REG_X17;    /* Prefer X17 */
+    } else if (!(written_regs & (1u << 16))) {
+        scratch = ARM64_REG_X16;    /* Fall back to X16 */
+    } else {
+        scratch = ARM64_REG_X17;    /* Both written — use X17, log warning */
+        hook_log("[hook] WARNING: both X16 and X17 written by relocated code, "
+                 "X17 may be clobbered");
+    }
+
+    Arm64Writer w;
+    arm64_writer_init(&w, dst, (uint64_t)dst, MIN_HOOK_SIZE);
+    arm64_writer_put_mov_reg_imm(&w, scratch, (uint64_t)target);
+    arm64_writer_put_br_reg(&w, scratch);
+
+    if (arm64_writer_offset(&w) > MIN_HOOK_SIZE) {
+        arm64_writer_clear(&w);
+        return HOOK_ERROR_BUFFER_TOO_SMALL;
+    }
+
+    return finalize_jump_writer(&w);
+}
+
 /* Write an absolute jump using arm64_writer (MOVZ/MOVK + BR sequence) */
 int hook_write_jump(void* dst, void* target) {
     if (!dst || !target) {
@@ -179,14 +229,7 @@ int hook_write_jump(void* dst, void* target) {
         return HOOK_ERROR_BUFFER_TOO_SMALL;
     }
 
-    /* Fill remaining space with BRK to catch unexpected execution */
-    while (arm64_writer_offset(&w) < MIN_HOOK_SIZE && arm64_writer_can_write(&w, 4)) {
-        arm64_writer_put_brk_imm(&w, 0xFFFF);
-    }
-
-    int bytes_written = (int)arm64_writer_offset(&w);
-    arm64_writer_clear(&w);
-    return bytes_written;
+    return finalize_jump_writer(&w);
 }
 
 /* Allocate from executable memory pool */
@@ -220,7 +263,7 @@ void* hook_alloc(size_t size) {
  * writer PC.  This allows arm64_relocator_write_one() to emit label-based
  * branches (rather than absolute branches to the now-overwritten original code)
  * for any PC-relative branch whose target lies inside [src_pc, src_pc+min_bytes). */
-size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* dst, size_t min_bytes) {
+size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* dst, size_t min_bytes, uint32_t* out_written_regs) {
     Arm64Writer w;
     Arm64Relocator r;
 
@@ -262,8 +305,125 @@ size_t hook_relocate_instructions(const void* src_buf, uint64_t src_pc, void* ds
     arm64_writer_flush(&w);
 
     size_t written = arm64_writer_offset(&w);
+
+    if (out_written_regs)
+        *out_written_regs = r.written_regs;
+
     arm64_writer_clear(&w);
     arm64_relocator_clear(&r);
 
     return written;
+}
+
+/* --- Hook installation helpers --- */
+
+HookEntry* setup_hook_entry(void* target) {
+    /* Caller must hold g_engine.lock */
+
+    /* Check if already hooked */
+    if (find_hook(target)) {
+        return NULL;
+    }
+
+    /* Make pool writable for allocation and code generation */
+    if (pool_make_writable() != 0) {
+        return NULL;
+    }
+
+    /* Allocate hook entry (reuse from free list if possible) */
+    HookEntry* entry = alloc_entry();
+    if (!entry) {
+        pool_make_executable();
+        return NULL;
+    }
+
+    entry->target = target;
+
+    /* Allocate trampoline space (reuse if available and large enough) */
+    if (!entry->trampoline || entry->trampoline_alloc < TRAMPOLINE_ALLOC_SIZE) {
+        entry->trampoline = hook_alloc(TRAMPOLINE_ALLOC_SIZE);
+        entry->trampoline_alloc = TRAMPOLINE_ALLOC_SIZE;
+    }
+    if (!entry->trampoline) {
+        free_entry(entry);
+        pool_make_executable();
+        return NULL;
+    }
+
+    /* Save original bytes — use XOM-safe read */
+    if (read_target_safe(target, entry->original_bytes, MIN_HOOK_SIZE) != 0) {
+        hook_log("setup_hook_entry: target %p is not readable, aborting", target);
+        free_entry(entry);
+        pool_make_executable();
+        return NULL;
+    }
+    entry->original_size = MIN_HOOK_SIZE;
+
+    return entry;
+}
+
+int build_trampoline(HookEntry* entry) {
+    /* Relocate original instructions to trampoline */
+    uint32_t written_regs = 0;
+    size_t relocated_size = hook_relocate_instructions(
+        entry->original_bytes, (uint64_t)entry->target,
+        entry->trampoline, MIN_HOOK_SIZE, &written_regs);
+
+    /* Write jump back to original code after the relocated instructions */
+    void* jump_back_target = (uint8_t*)entry->target + MIN_HOOK_SIZE;
+    int jump_result = write_jump_back(
+        (uint8_t*)entry->trampoline + relocated_size,
+        jump_back_target, written_regs);
+
+    return jump_result;
+}
+
+int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry) {
+    int jump_result;
+
+    if (stealth) {
+        /* Stealth mode: write jump to temp buffer, patch via wxshadow */
+        uint8_t jump_buf[MIN_HOOK_SIZE];
+        jump_result = hook_write_jump(jump_buf, jump_dest);
+        if (jump_result < 0) {
+            return jump_result;
+        }
+        if (wxshadow_patch(target, jump_buf, jump_result) != 0) {
+            return HOOK_ERROR_WXSHADOW_FAILED;
+        }
+        entry->stealth = 1;
+    } else {
+        /* Normal mode: mprotect + direct write */
+        uintptr_t page_start = (uintptr_t)target & ~0xFFF;
+        if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            return HOOK_ERROR_MPROTECT_FAILED;
+        }
+        jump_result = hook_write_jump(target, jump_dest);
+        if (jump_result < 0) {
+            restore_page_rx(page_start);
+            return jump_result;
+        }
+        entry->stealth = 0;
+        restore_page_rx(page_start);
+    }
+
+    return 0;
+}
+
+void finalize_hook(HookEntry* entry, void* thunk, size_t thunk_size) {
+    /* Flush caches */
+    if (!entry->stealth) {
+        hook_flush_cache(entry->target, MIN_HOOK_SIZE);
+    }
+    hook_flush_cache(entry->trampoline, TRAMPOLINE_ALLOC_SIZE);
+    if (thunk && thunk_size > 0) {
+        hook_flush_cache(thunk, thunk_size);
+    }
+
+    /* Add to hook list */
+    entry->next = g_engine.hooks;
+    g_engine.hooks = entry;
+
+    /* Tighten pool to R-X */
+    pool_make_executable();
 }

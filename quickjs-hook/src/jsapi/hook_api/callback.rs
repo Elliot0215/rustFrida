@@ -1,14 +1,23 @@
-//! Hook callback wrapper (cross-thread safety, context building)
+//! Hook callback wrapper (cross-thread safety, context building) — replace mode
+//!
+//! The thunk saves context and calls on_enter, then restores x0 and returns.
+//! The callback can optionally call the original function via callOriginal().
 
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::console::output_message;
+use crate::jsapi::callback_util::{invoke_hook_callback_common, set_js_u64_property};
 use crate::value::JSValue;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::registry::HOOK_REGISTRY;
 
-/// Hook callback that calls the JS function
+// Global state for the currently executing native hook callback.
+// Protected by JS_ENGINE lock (single-threaded JS execution).
+static CURRENT_NATIVE_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
+static CURRENT_NATIVE_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
+
+/// Hook callback that calls the JS function (replace mode)
 pub(crate) unsafe extern "C" fn hook_callback_wrapper(
     ctx_ptr: *mut hook_ffi::HookContext,
     user_data: *mut std::ffi::c_void,
@@ -20,10 +29,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
     let target_addr = user_data as u64;
 
     // Copy callback data then release the lock before QuickJS operations.
-    // Holding the registry lock during JS_Call risks deadlock if the JS callback
-    // itself tries to hook/unhook. Also avoids holding a lock during potentially
-    // blocking QuickJS execution.
-    let (ctx_usize, callback_bytes) = {
+    let (ctx_usize, callback_bytes, trampoline) = {
         let guard = match HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -36,131 +42,85 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             Some(d) => d,
             None => return,
         };
-        (hook_data.ctx, hook_data.callback_bytes)
+        (hook_data.ctx, hook_data.callback_bytes, hook_data.trampoline)
     }; // HOOK_REGISTRY lock released here
 
-    // Serialize concurrent JS_Call invocations from multiple hooked threads.
-    // QuickJS is not thread-safe; without this lock, two threads hitting the same
-    // hook simultaneously would corrupt the runtime state.
-    //
-    // Use try_lock() to prevent same-thread deadlock: if the hooked function is
-    // called from within load_script() (which already holds JS_ENGINE), a blocking
-    // lock() would deadlock because std::sync::Mutex is not reentrant. try_lock()
-    // returns WouldBlock in that case and we skip the callback safely.
-    let _js_guard = match crate::JS_ENGINE.try_lock() {
-        Ok(g) => g,
-        Err(std::sync::TryLockError::WouldBlock) => {
-            // Same thread already holds JS_ENGINE (re-entrant call) or another
-            // thread is mid-callback. Skip this invocation to avoid deadlock.
-            output_message(&format!(
-                "[hook] callback skipped (JS engine busy), target={:#x}",
-                target_addr
-            ));
-            return;
-        }
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-    };
+    // Set global state for js_native_call_original
+    CURRENT_NATIVE_CTX_PTR.store(ctx_ptr as usize, Ordering::Relaxed);
+    CURRENT_NATIVE_TRAMPOLINE.store(trampoline, Ordering::Relaxed);
 
-    let ctx = ctx_usize as *mut ffi::JSContext;
-    // Reconstruct JSValue from bytes
-    let callback: ffi::JSValue =
-        std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
+    invoke_hook_callback_common(
+        ctx_usize,
+        &callback_bytes,
+        "hook",
+        target_addr,
+        // 构建 JS 上下文对象：x0-x30, sp, pc, trampoline, callOriginal()
+        |ctx| {
+            let js_ctx = ffi::JS_NewObject(ctx);
+            let hook_ctx = &*ctx_ptr;
 
-    // CRITICAL: Update QuickJS stack top before ANY QuickJS operations.
-    // This hook callback fires in the hooked thread's context, which has a
-    // different stack than the JS-init thread. Without this call, QuickJS's
-    // stack-overflow check compares the current SP against the JS thread's
-    // stack_top, sees a huge difference, falsely detects overflow, tries to
-    // throw an exception, recurses, and crashes with SIGSEGV.
-    ffi::qjs_update_stack_top(ctx);
-
-    // Create context object for JS callback
-    let js_ctx = ffi::JS_NewObject(ctx);
-
-    // Populate context with register values
-    let hook_ctx = &*ctx_ptr;
-
-    // Add x0-x30
-    for i in 0..31 {
-        let prop_name = format!("x{}", i);
-        let cprop = CString::new(prop_name).unwrap();
-        let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
-        let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[i]);
-        ffi::qjs_set_property(ctx, js_ctx, atom, val);
-        ffi::JS_FreeAtom(ctx, atom);
-    }
-
-    // Add sp
-    {
-        let cprop = CString::new("sp").unwrap();
-        let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
-        let val = ffi::JS_NewBigUint64(ctx, hook_ctx.sp);
-        ffi::qjs_set_property(ctx, js_ctx, atom, val);
-        ffi::JS_FreeAtom(ctx, atom);
-    }
-
-    // Add pc
-    {
-        let cprop = CString::new("pc").unwrap();
-        let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
-        let val = ffi::JS_NewBigUint64(ctx, hook_ctx.pc);
-        ffi::qjs_set_property(ctx, js_ctx, atom, val);
-        ffi::JS_FreeAtom(ctx, atom);
-    }
-
-    let global = ffi::JS_GetGlobalObject(ctx);
-    let result = ffi::JS_Call(ctx, callback, global, 1, &js_ctx as *const _ as *mut _);
-
-    // Check for JS exception thrown by the callback.
-    // If the callback threw, report the error and skip register write-back.
-    if ffi::qjs_is_exception(result) != 0 {
-        let exc = ffi::JS_GetException(ctx);
-        let exc_val = JSValue(exc);
-        // Use .message property directly (avoids calling toString() which may itself throw
-        // and return NULL from JS_ToCString, silencing the error message entirely).
-        let msg_prop = exc_val.get_property(ctx, "message");
-        let msg = if let Some(s) = msg_prop.to_string(ctx) {
-            msg_prop.free(ctx);
-            s
-        } else {
-            msg_prop.free(ctx);
-            let fallback = exc_val.to_string(ctx).unwrap_or_else(|| "[unknown exception]".to_string());
-            // exc_val.to_string 内部调用 JS_ToCString 可能触发二次异常（例如
-            // toString() 方法本身抛出），残留在 QuickJS 状态中会污染后续执行。
-            // 消费掉可能的二次异常。
-            let secondary = ffi::JS_GetException(ctx);
-            let secondary_val = JSValue(secondary);
-            if !secondary_val.is_null() && !secondary_val.is_undefined() {
-                secondary_val.free(ctx);
+            for i in 0..31 {
+                let prop_name = format!("x{}", i);
+                set_js_u64_property(ctx, js_ctx, &prop_name, hook_ctx.x[i]);
             }
-            fallback
-        };
-        output_message(&format!("[hook error] {}", msg));
-        exc_val.free(ctx);
-        // JS_EXCEPTION sentinel does not own heap memory; qjs_free_value is a no-op for it.
-        ffi::qjs_free_value(ctx, js_ctx);
-        ffi::qjs_free_value(ctx, result);
-        ffi::qjs_free_value(ctx, global);
-        return;
+            set_js_u64_property(ctx, js_ctx, "sp", hook_ctx.sp);
+            set_js_u64_property(ctx, js_ctx, "pc", hook_ctx.pc);
+            set_js_u64_property(ctx, js_ctx, "trampoline", trampoline);
+
+            let cname = CString::new("callOriginal").unwrap();
+            let func_val = ffi::qjs_new_cfunction(ctx, Some(js_native_call_original), cname.as_ptr(), 0);
+            JSValue(js_ctx).set_property(ctx, "callOriginal", JSValue(func_val));
+
+            js_ctx
+        },
+        // 处理返回值：从上下文对象读回 x0（replace mode 只恢复 x0）
+        |ctx, js_ctx, _result| {
+            let cprop = CString::new("x0").unwrap();
+            let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
+            let val = ffi::qjs_get_property(ctx, js_ctx, atom);
+            ffi::JS_FreeAtom(ctx, atom);
+
+            let js_val = JSValue(val);
+            if let Some(new_val) = js_val.to_u64(ctx) {
+                (*ctx_ptr).x[0] = new_val;
+            }
+            js_val.free(ctx);
+        },
+    );
+
+    // Clear global state
+    CURRENT_NATIVE_CTX_PTR.store(0, Ordering::Relaxed);
+    CURRENT_NATIVE_TRAMPOLINE.store(0, Ordering::Relaxed);
+}
+
+/// JS CFunction: ctx.callOriginal()
+/// Restores registers from HookContext and calls the trampoline (original function).
+/// Returns the result as BigUint64, also writes it to ctx.x[0].
+unsafe extern "C" fn js_native_call_original(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    _argc: i32,
+    _argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    let ctx_ptr = CURRENT_NATIVE_CTX_PTR.load(Ordering::Relaxed) as *mut hook_ffi::HookContext;
+    let trampoline = CURRENT_NATIVE_TRAMPOLINE.load(Ordering::Relaxed);
+
+    if ctx_ptr.is_null() || trampoline == 0 {
+        return ffi::JS_ThrowInternalError(
+            ctx,
+            b"callOriginal() can only be called inside a hook callback\0".as_ptr() as *const _,
+        );
     }
 
-    // Read back x0-x30 from JS context to HookContext (allows JS to modify any register)
-    for i in 0..31 {
-        let prop_name = format!("x{}", i);
-        let cprop = CString::new(prop_name).unwrap();
-        let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
-        let val = ffi::qjs_get_property(ctx, js_ctx, atom);
-        ffi::JS_FreeAtom(ctx, atom);
+    let result = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
 
-        let js_val = JSValue(val);
-        if let Some(new_val) = js_val.to_u64(ctx) {
-            (*ctx_ptr).x[i] = new_val;
-        }
-        js_val.free(ctx);
+    // Write result back to HookContext.x[0] so the thunk's final RET returns this value
+    (*ctx_ptr).x[0] = result;
+
+    // Return value: Number (≤2^53) or BigUint64
+    if result <= (1u64 << 53) {
+        ffi::qjs_new_int64(ctx, result as i64)
+    } else {
+        ffi::JS_NewBigUint64(ctx, result)
     }
-
-    // Cleanup
-    ffi::qjs_free_value(ctx, js_ctx);
-    ffi::qjs_free_value(ctx, result);
-    ffi::qjs_free_value(ctx, global);
 }

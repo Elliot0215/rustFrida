@@ -2,12 +2,13 @@
 
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
-use crate::jsapi::ptr::get_native_pointer_addr;
+use crate::jsapi::callback_util::{dup_callback_to_bytes, extract_pointer_address};
 use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
 
 use super::callback::hook_callback_wrapper;
 use super::registry::{hook_error_message, init_registry, HookData, HOOK_OK, HOOK_REGISTRY};
+use crate::jsapi::callback_util::with_registry_mut;
 
 /// hook(ptr, callback, stealth?) - Install a hook at the given address
 /// stealth: optional boolean, default false. If true, uses wxshadow for traceless hooking.
@@ -36,20 +37,9 @@ pub(crate) unsafe extern "C" fn js_hook(
     };
 
     // Get the address
-    let addr = match get_native_pointer_addr(ctx, ptr_arg) {
-        Some(a) => a,
-        None => {
-            // Try to convert directly
-            match ptr_arg.to_u64(ctx) {
-                Some(a) => a,
-                None => {
-                    return ffi::JS_ThrowTypeError(
-                        ctx,
-                        b"hook() first argument must be a pointer\0".as_ptr() as *const _,
-                    )
-                }
-            }
-        }
+    let addr = match extract_pointer_address(ctx, ptr_arg, "hook") {
+        Ok(a) => a,
+        Err(e) => return e,
     };
 
     // Check callback is a function
@@ -63,52 +53,40 @@ pub(crate) unsafe extern "C" fn js_hook(
     // Initialize registry
     init_registry();
 
-    // Duplicate the callback to prevent GC
-    let callback_dup = ffi::qjs_dup_value(ctx, callback_arg.raw());
+    // Duplicate callback and convert to bytes for Send/Sync-safe registry storage
+    let callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
 
-    // Store in registry - convert to bytes for Send/Sync safety
-    let mut callback_bytes = [0u8; 16];
-    std::ptr::copy_nonoverlapping(
-        &callback_dup as *const ffi::JSValue as *const u8,
-        callback_bytes.as_mut_ptr(),
-        16,
+    // 使用 hook_replace 代替 hook_attach，支持 replace 模式
+    // hook_replace 返回 trampoline 地址（用于 callOriginal），失败返回 NULL
+    let trampoline = hook_ffi::hook_replace(
+        addr as *mut std::ffi::c_void,
+        Some(hook_callback_wrapper),
+        addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
+        if stealth { 1 } else { 0 },
     );
 
-    // 先将 callback 插入 registry，再安装 hook。
-    // 避免 TOCTOU 窗口：hook_attach 成功后 hook 立即激活，如果 callback
-    // 还未插入 registry，回调线程会在 HOOK_REGISTRY 中找不到数据。
-    {
-        let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let registry = guard.as_mut().unwrap();
+    if trampoline.is_null() {
+        // hook 安装失败，释放 JS 回调引用
+        let callback: ffi::JSValue =
+            std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
+        ffi::qjs_free_value(ctx, callback);
+        return ffi::JS_ThrowInternalError(
+            ctx,
+            b"hook_replace failed: could not install hook\0".as_ptr() as *const _,
+        );
+    }
+
+    // hook 已安装，将 callback 和 trampoline 插入 registry
+    with_registry_mut(&HOOK_REGISTRY, |registry| {
         registry.insert(
             addr,
             HookData {
                 ctx: ctx as usize,
                 callback_bytes,
+                trampoline: trampoline as u64,
             },
         );
-    }
-
-    let result = hook_ffi::hook_attach(
-        addr as *mut std::ffi::c_void,
-        Some(hook_callback_wrapper),
-        None,                          // No on_leave callback for now
-        addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
-        if stealth { 1 } else { 0 },
-    );
-
-    if result != HOOK_OK {
-        // hook 安装失败，回滚 registry 并释放 JS 回调引用
-        {
-            let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(registry) = guard.as_mut() {
-                registry.remove(&addr);
-            }
-        }
-        ffi::qjs_free_value(ctx, callback_dup);
-        let err_msg = hook_error_message(result);
-        return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
-    }
+    });
 
     JSValue::bool(true).raw()
 }
@@ -127,17 +105,9 @@ pub(crate) unsafe extern "C" fn js_unhook(
     let ptr_arg = JSValue(*argv);
 
     // Get the address
-    let addr = match get_native_pointer_addr(ctx, ptr_arg) {
-        Some(a) => a,
-        None => match ptr_arg.to_u64(ctx) {
-            Some(a) => a,
-            None => {
-                return ffi::JS_ThrowTypeError(
-                    ctx,
-                    b"unhook() argument must be a pointer\0".as_ptr() as *const _,
-                )
-            }
-        },
+    let addr = match extract_pointer_address(ctx, ptr_arg, "unhook") {
+        Ok(a) => a,
+        Err(e) => return e,
     };
 
     // 先移除 hook（阻止新回调进入），再从 registry 移除并释放 callback。
@@ -150,15 +120,12 @@ pub(crate) unsafe extern "C" fn js_unhook(
     }
 
     // hook 已移除，不会再有新回调触发，安全释放 callback
-    {
-        let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(registry) = guard.as_mut() {
-            if let Some(data) = registry.remove(&addr) {
-                let ctx = data.ctx as *mut ffi::JSContext;
-                let callback: ffi::JSValue =
-                    std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, callback);
-            }
+    if let Some(data) = with_registry_mut(&HOOK_REGISTRY, |registry| registry.remove(&addr)) {
+        if let Some(data) = data {
+            let ctx = data.ctx as *mut ffi::JSContext;
+            let callback: ffi::JSValue =
+                std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
+            ffi::qjs_free_value(ctx, callback);
         }
     }
 
@@ -183,17 +150,9 @@ pub(crate) unsafe extern "C" fn js_call_native(
 
     let ptr_arg = JSValue(*argv);
 
-    let addr = match get_native_pointer_addr(ctx, ptr_arg) {
-        Some(a) => a,
-        None => match ptr_arg.to_u64(ctx) {
-            Some(a) => a,
-            None => {
-                return ffi::JS_ThrowTypeError(
-                    ctx,
-                    b"callNative() argument must be a pointer or number\0".as_ptr() as *const _,
-                )
-            }
-        },
+    let addr = match extract_pointer_address(ctx, ptr_arg, "callNative") {
+        Ok(a) => a,
+        Err(e) => return e,
     };
 
     // Reject null and near-zero addresses without calling mincore:

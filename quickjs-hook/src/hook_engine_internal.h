@@ -41,11 +41,16 @@
 #define TRAMPOLINE_ALLOC_SIZE 256
 #define THUNK_ALLOC_SIZE 512
 
-/* --- Shared state --- */
+/* --- Shared state (defined in hook_engine.c) --- */
 extern HookEngine g_engine;
 extern HookLogFn g_log_fn;
 
-/* --- Diagnostic log --- */
+/* --- ART router globals (defined in hook_engine_art.c) --- */
+extern ArtRouterEntry g_art_router_table[ART_ROUTER_TABLE_MAX];
+extern volatile uint64_t g_art_router_last_x0;
+extern volatile uint64_t g_art_router_miss_count;
+
+/* --- Diagnostic log (hook_engine.c) --- */
 void hook_log(const char* fmt, ...);
 
 /* --- Memory management (hook_engine_mem.c) --- */
@@ -58,11 +63,98 @@ HookEntry* alloc_entry(void);
 void free_entry(HookEntry* entry);
 int wxshadow_patch(void* addr, const void* buf, size_t len);
 int wxshadow_release(void* addr);
+int write_jump_back(void* dst, void* target, uint32_t written_regs);
 
 /* --- Core (hook_engine.c) --- */
 HookEntry* find_hook(void* target);
 
-/* --- Redirect thunks (hook_engine_redir.c) --- */
+/* --- Hook installation helpers (hook_engine_mem.c) --- */
+
+/*
+ * Allocate and set up a HookEntry with trampoline.
+ *
+ * Caller must hold g_engine.lock. On success: pool is writable, entry is allocated
+ * with trampoline + original_bytes ready. On failure: returns NULL, lock is still held
+ * but pool is restored to executable.
+ *
+ * @param target    Address to hook
+ * @return          HookEntry* or NULL on failure
+ */
+HookEntry* setup_hook_entry(void* target);
+
+/*
+ * Relocate original instructions to the entry's trampoline and write jump-back.
+ *
+ * @param entry     HookEntry with target, original_bytes, trampoline set
+ * @return          0 on success, negative error code on failure
+ */
+int build_trampoline(HookEntry* entry);
+
+/*
+ * Patch the target address to jump to jump_dest.
+ *
+ * @param target        Address to patch
+ * @param jump_dest     Destination to jump to
+ * @param stealth       1 for wxshadow, 0 for mprotect
+ * @param entry         HookEntry (sets entry->stealth)
+ * @return              0 on success, negative error code on failure
+ */
+int patch_target(void* target, void* jump_dest, int stealth, HookEntry* entry);
+
+/*
+ * Finalize the hook: flush caches, add to hook list, make pool executable.
+ *
+ * @param entry         HookEntry to finalize
+ * @param thunk         Thunk pointer (may be NULL for simple replacement)
+ * @param thunk_size    Thunk size in bytes (0 if no thunk)
+ */
+void finalize_hook(HookEntry* entry, void* thunk, size_t thunk_size);
+
+/* --- Thunk emit helpers (hook_engine_inline.c) --- */
+
+/*
+ * Emit the shared HookContext save prologue (288-byte stack frame).
+ *
+ * Generates: SUB SP, #288 → STP x0-x29 → STR x30 →
+ *            save original SP → save target_pc → save NZCV →
+ *            optionally save trampoline_ptr
+ *
+ * @param w               Writer instance
+ * @param target_pc       Value to store in context.pc (original function address)
+ * @param trampoline_ptr  Trampoline address to store in context.trampoline;
+ *                        0 to skip (not all thunks need a trampoline)
+ */
+void emit_save_hook_context(Arm64Writer* w, uint64_t target_pc, uint64_t trampoline_ptr);
+
+/*
+ * Emit callback invocation: set up args and BLR.
+ *
+ * Generates: MOV X0, SP → LDR X1, =user_data → LDR X16, =callback → BLR X16
+ *
+ * @param w           Writer instance
+ * @param callback    Callback function address
+ * @param user_data   User data to pass as second argument
+ */
+void emit_callback_call(Arm64Writer* w, HookCallback callback, void* user_data);
+
+/*
+ * Emit replace-mode epilogue: restore x0 + LR, deallocate 288-byte stack, RET.
+ *
+ * Shared by generate_replace_thunk (inline hook) and generate_native_hook_thunk (Java hook).
+ */
+void emit_replace_epilogue(Arm64Writer* w);
+
+/*
+ * Emit x0-x15 restore from HookContext on stack.
+ *
+ * Restores caller-saved registers (x0-x15) from the 288-byte HookContext frame.
+ * Does NOT restore x16-x18 — caller handles those after loading addresses into x16.
+ *
+ * Shared by generate_attach_thunk (inline hook) and generate_redirect_thunk (Java hook).
+ */
+void emit_restore_caller_regs(Arm64Writer* w);
+
+/* --- Inline hook thunks (hook_engine_inline.c) --- */
 void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
                              HookCallback on_leave, void* user_data,
                              size_t* thunk_size_out);

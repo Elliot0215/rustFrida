@@ -43,8 +43,54 @@
         this._cache = cache || null;
     }
 
-    MethodWrapper.prototype.overload = function(sig) {
-        return new MethodWrapper(this._c, this._m, sig, this._cache);
+    // Convert Java type name to JNI type descriptor (mirrors Rust java_type_to_jni)
+    function _jniType(t) {
+        switch(t) {
+            case "void": case "V": return "V";
+            case "boolean": case "Z": return "Z";
+            case "byte": case "B": return "B";
+            case "char": case "C": return "C";
+            case "short": case "S": return "S";
+            case "int": case "I": return "I";
+            case "long": case "J": return "J";
+            case "float": case "F": return "F";
+            case "double": case "D": return "D";
+            default:
+                if (t.charAt(0) === '[') return t.replace(/\./g, "/");
+                return "L" + t.replace(/\./g, "/") + ";";
+        }
+    }
+
+    // Frida-compatible overload: accepts Java type names as arguments
+    // e.g. .overload("java.lang.String", "int") → matches JNI sig "(Ljava/lang/String;I)..."
+    // Also accepts raw JNI signature: .overload("(Ljava/lang/String;)I")
+    MethodWrapper.prototype.overload = function() {
+        if (arguments.length === 1 && typeof arguments[0] === "string"
+            && arguments[0].charAt(0) === '(') {
+            // Raw JNI signature passed directly
+            return new MethodWrapper(this._c, this._m, arguments[0], this._cache);
+        }
+        // Build JNI parameter prefix from Java type names
+        var paramSig = "(";
+        for (var i = 0; i < arguments.length; i++) {
+            paramSig += _jniType(arguments[i]);
+        }
+        paramSig += ")";
+        // Find matching method from _methods
+        var ms;
+        if (this._cache && this._cache.methods) {
+            ms = this._cache.methods;
+        } else {
+            ms = _methods(this._c);
+            if (this._cache) this._cache.methods = ms;
+        }
+        var name = this._m === "$init" ? "<init>" : this._m;
+        for (var i = 0; i < ms.length; i++) {
+            if (ms[i].name === name && ms[i].sig.indexOf(paramSig) === 0) {
+                return new MethodWrapper(this._c, this._m, ms[i].sig, this._cache);
+            }
+        }
+        throw new Error("No matching overload: " + this._c + "." + this._m + paramSig);
     };
 
     Object.defineProperty(MethodWrapper.prototype, "impl", {

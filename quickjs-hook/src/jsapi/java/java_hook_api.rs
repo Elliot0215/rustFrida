@@ -1,4 +1,17 @@
 //! JS API: Java.hook / Java.unhook
+//!
+//! 统一 Clone+Replace 策略:
+//! 所有方法（无论编译/解释）统一走:
+//! 1. clone → backup (callOriginal 用)
+//! 2. 创建 replacement (native, jniCode=thunk, quickCode=jni_trampoline, flags=native)
+//! 3. 修改 original flags (kAccCompileDontBother 等)
+//! 4. Nterp 降级 (如果需要)
+//! 5. 确保 artController 初始化 (Layer 1 + Layer 2)
+//! 6. 注册 replacedMethods(original, replacement)
+//! 7. 编译方法: 安装 per-method 路由 hook (Layer 3)
+//! 8. 注册 JAVA_HOOK_REGISTRY
+//!
+//! 所有 callback 统一 JNI 约定: x0=JNIEnv*, x1=this/class, x2+=args
 
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
@@ -6,13 +19,30 @@ use crate::jsapi::console::output_message;
 use crate::value::JSValue;
 use std::ffi::CString;
 
+use crate::jsapi::callback_util::{dup_callback_to_bytes, with_registry, with_registry_mut};
+
 use super::jni_core::*;
 use super::reflect::*;
 use super::art_method::*;
+use super::art_controller::ensure_art_controller_initialized;
 use super::callback::*;
 
 // ============================================================================
 // JS API: Java.hook(class, method, sig, callback)
+//
+// 统一 Clone+Replace 流程:
+//
+// 1. fetchArtMethod — 读取原始 4 字段
+// 2. 检查 Xposed (kAccXposedHookedMethod)
+// 3. cloneArtMethod — 堆分配 backup clone (callOriginal 用)
+// 4. 创建 replacement ArtMethod (native, jniCode=thunk, quickCode=jni_trampoline)
+// 5. 修改 original flags
+// 6. Nterp 降级 (如果 quickCode == nterp → 改写为 interpreter_bridge)
+// 7. 确保 artController 初始化 (Layer 1 + Layer 2)
+// 8. 注册 replacedMethods 映射
+// 9. 编译方法: 安装 per-method 路由 hook (Layer 3)
+// 10. backup_clone: 编译方法设置 quickCode = trampoline
+// 11. 注册 JAVA_HOOK_REGISTRY
 // ============================================================================
 
 pub(super) unsafe extern "C" fn js_java_hook(
@@ -34,7 +64,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
     let sig_arg = JSValue(*argv.add(2));
     let callback_arg = JSValue(*argv.add(3));
 
-    // Extract string arguments
+    // 提取字符串参数
     let class_name = match class_arg.to_string(ctx) {
         Some(s) => s,
         None => {
@@ -72,14 +102,14 @@ pub(super) unsafe extern "C" fn js_java_hook(
         );
     }
 
-    // Parse "static:" prefix
+    // 解析 "static:" 前缀
     let (actual_sig, force_static) = if let Some(stripped) = sig_str.strip_prefix("static:") {
         (stripped.to_string(), true)
     } else {
         (sig_str.clone(), false)
     };
 
-    // Initialize JNI
+    // 初始化 JNI
     let env = match ensure_jni_initialized() {
         Ok(e) => e,
         Err(msg) => {
@@ -88,7 +118,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
         }
     };
 
-    // Resolve ArtMethod
+    // 解析 ArtMethod
     let (art_method, is_static) = match resolve_art_method(env, &class_name, &method_name, &actual_sig, force_static) {
         Ok(r) => r,
         Err(msg) => {
@@ -97,79 +127,59 @@ pub(super) unsafe extern "C" fn js_java_hook(
         }
     };
 
-    // Check if already hooked
+    // 检查是否已 hook
     init_java_registry();
-    {
-        let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref registry) = *guard {
-            if registry.contains_key(&art_method) {
-                return ffi::JS_ThrowInternalError(
-                    ctx,
-                    b"method already hooked (unhook first)\0".as_ptr() as *const _,
-                );
-            }
-        }
+    if with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false) {
+        return ffi::JS_ThrowInternalError(
+            ctx,
+            b"method already hooked (unhook first)\0".as_ptr() as *const _,
+        );
     }
 
-    // Probe entry_point offset (lazy, one-time)
+    // 探测 entry_point 偏移（惰性，一次性）
     let ep_offset = get_entry_point_offset(env, art_method);
+    let data_off = data_offset_for(ep_offset);
 
     // ================================================================
-    // Replace-with-native hooking
-    //
-    // Convert the method to native so ART routes calls through
-    // art_quick_generic_jni_trampoline → data_ (our thunk).
-    //
-    // This ensures the JNI calling convention:
-    //   x0=JNIEnv*, x1=jobject/jclass, x2-x7=Java args
-    //
-    // Steps:
-    //   1. Write thunk to data_ (JNI function pointer slot)
-    //   2. Set kAccNative + kAccCompileDontBother flags
-    //   3. Write art_quick_generic_jni_trampoline to entry_point_
-    //
-    // GC safety: ArtMethod::VisitRoots() only visits declaring_class_,
-    // NOT data_. With kAccNative set, ART treats data_ as an opaque
-    // JNI function pointer. Writing data_ BEFORE setting flags avoids
-    // any window where GC sees inconsistent state.
+    // Step 1: fetchArtMethod — 读取原始方法的 4 个关键字段
     // ================================================================
-
-    // Find the JNI trampoline (required for native hook path)
-    let jni_trampoline = find_jni_trampoline(env, ep_offset);
-    if jni_trampoline == 0 {
-        let err = CString::new("failed to find art_quick_generic_jni_trampoline").unwrap();
-        return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
-    }
-    output_message(&format!(
-        "[java hook] JNI trampoline={:#x}", jni_trampoline
-    ));
-
-    // Save original method state for unhook
-    let original_access_flags = {
-        std::ptr::read_volatile(
-            (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *const u32,
-        )
-    };
-    let original_data = {
-        std::ptr::read_volatile(
-            (art_method as usize + data_offset_for(ep_offset)) as *const u64,
-        )
-    };
+    let original_access_flags = std::ptr::read_volatile(
+        (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *const u32,
+    );
+    let original_data = std::ptr::read_volatile(
+        (art_method as usize + data_off) as *const u64,
+    );
     let original_entry_point = read_entry_point(art_method, ep_offset);
 
     output_message(&format!(
-        "[java hook] art_method={:#x}, orig_flags={:#x}, orig_data={:#x}, orig_entry={:#x}",
+        "[java hook] Step 1 fetchArtMethod: art_method={:#x}, flags={:#x}, data_={:#x}, ep={:#x}",
         art_method, original_access_flags, original_data, original_entry_point
     ));
 
-    // Clone ArtMethod for callOriginal (Frida pattern)
-    // The clone preserves the original method state. callOriginal() invokes the clone
-    // via JNI CallNonvirtual*MethodA which reads the clone's original quickCode.
-    let clone_size = ep_offset + 8; // includes entry_point field
+    // ================================================================
+    // Step 2: 检查 Xposed (kAccXposedHookedMethod = 0x10000000)
+    // 注意: 0x10000000 在 Android 12+ (API 30+) 等于 kAccIntrinsic，
+    // 所有内部方法 (String.length, Integer.parseInt 等) 都设置了此标志。
+    // 仅在 API < 30 时检查以避免误报。
+    // ================================================================
+    {
+        let api_level = get_android_api_level();
+        if api_level < 30 && (original_access_flags & K_ACC_XPOSED_HOOKED_METHOD) != 0 {
+            output_message(&format!(
+                "[java hook] Step 2: Xposed hooked method detected (flags={:#x}), proceeding with caution",
+                original_access_flags
+            ));
+        }
+    }
+
+    // ================================================================
+    // Step 3: cloneArtMethod — 堆分配 backup clone (callOriginal 用)
+    // ================================================================
+    let clone_size = ep_offset + 8;
     let clone_addr = {
         let ptr = libc::malloc(clone_size);
         if ptr.is_null() {
-            let err = CString::new("malloc failed for ArtMethod clone").unwrap();
+            let err = CString::new("malloc failed for ArtMethod backup clone").unwrap();
             return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
         }
         std::ptr::copy_nonoverlapping(
@@ -179,11 +189,22 @@ pub(super) unsafe extern "C" fn js_java_hook(
         );
         ptr as u64
     };
+
     output_message(&format!(
-        "[java hook] ArtMethod clone at {:#x} (size={})", clone_addr, clone_size
+        "[java hook] Step 3 clone: backup={:#x} (size={})", clone_addr, clone_size
     ));
 
-    // Create JNI global ref to the class for callOriginal JNI calls
+    // 发现 ART bridge 函数（惰性，一次性）
+    let bridge = find_art_bridge_functions(env, ep_offset);
+
+    let jni_trampoline = bridge.quick_generic_jni_trampoline;
+    if jni_trampoline == 0 {
+        libc::free(clone_addr as *mut std::ffi::c_void);
+        let err = CString::new("failed to find art_quick_generic_jni_trampoline").unwrap();
+        return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+    }
+
+    // 创建 JNI global ref（callOriginal 用）
     let class_global_ref = {
         let cls = find_class_safe(env, &class_name);
         if cls.is_null() {
@@ -198,19 +219,29 @@ pub(super) unsafe extern "C" fn js_java_hook(
         gref as usize
     };
 
-    // Extract return type from signature
     let return_type = get_return_type_from_sig(&actual_sig);
 
-    // Create native hook thunk (saves context → calls callback → restores x0 → RET)
+    // ================================================================
+    // Step 4: 创建 replacement ArtMethod (统一: native, jniCode=thunk, quickCode=jni_trampoline)
+    // ================================================================
+
+    // 判断是否为编译方法 (quickCode 不在 libart.so 内)
+    let has_independent_code = !is_art_quick_entrypoint(original_entry_point, bridge);
+
+    output_message(&format!(
+        "[java hook] Step 4: has_independent_code={} (ep={:#x})",
+        has_independent_code, original_entry_point
+    ));
+
+    // 创建 native thunk (callback when method is called via JNI trampoline)
     let thunk = hook_ffi::hook_create_native_trampoline(
-        art_method,                          // key = ArtMethod*
-        Some(java_hook_callback),            // on_enter callback
-        art_method as *mut std::ffi::c_void, // user_data = ArtMethod* for registry lookup
+        art_method,
+        Some(java_hook_callback),
+        art_method as *mut std::ffi::c_void,
     );
 
     if thunk.is_null() {
         libc::free(clone_addr as *mut std::ffi::c_void);
-        // 释放 class global ref，避免泄漏
         if class_global_ref != 0 {
             if let Ok(env) = get_thread_env() {
                 let delete_global_ref: DeleteGlobalRefFn =
@@ -222,29 +253,212 @@ pub(super) unsafe extern "C" fn js_java_hook(
         return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
     }
 
-    // Duplicate callback and store in registry BEFORE modifying ArtMethod
-    let callback_dup = ffi::qjs_dup_value(ctx, callback_arg.raw());
-    let mut callback_bytes = [0u8; 16];
-    std::ptr::copy_nonoverlapping(
-        &callback_dup as *const ffi::JSValue as *const u8,
-        callback_bytes.as_mut_ptr(),
-        16,
-    );
+    // 创建 replacement ArtMethod (native method with our thunk)
+    let replacement_addr = {
+        let ptr = libc::malloc(clone_size);
+        if ptr.is_null() {
+            libc::free(clone_addr as *mut std::ffi::c_void);
+            hook_ffi::hook_remove_redirect(art_method);
+            if class_global_ref != 0 {
+                if let Ok(env) = get_thread_env() {
+                    let delete_global_ref: DeleteGlobalRefFn =
+                        jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
+                    delete_global_ref(env, class_global_ref as *mut std::ffi::c_void);
+                }
+            }
+            let err = CString::new("malloc failed for replacement ArtMethod").unwrap();
+            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+        }
+        std::ptr::copy_nonoverlapping(
+            art_method as *const u8,
+            ptr as *mut u8,
+            clone_size,
+        );
 
+        let repl = ptr as usize;
+
+        let repl_flags = (original_access_flags
+            & !(K_ACC_CRITICAL_NATIVE | K_ACC_FAST_NATIVE | K_ACC_NTERP_ENTRY_POINT_FAST_PATH))
+            | K_ACC_NATIVE
+            | K_ACC_COMPILE_DONT_BOTHER;
+        std::ptr::write_volatile(
+            (repl + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+            repl_flags,
+        );
+        std::ptr::write_volatile(
+            (repl + data_off) as *mut u64,
+            thunk as u64,
+        );
+        std::ptr::write_volatile(
+            (repl + ep_offset) as *mut u64,
+            jni_trampoline,
+        );
+        hook_ffi::hook_flush_cache(ptr, clone_size);
+
+        output_message(&format!(
+            "[java hook] Step 4 replacement: addr={:#x}, flags={:#x}, data_={:#x}, ep={:#x}",
+            repl, repl_flags, thunk as u64, jni_trampoline
+        ));
+
+        repl
+    };
+
+    // ================================================================
+    // Step 5: 修改 ORIGINAL — accessFlags (所有方法)
+    //
+    // 清除:
+    //   kAccFastInterpreterToInterpreterInvoke — 阻止解释器走快速路径绕过 entry_point
+    //   kAccSingleImplementation — 阻止虚调用去虚化优化
+    //   kAccNterpEntryPointFastPath — 阻止 Nterp 快速路径
+    //   kAccSkipAccessChecks — 阻止 access check 跳过 (非 native 方法)
+    // 设置:
+    //   kAccCompileDontBother — 阻止 JIT 重编译/内联
+    //
+    // 关键: kAccFastInterpreterToInterpreterInvoke (0x40000000) 必须清除，否则
+    // 解释器会直接调用 artInterpreterToInterpreterBridge() 而不经过
+    // entry_point 分发，导致 Layer 1 hook 被完全绕过。
+    // ================================================================
     {
-        let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        let registry = guard.as_mut().unwrap();
+        let mut removed_flags = K_ACC_FAST_INTERP_TO_INTERP
+            | K_ACC_SINGLE_IMPLEMENTATION
+            | K_ACC_NTERP_ENTRY_POINT_FAST_PATH;
+        if (original_access_flags & K_ACC_NATIVE) == 0 {
+            removed_flags |= K_ACC_SKIP_ACCESS_CHECKS;
+        }
+        let new_flags = (original_access_flags & !removed_flags) | K_ACC_COMPILE_DONT_BOTHER;
+        std::ptr::write_volatile(
+            (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+            new_flags,
+        );
+        output_message(&format!(
+            "[java hook] Step 5 original flags: {:#x} → {:#x}", original_access_flags, new_flags
+        ));
+    }
+
+    // ================================================================
+    // Step 7: 确保 artController 已初始化 (Layer 1 + Layer 2)
+    // ================================================================
+    ensure_art_controller_initialized(bridge, ep_offset, env as *mut std::ffi::c_void);
+
+    // ================================================================
+    // Step 8: 注册 replacedMethods 映射 (所有方法统一注册)
+    // ================================================================
+    set_replacement_method(art_method, replacement_addr as u64);
+    output_message(&format!(
+        "[java hook] Step 8: replacedMethods.set({:#x}, {:#x})", art_method, replacement_addr
+    ));
+
+    // Debug: verify table was populated and scan works
+    hook_ffi::hook_art_router_table_dump();
+    hook_ffi::hook_art_router_debug_scan(art_method);
+
+    // ================================================================
+    // Step 9: 拦截方法调用
+    //
+    // 编译方法 (has_independent_code=true):
+    //   安装 Layer 3 per-method 路由 hook (inline patch 独立编译代码)
+    //   backup_clone.quickCode = trampoline (绕过路由 hook)
+    //
+    // 共享 stub 方法 (has_independent_code=false):
+    //   不做 inline patch (避免破坏 libart.so 共享代码)
+    //   原子写入 entry_point = jni_trampoline (Layer 1 router 拦截)
+    //   backup_clone 保持原始 quickCode (不在 replacedMethods 中，router 不拦截)
+    // ================================================================
+    let per_method_hook_target = if has_independent_code {
+        // --- 编译方法: Layer 3 inline hook ---
+        let trampoline = hook_ffi::hook_install_art_router(
+            original_entry_point as *mut std::ffi::c_void,
+            ep_offset as u32,
+            0, // 不使用 stealth
+            env as *mut std::ffi::c_void,
+        );
+
+        if trampoline.is_null() {
+            delete_replacement_method(art_method);
+            hook_ffi::hook_remove_redirect(art_method);
+            libc::free(replacement_addr as *mut std::ffi::c_void);
+            libc::free(clone_addr as *mut std::ffi::c_void);
+            std::ptr::write_volatile(
+                (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+                original_access_flags,
+            );
+            if class_global_ref != 0 {
+                if let Ok(env) = get_thread_env() {
+                    let delete_global_ref: DeleteGlobalRefFn =
+                        jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
+                    delete_global_ref(env, class_global_ref as *mut std::ffi::c_void);
+                }
+            }
+            let err = CString::new("hook_install_art_router failed").unwrap();
+            return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
+        }
+
+        // backup_clone.quickCode = trampoline (绕过路由 hook, callOriginal 用)
+        std::ptr::write_volatile(
+            (clone_addr as usize + ep_offset) as *mut u64,
+            trampoline as u64,
+        );
+        hook_ffi::hook_flush_cache(
+            (clone_addr as usize + ep_offset) as *mut std::ffi::c_void,
+            8,
+        );
+
+        output_message(&format!(
+            "[java hook] Step 9: Layer 3 installed: ep={:#x}, trampoline={:#x}",
+            original_entry_point, trampoline as u64
+        ));
+
+        Some(original_entry_point)
+    } else {
+        // --- 共享 stub 方法: Frida 风格 nterp 降级 ---
+        // Nterp 特判: nterp → interpreter_bridge (libart → libart，无非 ART 地址暴露)
+        // 其他共享 stub (jni_trampoline, interpreter_bridge, resolution_trampoline)
+        // 不改 entry_point，完全依赖 Layer 1 + Layer 2 路由
+        if bridge.nterp_entry_point != 0 && original_entry_point == bridge.nterp_entry_point {
+            let interp_bridge = bridge.quick_to_interpreter_bridge;
+            if interp_bridge != 0 {
+                std::ptr::write_volatile(
+                    (art_method as usize + ep_offset) as *mut u64,
+                    interp_bridge,
+                );
+                hook_ffi::hook_flush_cache(
+                    (art_method as usize + ep_offset) as *mut std::ffi::c_void,
+                    8,
+                );
+                output_message(&format!(
+                    "[java hook] Step 9: nterp 降级: ep {:#x} → interpreter_bridge {:#x}",
+                    original_entry_point, interp_bridge
+                ));
+            }
+        } else {
+            output_message(&format!(
+                "[java hook] Step 9: 共享 stub, 依赖 Layer 1+2 路由: ep={:#x}",
+                original_entry_point
+            ));
+        }
+        None
+    };
+
+    // ================================================================
+    // Step 11: 注册 JAVA_HOOK_REGISTRY
+    // ================================================================
+    let callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
+
+    with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
         registry.insert(
             art_method,
             JavaHookData {
                 art_method,
                 original_access_flags,
-                original_data,
                 original_entry_point,
+                original_data,
+                hook_type: HookType::Replaced {
+                    replacement_addr,
+                    per_method_hook_target,
+                },
                 clone_addr,
                 class_global_ref,
                 return_type,
-                method_id_raw: art_method, // decoded art_method is the raw pointer
                 ctx: ctx as usize,
                 callback_bytes,
                 method_key: method_key(&class_name, &method_name, &actual_sig),
@@ -254,54 +468,15 @@ pub(super) unsafe extern "C" fn js_java_hook(
                 class_name: class_name.clone(),
             },
         );
-    }
+    });
 
-    // === Modify ArtMethod: convert to native with our thunk as JNI impl ===
-    // Order: data_ first → flags → entry_point_ (GC sees consistent state)
-
-    // 1. Write thunk to data_ (native function pointer slot)
-    {
-        let data_ptr = (art_method as usize + data_offset_for(ep_offset)) as *mut u64;
-        std::ptr::write_volatile(data_ptr, thunk as u64);
-    }
-
-    // 2. Set kAccNative + kAccCompileDontBother, clear fast-path flags
-    set_native_hook_flags(art_method);
-
-    // 3. Write JNI trampoline to entry_point_
-    {
-        let ep_ptr = (art_method as usize + ep_offset) as *mut u64;
-        std::ptr::write_volatile(ep_ptr, jni_trampoline);
-        hook_ffi::hook_flush_cache(
-            (art_method as usize) as *mut std::ffi::c_void,
-            ep_offset + 8,
-        );
-    }
-
-    // Verify writes
-    let verify_flags = {
-        std::ptr::read_volatile(
-            (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *const u32,
-        )
-    };
-    let verify_ep = read_entry_point(art_method, ep_offset);
-    let verify_data = {
-        std::ptr::read_volatile(
-            (art_method as usize + data_offset_for(ep_offset)) as *const u64,
-        )
-    };
-
-    output_message(&format!(
-        "[java hook] hook installed: flags={:#x}, entry(trampoline)={:#x}, data(thunk)={:#x}",
-        verify_flags, verify_ep, verify_data
-    ));
-
-    // Pre-cache field info for this class (safe from init thread)
+    // 预缓存字段信息
     cache_fields_for_class(env, &class_name);
 
+    let strategy = if has_independent_code { "compiled+router" } else { "shared_stub" };
     output_message(&format!(
-        "[java hook] hooked {}.{}{} (ArtMethod={:#x}, strategy=replace-with-native)",
-        class_name, method_name, actual_sig, art_method
+        "[java hook] 完成: {}.{}{} (ArtMethod={:#x}, strategy={})",
+        class_name, method_name, actual_sig, art_method, strategy
     ));
 
     JSValue::bool(true).raw()
@@ -309,6 +484,14 @@ pub(super) unsafe extern "C" fn js_java_hook(
 
 // ============================================================================
 // JS API: Java.unhook(class, method, sig)
+//
+// 统一 unhook 流程:
+// 1. 有 per_method_hook: hook_remove(quickCode)
+// 2. hook_remove_redirect (移除 native trampoline)
+// 3. 恢复全部 ArtMethod 字段 (accessFlags, data_, entry_point_)
+// 4. 删除 replacedMethods 映射
+// 5. 释放 replacement ArtMethod
+// 6. 释放资源 (clone, global ref, JS callback)
 // ============================================================================
 
 pub(super) unsafe extern "C" fn js_java_unhook(
@@ -359,7 +542,7 @@ pub(super) unsafe extern "C" fn js_java_unhook(
         }
     };
 
-    // Handle "static:" prefix
+    // 处理 "static:" 前缀
     let actual_sig = if let Some(stripped) = sig_str.strip_prefix("static:") {
         stripped.to_string()
     } else {
@@ -368,20 +551,14 @@ pub(super) unsafe extern "C" fn js_java_unhook(
 
     let key = method_key(&class_name, &method_name, &actual_sig);
 
-    // 先查找 art_method 地址并移除 hook redirect（阻止新回调进入），
-    // 然后再从 registry 移除 entry 并释放资源。
-    // 这个顺序避免了并发 callback 已复制旧数据但 entry 已被释放的竞态。
-    let art_method_addr = {
-        let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(registry) = guard.as_ref() {
-            registry
-                .iter()
-                .find(|(_, v)| v.method_key == key)
-                .map(|(k, _)| *k)
-        } else {
-            None
-        }
-    };
+    // 查找 art_method 地址
+    let art_method_addr = with_registry(&JAVA_HOOK_REGISTRY, |registry| {
+        registry
+            .iter()
+            .find(|(_, v)| v.method_key == key)
+            .map(|(k, _)| *k)
+    })
+    .flatten();
 
     let art_method_addr = match art_method_addr {
         Some(am) => am,
@@ -393,18 +570,11 @@ pub(super) unsafe extern "C" fn js_java_unhook(
         }
     };
 
-    // 1. 先移除 hook redirect，阻止新的 callback 触发
-    hook_ffi::hook_remove_redirect(art_method_addr);
-
-    // 2. 再从 registry 移除 entry（此时不会有新 callback 读取此 entry）
-    let hook_data = {
-        let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(registry) = guard.as_mut() {
-            registry.remove(&art_method_addr)
-        } else {
-            None
-        }
-    };
+    // 从 registry 移除 entry
+    let hook_data = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+        registry.remove(&art_method_addr)
+    })
+    .flatten();
 
     let hook_data = match hook_data {
         Some(d) => d,
@@ -416,35 +586,75 @@ pub(super) unsafe extern "C" fn js_java_unhook(
         }
     };
 
-    // Restore original ArtMethod state (data_ + access_flags_ + entry_point_)
-    // Order: entry_point_ first → flags → data_ (reverse of hook installation)
-    if let Some(&ep_offset) = ENTRY_POINT_OFFSET.get() {
-        // Restore entry_point_ first (stop routing to our thunk)
-        let ep_ptr = (hook_data.art_method as usize + ep_offset) as *mut u64;
-        std::ptr::write_volatile(ep_ptr, hook_data.original_entry_point);
+    // 统一 unhook 流程
+    match &hook_data.hook_type {
+        HookType::Replaced { replacement_addr, per_method_hook_target } => {
+            output_message(&format!(
+                "[java unhook] 开始: art_method={:#x}, replacement={:#x}, per_method={:?}",
+                hook_data.art_method, replacement_addr, per_method_hook_target
+            ));
 
-        // Restore access_flags_ (clears kAccNative)
-        let flags_ptr = (hook_data.art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET)
-            as *mut u32;
-        std::ptr::write_volatile(flags_ptr, hook_data.original_access_flags);
+            // Step 1: 删除 replacedMethods 映射 (先删，防止路由到已释放的 replacement)
+            delete_replacement_method(hook_data.art_method);
+            output_message("[java unhook] Step 1: replacedMethods 已删除");
 
-        // Restore data_
-        let data_ptr = (hook_data.art_method as usize + data_offset_for(ep_offset))
-            as *mut u64;
-        std::ptr::write_volatile(data_ptr, hook_data.original_data);
+            // Step 2: 移除 per-method 路由 hook (Layer 3, if any)
+            if let Some(target) = per_method_hook_target {
+                hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
+                output_message(&format!(
+                    "[java unhook] Step 2: Layer 3 hook 已移除: {:#x}", target
+                ));
+            }
 
-        hook_ffi::hook_flush_cache(
-            (hook_data.art_method as usize) as *mut std::ffi::c_void,
-            ep_offset + 8,
-        );
+            // Step 3: 恢复全部 ArtMethod 字段
+            if let Some(&ep_offset) = ENTRY_POINT_OFFSET.get() {
+                let data_off = data_offset_for(ep_offset);
+
+                // 恢复 access_flags_
+                std::ptr::write_volatile(
+                    (hook_data.art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+                    hook_data.original_access_flags,
+                );
+
+                // 恢复 data_ (jniCode)
+                std::ptr::write_volatile(
+                    (hook_data.art_method as usize + data_off) as *mut u64,
+                    hook_data.original_data,
+                );
+
+                // 恢复 entry_point_ (quickCode)
+                std::ptr::write_volatile(
+                    (hook_data.art_method as usize + ep_offset) as *mut u64,
+                    hook_data.original_entry_point,
+                );
+
+                hook_ffi::hook_flush_cache(
+                    (hook_data.art_method as usize) as *mut std::ffi::c_void,
+                    ep_offset + 8,
+                );
+                output_message("[java unhook] Step 3: ArtMethod 字段已恢复");
+            }
+
+            // Step 4: 移除 native trampoline (redirect entry)
+            hook_ffi::hook_remove_redirect(hook_data.art_method);
+            output_message("[java unhook] Step 4: native trampoline 已移除");
+
+            // Step 5: 释放 replacement ArtMethod
+            // NOTE: 延迟释放 — 其他线程可能仍在 ART 栈帧中引用 replacement
+            // 暂不释放，避免 use-after-free (32 bytes 泄漏可接受)
+            // if *replacement_addr != 0 {
+            //     libc::free(*replacement_addr as *mut std::ffi::c_void);
+            // }
+            output_message("[java unhook] Step 5: replacement 保留 (避免 UAF)");
+        }
     }
 
-    // Free the ArtMethod clone
+    // Step 6: 释放 backup clone (callOriginal)
     if hook_data.clone_addr != 0 {
         libc::free(hook_data.clone_addr as *mut std::ffi::c_void);
     }
 
-    // Delete the JNI global ref to the class
+    // 删除 JNI global ref
     if hook_data.class_global_ref != 0 {
         if let Ok(env) = get_thread_env() {
             let delete_global_ref: DeleteGlobalRefFn =
@@ -453,15 +663,14 @@ pub(super) unsafe extern "C" fn js_java_unhook(
         }
     }
 
-    // Free the JS callback
+    // 释放 JS callback
     let js_ctx = hook_data.ctx as *mut ffi::JSContext;
     let callback: ffi::JSValue =
         std::ptr::read(hook_data.callback_bytes.as_ptr() as *const ffi::JSValue);
     ffi::qjs_free_value(js_ctx, callback);
 
     output_message(&format!(
-        "[java hook] unhooked {}.{}{}",
-        class_name, method_name, actual_sig
+        "[java unhook] 完成: {}.{}{}", class_name, method_name, actual_sig
     ));
 
     JSValue::bool(true).raw()

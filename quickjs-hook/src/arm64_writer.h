@@ -451,6 +451,39 @@ void arm64_writer_put_branch_address(Arm64Writer* w, uint64_t target);
 /* Generate absolute call using MOVZ/MOVK sequence + BLR X16 (up to 20 bytes) */
 void arm64_writer_put_call_address(Arm64Writer* w, uint64_t target);
 
+/* Generate absolute jump using MOVZ/MOVK sequence + BR with specified scratch register */
+void arm64_writer_put_branch_address_reg(Arm64Writer* w, uint64_t target, Arm64Reg scratch);
+
+/* Generate absolute call using MOVZ/MOVK sequence + BLR with specified scratch register */
+void arm64_writer_put_call_address_reg(Arm64Writer* w, uint64_t target, Arm64Reg scratch);
+
+/* ============================================================================
+ * FP/SIMD Pair Instructions
+ * ============================================================================ */
+
+/* STP Dt1, Dt2, [Xn, #offset] - Store FP pair (signed offset) */
+void arm64_writer_put_fp_stp_offset(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
+                                     Arm64Reg base, int32_t offset);
+
+/* STP Dt1, Dt2, [Xn, #offset]! - Store FP pair (pre-index) */
+void arm64_writer_put_fp_stp_pre(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
+                                  Arm64Reg base, int32_t offset);
+
+/* LDP Dt1, Dt2, [Xn, #offset] - Load FP pair (signed offset) */
+void arm64_writer_put_fp_ldp_offset(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
+                                     Arm64Reg base, int32_t offset);
+
+/* LDP Dt1, Dt2, [Xn], #offset - Load FP pair (post-index) */
+void arm64_writer_put_fp_ldp_post(Arm64Writer* w, uint32_t dt1, uint32_t dt2,
+                                   Arm64Reg base, int32_t offset);
+
+/* ============================================================================
+ * Comparison Instructions
+ * ============================================================================ */
+
+/* CMP Xn, Xm - Compare registers (alias for SUBS XZR, Xn, Xm) */
+void arm64_writer_put_cmp_reg_reg(Arm64Writer* w, Arm64Reg rn, Arm64Reg rm);
+
 /* ============================================================================
  * Helper Macros
  * ============================================================================ */

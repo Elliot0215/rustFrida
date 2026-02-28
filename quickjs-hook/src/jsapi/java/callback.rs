@@ -1,10 +1,15 @@
-//! Java hook callback and registry
+//! Java hook callback and registry + replacedMethods mapping
 //!
 //! Contains: JavaHookData, JAVA_HOOK_REGISTRY, CURRENT_HOOK_* globals,
-//! helper functions, dispatch_call!, js_call_original, java_hook_callback.
+//! helper functions, dispatch_call!, js_call_original, java_hook_callback,
+//! replacedMethods mapping (set/get/delete).
 
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
+use crate::jsapi::callback_util::{
+    ensure_registry_initialized, invoke_hook_callback_common,
+    BiMap,
+};
 use crate::jsapi::console::output_message;
 use crate::value::JSValue;
 use std::collections::HashMap;
@@ -18,20 +23,33 @@ use super::jni_core::*;
 // Hook registry
 // ============================================================================
 
+/// Hook 类型：统一 Clone+Replace 策略
+/// 所有回调统一 JNI 调用约定: x0=JNIEnv*, x1=this/jclass, x2+=args
+pub(super) enum HookType {
+    /// Unified replacement hook
+    /// - replacement_addr: heap-allocated replacement ArtMethod (native, jniCode=thunk)
+    /// - per_method_hook_target: Some(quickCode) for compiled methods (Layer 3 router hook),
+    ///   None for shared stub methods (routed via Layer 1/2)
+    Replaced {
+        replacement_addr: usize,
+        per_method_hook_target: Option<u64>,
+    },
+}
+
 pub(super) struct JavaHookData {
     pub(super) art_method: u64,
-    // Original method state (saved for unhook restore)
+    // Frida-style original method state（unhook 时恢复全部字段）
     pub(super) original_access_flags: u32,
-    pub(super) original_data: u64,
-    pub(super) original_entry_point: u64,
-    // ArtMethod clone for callOriginal (heap-allocated, 8-byte aligned)
+    pub(super) original_entry_point: u64,  // quickCode / entry_point_
+    pub(super) original_data: u64,         // data_ / jniCode
+    // Hook 路径类型
+    pub(super) hook_type: HookType,
+    // Backup clone for callOriginal (heap, 原始状态副本)
     pub(super) clone_addr: u64,
     // JNI global ref to jclass (for JNI CallNonvirtual/Static calls)
     pub(super) class_global_ref: usize,
     // Return type char from JNI signature: b'V', b'I', b'J', b'Z', b'L', etc.
     pub(super) return_type: u8,
-    // Original jmethodID (before decode) — for JNI calls via clone
-    pub(super) method_id_raw: u64,
     // JS callback info
     pub(super) ctx: usize,
     pub(super) callback_bytes: [u8; 16],
@@ -71,10 +89,7 @@ pub(super) fn get_return_type_from_sig(sig: &str) -> u8 {
 }
 
 pub(super) fn init_java_registry() {
-    let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.is_none() {
-        *guard = Some(HashMap::new());
-    }
+    ensure_registry_initialized(&JAVA_HOOK_REGISTRY);
 }
 
 /// Build a unique key string for method lookup
@@ -182,6 +197,20 @@ macro_rules! dispatch_call {
     }};
 }
 
+/// Dispatch + check exception + convert result to JSValue.
+/// 将 dispatch_call、jni_check_exc 和 JSValue 转换统一为单个宏调用。
+macro_rules! dispatch_and_convert {
+    // 非 void 原始类型: dispatch → check exc → convert to JSValue
+    ($env:expr, $static_idx:expr, $nonvirt_idx:expr,
+     $cls:expr, $this:expr, $mid:expr, $args:expr, $is_static:expr,
+     $ret_ty:ty, $convert:expr) => {{
+        let ret: $ret_ty = dispatch_call!($env, $static_idx, $nonvirt_idx,
+                                          $cls, $this, $mid, $args, $is_static, $ret_ty);
+        jni_check_exc($env);
+        $convert(ret)
+    }};
+}
+
 /// JS CFunction: ctx.callOriginal()
 /// Invokes the cloned ArtMethod via JNI CallNonvirtual*MethodA / CallStatic*MethodA.
 /// Returns the method's return value as a JS value.
@@ -238,24 +267,24 @@ unsafe extern "C" fn js_call_original(
 
     let hook_ctx = &*ctx_ptr;
 
-    // JNIEnv* is in x0 of the HookContext (set by ART's JNI trampoline)
-    let env: JniEnv = hook_ctx.x[0] as JniEnv;
-    if env.is_null() {
-        return ffi::JS_ThrowInternalError(
-            ctx,
-            b"callOriginal: JNIEnv* is null\0".as_ptr() as *const _,
-        );
-    }
+    // Unified JNI calling convention: x0=JNIEnv*, x1=this/class, x2+=args
+    let env: JniEnv = {
+        let e = hook_ctx.x[0] as JniEnv;
+        if e.is_null() {
+            return ffi::JS_ThrowInternalError(
+                ctx,
+                b"callOriginal: JNIEnv* is null\0".as_ptr() as *const _,
+            );
+        }
+        e
+    };
 
-    // Build jvalue args from HookContext registers x2-x7 + stack spill
-    // jvalue is a union of 8 bytes (same size on ARM64)
-    // ARM64 JNI: x0=JNIEnv, x1=this/class, x2-x7=args 0-5, stack for args 6+
+    // Build jvalue args from HookContext registers (JNI convention: x2-x7 = args[0-5])
     let mut jargs: Vec<u64> = Vec::with_capacity(param_count);
     for i in 0..param_count {
         let val = if i < 6 {
             hook_ctx.x[2 + i]
         } else {
-            // Args 6+ are on the stack at SP+0, SP+8, SP+16, ...
             let sp = hook_ctx.sp as usize;
             *((sp + (i - 6) * 8) as *const u64)
         };
@@ -289,36 +318,16 @@ unsafe extern "C" fn js_call_original(
             }
             ffi::qjs_undefined()
         }
-        b'Z' => {
-            let ret: u8 = dispatch_call!(env, JNI_CALL_STATIC_BOOLEAN_METHOD_A, JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A,
-                                         cls, this_obj, clone_mid, jargs_ptr, is_static, u8);
-            jni_check_exc(env);
-            JSValue::bool(ret != 0).raw()
-        }
-        b'I' | b'B' | b'C' | b'S' => {
-            let ret: i32 = dispatch_call!(env, JNI_CALL_STATIC_INT_METHOD_A, JNI_CALL_NONVIRTUAL_INT_METHOD_A,
-                                          cls, this_obj, clone_mid, jargs_ptr, is_static, i32);
-            jni_check_exc(env);
-            JSValue::int(ret).raw()
-        }
-        b'J' => {
-            let ret: i64 = dispatch_call!(env, JNI_CALL_STATIC_LONG_METHOD_A, JNI_CALL_NONVIRTUAL_LONG_METHOD_A,
-                                          cls, this_obj, clone_mid, jargs_ptr, is_static, i64);
-            jni_check_exc(env);
-            ffi::JS_NewBigUint64(ctx, ret as u64)
-        }
-        b'F' => {
-            let ret: f32 = dispatch_call!(env, JNI_CALL_STATIC_FLOAT_METHOD_A, JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A,
-                                          cls, this_obj, clone_mid, jargs_ptr, is_static, f32);
-            jni_check_exc(env);
-            JSValue::float(ret as f64).raw()
-        }
-        b'D' => {
-            let ret: f64 = dispatch_call!(env, JNI_CALL_STATIC_DOUBLE_METHOD_A, JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A,
-                                          cls, this_obj, clone_mid, jargs_ptr, is_static, f64);
-            jni_check_exc(env);
-            JSValue::float(ret).raw()
-        }
+        b'Z' => dispatch_and_convert!(env, JNI_CALL_STATIC_BOOLEAN_METHOD_A, JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A,
+                    cls, this_obj, clone_mid, jargs_ptr, is_static, u8, |ret: u8| JSValue::bool(ret != 0).raw()),
+        b'I' | b'B' | b'C' | b'S' => dispatch_and_convert!(env, JNI_CALL_STATIC_INT_METHOD_A, JNI_CALL_NONVIRTUAL_INT_METHOD_A,
+                    cls, this_obj, clone_mid, jargs_ptr, is_static, i32, |ret: i32| JSValue::int(ret).raw()),
+        b'J' => dispatch_and_convert!(env, JNI_CALL_STATIC_LONG_METHOD_A, JNI_CALL_NONVIRTUAL_LONG_METHOD_A,
+                    cls, this_obj, clone_mid, jargs_ptr, is_static, i64, |ret: i64| ffi::JS_NewBigUint64(ctx, ret as u64)),
+        b'F' => dispatch_and_convert!(env, JNI_CALL_STATIC_FLOAT_METHOD_A, JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A,
+                    cls, this_obj, clone_mid, jargs_ptr, is_static, f32, |ret: f32| JSValue::float(ret as f64).raw()),
+        b'D' => dispatch_and_convert!(env, JNI_CALL_STATIC_DOUBLE_METHOD_A, JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A,
+                    cls, this_obj, clone_mid, jargs_ptr, is_static, f64, |ret: f64| JSValue::float(ret).raw()),
         b'L' | b'[' => {
             let ret: *mut std::ffi::c_void = dispatch_call!(env, JNI_CALL_STATIC_OBJECT_METHOD_A, JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A,
                                                             cls, this_obj, clone_mid, jargs_ptr, is_static, *mut std::ffi::c_void);
@@ -456,7 +465,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     // user_data is ArtMethod* address (used as registry key)
     let art_method_addr = user_data as u64;
 
-    // Copy callback data then release lock (same pattern as hook_api.rs)
+    // Copy callback data then release lock before QuickJS operations
     let (ctx_usize, callback_bytes, is_static, param_count, return_type, param_types) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
@@ -475,138 +484,139 @@ pub(super) unsafe extern "C" fn java_hook_callback(
          hook_data.param_types.clone())
     }; // lock released
 
-    // Serialize JS access via JS_ENGINE mutex.
-    // Use try_lock() to prevent same-thread deadlock: if JS thread executes JS → JNI → hooked
-    // method, JS thread already holds JS_ENGINE → blocking lock() would deadlock.
-    // Same pattern as hook_api/callback.rs.
-    let _js_guard = match crate::JS_ENGINE.try_lock() {
-        Ok(g) => g,
-        Err(std::sync::TryLockError::WouldBlock) => {
-            // JS 线程已持有锁（重入调用）或另一线程正在执行回调，跳过以避免死锁
-            output_message(&format!(
-                "[java hook] callback skipped (JS engine busy), art_method={:#x}",
-                art_method_addr
-            ));
-            return;
-        }
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-    };
-
-    let ctx = ctx_usize as *mut ffi::JSContext;
-    let callback: ffi::JSValue =
-        std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
-
-    // CRITICAL: Update QuickJS stack top for cross-thread safety
-    ffi::qjs_update_stack_top(ctx);
-
     // Set callback state globals for js_call_original
     CURRENT_HOOK_CTX_PTR.store(ctx_ptr as usize, Ordering::Relaxed);
     CURRENT_HOOK_ART_METHOD.store(art_method_addr, Ordering::Relaxed);
 
-    // Build context object
-    let js_ctx = ffi::JS_NewObject(ctx);
-    let hook_ctx = &*ctx_ptr;
+    invoke_hook_callback_common(
+        ctx_usize,
+        &callback_bytes,
+        "java hook",
+        art_method_addr,
+        // 构建 JS 上下文对象：thisObj, args[], env, callOriginal()
+        |ctx| {
+            let js_ctx = ffi::JS_NewObject(ctx);
+            let hook_ctx = &*ctx_ptr;
+            let env: JniEnv = hook_ctx.x[0] as JniEnv;
 
-    // JNI calling convention: x0=JNIEnv*, x1=this/class, x2+=args
-    // Add thisObj for instance methods (x1 = jobject this)
-    // NOTE: thisObj 和 object 类型参数使用 ART 传入的原始 local ref（x 寄存器中的 jobject）。
-    // 这些 local ref 在 hook callback 返回前有效。JS callback 中不应异步存储这些值。
-    // 如需跨 callback 持久化，需在 JS 侧调用 Java 方法创建 global ref。
-    if !is_static {
-        let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[1]);
-        JSValue(js_ctx).set_property(ctx, "thisObj", JSValue(val));
-    }
-
-    // Add args[] — x2-x7 contain first 6 Java arguments, stack for args 6+.
-    // JNIEnv* from x0 for reading String/Object args.
-    {
-        let env: JniEnv = hook_ctx.x[0] as JniEnv;
-        let arr = ffi::JS_NewArray(ctx);
-        for i in 0..param_count {
-            let raw = if i < 6 {
-                hook_ctx.x[2 + i] // x2-x7
-            } else {
-                // Args 6+ are on the stack at SP+0, SP+8, SP+16, ...
-                let sp = hook_ctx.sp as usize;
-                *((sp + (i - 6) * 8) as *const u64)
-            };
-            let val = marshal_jni_arg_to_js(ctx, env, raw, param_types.get(i).map(|s| s.as_str()));
-            ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
-        }
-        JSValue(js_ctx).set_property(ctx, "args", JSValue(arr));
-    }
-
-    // Add env (JNIEnv* — useful for advanced JNI calls from JS)
-    {
-        let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[0]);
-        JSValue(js_ctx).set_property(ctx, "env", JSValue(val));
-    }
-
-    // Add callOriginal() CFunction to the context object
-    {
-        let cname = CString::new("callOriginal").unwrap();
-        let func_val = ffi::qjs_new_cfunction(ctx, Some(js_call_original), cname.as_ptr(), 0);
-        JSValue(js_ctx).set_property(ctx, "callOriginal", JSValue(func_val));
-    }
-
-    let global = ffi::JS_GetGlobalObject(ctx);
-    let result = ffi::JS_Call(ctx, callback, global, 1, &js_ctx as *const _ as *mut _);
-
-    // Check for exception
-    if ffi::qjs_is_exception(result) != 0 {
-        let exc = ffi::JS_GetException(ctx);
-        let exc_val = JSValue(exc);
-        let msg_prop = exc_val.get_property(ctx, "message");
-        let msg = if let Some(s) = msg_prop.to_string(ctx) {
-            msg_prop.free(ctx);
-            s
-        } else {
-            msg_prop.free(ctx);
-            exc_val.to_string(ctx).unwrap_or_else(|| "[unknown exception]".to_string())
-        };
-        output_message(&format!("[java hook error] {}", msg));
-        exc_val.free(ctx);
-    } else if return_type != b'V' {
-        // Propagate JS return value to HookContext.x[0] for non-void methods.
-        // The thunk restores x0 from HookContext, so ART sees this as the return value.
-        let result_val = JSValue(result);
-        let ret_u64 = match return_type {
-            b'F' => {
-                // Float: convert JS number to f32 IEEE 754 bits in low 32 bits
-                if let Some(f) = result_val.to_float() {
-                    (f as f32).to_bits() as u64
-                } else {
-                    0u64
-                }
+            // thisObj for instance methods (x1 = jobject this)
+            if !is_static {
+                let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[1]);
+                JSValue(js_ctx).set_property(ctx, "thisObj", JSValue(val));
             }
-            b'D' => {
-                // Double: convert JS number to f64 IEEE 754 bits
-                if let Some(f) = result_val.to_float() {
-                    f.to_bits()
-                } else {
-                    0u64
+
+            // args[] — x2-x7 = first 6 args, stack for args 6+
+            {
+                let arr = ffi::JS_NewArray(ctx);
+                for i in 0..param_count {
+                    let raw = if i < 6 {
+                        hook_ctx.x[2 + i]
+                    } else {
+                        let sp = hook_ctx.sp as usize;
+                        *((sp + (i - 6) * 8) as *const u64)
+                    };
+                    let val = marshal_jni_arg_to_js(ctx, env, raw, param_types.get(i).map(|s| s.as_str()));
+                    ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
                 }
+                JSValue(js_ctx).set_property(ctx, "args", JSValue(arr));
             }
-            _ => {
-                // Integer/object types: use u64/i64 conversion
-                if let Some(v) = result_val.to_u64(ctx) {
-                    v
-                } else if let Some(v) = result_val.to_i64(ctx) {
-                    v as u64
-                } else {
-                    // undefined/null → 0 (NULL for objects, 0 for primitives)
-                    0u64
-                }
+
+            // env (JNIEnv* — from x0)
+            {
+                let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[0]);
+                JSValue(js_ctx).set_property(ctx, "env", JSValue(val));
             }
-        };
-        (*ctx_ptr).x[0] = ret_u64;
-    }
+
+            // callOriginal()
+            {
+                let cname = CString::new("callOriginal").unwrap();
+                let func_val = ffi::qjs_new_cfunction(ctx, Some(js_call_original), cname.as_ptr(), 0);
+                JSValue(js_ctx).set_property(ctx, "callOriginal", JSValue(func_val));
+            }
+
+            js_ctx
+        },
+        // 处理返回值：根据 return_type 将 JS 返回值写入 HookContext.x[0]
+        |ctx, _js_ctx, result| {
+            if return_type != b'V' {
+                let result_val = JSValue(result);
+                let ret_u64 = match return_type {
+                    b'F' => {
+                        if let Some(f) = result_val.to_float() {
+                            (f as f32).to_bits() as u64
+                        } else {
+                            0u64
+                        }
+                    }
+                    b'D' => {
+                        if let Some(f) = result_val.to_float() {
+                            f.to_bits()
+                        } else {
+                            0u64
+                        }
+                    }
+                    _ => {
+                        if let Some(v) = result_val.to_u64(ctx) {
+                            v
+                        } else if let Some(v) = result_val.to_i64(ctx) {
+                            v as u64
+                        } else {
+                            0u64
+                        }
+                    }
+                };
+                (*ctx_ptr).x[0] = ret_u64;
+            }
+        },
+    );
 
     // Clear callback state globals
     CURRENT_HOOK_CTX_PTR.store(0, Ordering::Relaxed);
     CURRENT_HOOK_ART_METHOD.store(0, Ordering::Relaxed);
-
-    ffi::qjs_free_value(ctx, js_ctx);
-    ffi::qjs_free_value(ctx, result);
-    ffi::qjs_free_value(ctx, global);
 }
+
+// ============================================================================
+// replacedMethods — 双向映射 original↔replacement ArtMethod
+// ============================================================================
+//
+// 用于 artController 全局 DoCall hook 回调中查找 replacement。
+// artController hooks ART 的 DoCall 函数（解释器路径），在 on_enter 回调中
+// 通过此映射将 x0 (ArtMethod*) 从 original 替换为 replacement。
+// 所有被 hook 方法均通过 per-method deoptimize 强制走解释器 → DoCall 路径。
+
+/// 双向映射 original ArtMethod ↔ replacement ArtMethod
+static REPLACED_METHODS: BiMap = BiMap::new();
+
+/// 注册 original → replacement 映射（双向 + C 侧内联查表）
+pub(super) fn set_replacement_method(original: u64, replacement: u64) {
+    REPLACED_METHODS.init();
+    REPLACED_METHODS.insert(original, replacement);
+    // 同步到 C 侧内联查表 (thunk 直接扫描，无需 Mutex+HashMap)
+    unsafe {
+        hook_ffi::hook_art_router_table_add(original, replacement);
+    }
+}
+
+/// 查找 original 对应的 replacement（如果已注册）
+pub(super) fn get_replacement_method(original: u64) -> Option<u64> {
+    REPLACED_METHODS.get_forward(original)
+}
+
+/// 删除 original → replacement 映射（双向 + C 侧内联查表）
+pub(super) fn delete_replacement_method(original: u64) {
+    REPLACED_METHODS.remove_by_forward(original);
+    // 同步到 C 侧内联查表
+    unsafe {
+        hook_ffi::hook_art_router_table_remove(original);
+    }
+}
+
+/// 检查给定地址是否为 replacement ArtMethod
+#[allow(dead_code)]
+pub(super) fn is_replacement_method(method: u64) -> bool {
+    REPLACED_METHODS.contains_reverse(method)
+}
+
+// NOTE: art_router_fn has been removed — routing is now done via inline
+// g_art_router_table scan in the C-side thunk (no function call needed).
+
