@@ -663,11 +663,15 @@ unsafe fn synchronize_replacement_methods() {
 
         // --- Fix 1: declaring_class_ 同步 ---
         // 移动 GC 会更新原始 ArtMethod 的 declaring_class_ (offset 0, 4 bytes GcRoot)，
-        // 但堆分配的 replacement 不会被 GC 追踪。同步以防悬空引用。
+        // 但堆分配的 replacement 和 clone 不会被 GC 追踪。同步以防悬空引用。
         let HookType::Replaced { replacement_addr, .. } = &data.hook_type;
         {
             let declaring_class = std::ptr::read_volatile(art_method as *const u32);
             std::ptr::write_volatile(*replacement_addr as *mut u32, declaring_class);
+            // 同步到 clone (callOriginal 使用的备份 ArtMethod)
+            if data.clone_addr != 0 {
+                std::ptr::write_volatile(data.clone_addr as *mut u32, declaring_class);
+            }
         }
 
         // --- flags 修复: 确保 kAccCompileDontBother 在 + kAccFastInterpreterToInterpreterInvoke 不在 ---

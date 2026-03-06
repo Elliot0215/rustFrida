@@ -640,9 +640,18 @@ fn handle_zymbiote_connection(
     };
 
     // 查找匹配的 spawn 请求（匹配时立即移除，与 Frida unset 一致，防止重复消费）
+    // 先精确匹配，再前缀匹配（处理 android:process 自定义进程名，如 "pkg:suffix"）
     let notifier = if let Some(requests) = SPAWN_REQUESTS.get() {
         let mut map = requests.lock().unwrap();
-        map.remove(&package_name)
+        if let Some(n) = map.remove(&package_name) {
+            Some(n)
+        } else {
+            // 前缀匹配: "com.foo.bar:service" 匹配注册的 "com.foo.bar"
+            let prefix_key = map.keys()
+                .find(|k| package_name.starts_with(k.as_str()) && package_name[k.len()..].starts_with(':'))
+                .cloned();
+            prefix_key.and_then(|k| map.remove(&k))
+        }
     } else {
         None
     };

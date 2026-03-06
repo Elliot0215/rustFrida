@@ -185,8 +185,49 @@ fn get_abort_message() -> Option<String> {
     }
 }
 
+/// 从 ucontext 提取 ARM64 寄存器状态
+unsafe fn dump_registers(ucontext: *mut c_void) -> String {
+    if ucontext.is_null() {
+        return "  (ucontext is NULL)\n".to_string();
+    }
+    // ucontext_t on aarch64-linux-android (bionic):
+    //   uc_flags(8) + uc_link(8) + uc_stack(24) + uc_sigmask(8) + __padding(120) = 168
+    //   + 8 bytes alignment padding → mcontext_t at offset 176
+    //   mcontext_t (struct sigcontext):
+    //     fault_address(8) + regs[31](248) + sp(8) + pc(8) + pstate(8)
+    let uc = ucontext as *const u8;
+    let mctx = 176usize; // mcontext_t offset in ucontext_t
+    let regs = uc.add(mctx + 8) as *const u64;   // regs[0..31]
+    let sp = *(uc.add(mctx + 256) as *const u64); // sp
+    let pc = *(uc.add(mctx + 264) as *const u64); // pc
+    let pstate = *(uc.add(mctx + 272) as *const u64); // pstate
+
+    let mut s = String::new();
+    // PC with symbol resolution
+    let (pc_lib, pc_sym, pc_off) = resolve_symbol(pc as usize);
+    s.push_str(&format!("  PC:  0x{:016x}", pc));
+    match (pc_lib, pc_sym) {
+        (Some(lib), Some(sym)) => s.push_str(&format!(" ({} {}+0x{:x})", lib, sym, pc_off)),
+        (Some(lib), None) => s.push_str(&format!(" ({} +0x{:x})", lib, pc_off)),
+        _ => {}
+    }
+    s.push('\n');
+    s.push_str(&format!("  SP:  0x{:016x}  PSTATE: 0x{:x}\n", sp, pstate));
+
+    // x0-x30 in rows of 4
+    for row in 0..8 {
+        for col in 0..4 {
+            let i = row * 4 + col;
+            if i > 30 { break; }
+            s.push_str(&format!("  x{:<2}=0x{:016x}", i, *regs.add(i)));
+        }
+        s.push('\n');
+    }
+    s
+}
+
 /// 信号处理函数 - 打印崩溃信息和backtrace
-extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, _ucontext: *mut c_void) {
+extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, ucontext: *mut c_void) {
     unsafe {
         let sig_name = match sig {
             SIGSEGV => "SIGSEGV (Segmentation Fault)",
@@ -222,6 +263,10 @@ extern "C" fn crash_signal_handler(sig: c_int, info: *mut siginfo_t, _ucontext: 
                 crash_msg.push_str(&format!("Abort Message: {}\n", abort_msg));
             }
         }
+
+        // 打印寄存器状态
+        crash_msg.push_str("\n=== REGISTERS ===\n");
+        crash_msg.push_str(&dump_registers(ucontext));
 
         crash_msg.push_str("\n=== BACKTRACE ===\n");
 

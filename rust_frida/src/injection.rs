@@ -645,7 +645,8 @@ pub(crate) fn inject_debug(
     }
 
     // detach 前检查 maps 中 memfd/wwb 条目（调试用）
-    if let Ok(maps) = std::fs::read_to_string(format!("/proc/{}/maps", pid)) {
+    if let Ok(raw) = std::fs::read(format!("/proc/{}/maps", pid)) {
+        let maps = String::from_utf8_lossy(&raw);
         let memfd_lines: Vec<&str> = maps.lines().filter(|l| l.contains("memfd") || l.contains("wwb")).collect();
         if memfd_lines.is_empty() {
             log_info!("maps 中无 memfd/wwb 条目（KPM 隐藏生效）");

@@ -31,11 +31,12 @@ pub(crate) fn get_lib_base(pid: Option<i32>, lib_name: &str) -> Result<usize, St
         return Err(format!("进程 {} 不存在", pid.unwrap_or(-1)));
     }
 
-    let file = File::open(&maps_path).map_err(|e| format!("无法打开maps文件: {}", e))?;
-    let reader = BufReader::new(file);
+    let mut file = File::open(&maps_path).map_err(|e| format!("无法打开maps文件: {}", e))?;
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut raw)
+        .map_err(|e| format!("读取maps文件失败: {}", e))?;
 
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("读取maps文件失败: {}", e))?;
+    for line in String::from_utf8_lossy(&raw).lines() {
         if line.contains(lib_name) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if let Some(addr_range) = parts.get(0) {
@@ -401,13 +402,15 @@ impl MapEntry {
 /// 结构化解析 /proc/<pid>/maps
 pub(crate) fn parse_proc_maps(pid: u32) -> Result<Vec<MapEntry>, String> {
     let maps_path = format!("/proc/{}/maps", pid);
-    let file = File::open(&maps_path)
+    let mut file = File::open(&maps_path)
         .map_err(|e| format!("无法打开 {}: {}", maps_path, e))?;
-    let reader = BufReader::new(file);
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut raw)
+        .map_err(|e| format!("读取 {} 失败: {}", maps_path, e))?;
     let mut entries = Vec::new();
 
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("读取 maps 失败: {}", e))?;
+    for line in String::from_utf8_lossy(&raw).lines() {
+        let line = line.to_string();
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 2 {
             continue;
