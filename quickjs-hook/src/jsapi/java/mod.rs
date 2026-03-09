@@ -237,6 +237,14 @@ pub fn register_java_api(ctx: &JSContext) {
         add_cfunction_to_object(
             ctx_ptr,
             java_obj,
+            "_invokeStaticMethod",
+            js_java_invoke_static_method,
+            4,
+        );
+        add_cfunction_to_object(ctx_ptr, java_obj, "_newObject", js_java_new_object, 2);
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
             "_getFieldAuto",
             js_java_get_field_auto,
             3,

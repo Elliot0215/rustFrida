@@ -548,9 +548,19 @@ unsafe fn build_invoke_jargs(
     argv: *mut ffi::JSValue,
     param_types: &[String],
 ) -> Vec<u64> {
+    build_jargs_from_argv(ctx, env, argv, 4, param_types)
+}
+
+unsafe fn build_jargs_from_argv(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    argv: *mut ffi::JSValue,
+    start_index: usize,
+    param_types: &[String],
+) -> Vec<u64> {
     let mut jargs = Vec::with_capacity(param_types.len());
     for (i, type_sig) in param_types.iter().enumerate() {
-        let js_arg = JSValue(*argv.add(4 + i));
+        let js_arg = JSValue(*argv.add(start_index + i));
         jargs.push(marshal_js_to_jvalue(
             ctx,
             env,

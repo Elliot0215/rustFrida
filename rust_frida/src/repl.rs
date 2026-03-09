@@ -285,6 +285,7 @@ pub(crate) fn print_help() {
     println!("{DIM}  callNative{RESET}   callNative(addr, retType, argTypes, ...args)");
     println!("{DIM}             {RESET}  retType/argType: 'void'|'int'|'long'|'ptr'|'float'");
     println!("{DIM}  Java{RESET}         .use(class) → class wrapper (Proxy)");
+    println!("{DIM}             {RESET}  .$new(...args) → new Java object");
     println!("{DIM}             {RESET}  .method.impl = fn → hook (auto-detect overload)");
     println!("{DIM}             {RESET}  .method.overload(sig).impl = fn");
     println!("{DIM}             {RESET}  .method.impl = null → unhook");
@@ -292,6 +293,10 @@ pub(crate) fn print_help() {
     println!("{DIM}    jseval Memory.readCString(ptr(0x7f000000)){RESET}");
     println!("{DIM}    loadjs hook(ptr(0x1234), function(ctx){{console.log('hit')}}){RESET}");
     println!("{DIM}    loadjs var A=Java.use(\"android.app.Activity\"); A.onResume.impl=function(ctx){{console.log('hit')}}{RESET}");
+    println!(
+        "{DIM}    loadjs var P=Java.use(\"android.os.Process\"); console.log(P.myPid()){RESET}"
+    );
+    println!("{DIM}    loadjs var S=Java.use(\"java.lang.String\"); var s=S.$new(\"hello\"); console.log(s.length()){RESET}");
     println!();
 }
 

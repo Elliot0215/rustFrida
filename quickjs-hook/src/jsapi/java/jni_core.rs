@@ -101,6 +101,12 @@ pub(super) type NewGlobalRefFn =
 pub(super) type DeleteGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void);
 pub(super) type GetObjectClassFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+pub(super) type NewObjectAFn = unsafe extern "C" fn(
+    JniEnv,
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *const std::ffi::c_void,
+) -> *mut std::ffi::c_void;
 pub(super) type IsInstanceOfFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
 pub(super) type GetFieldIdFn = unsafe extern "C" fn(
@@ -650,6 +656,7 @@ pub(super) const JNI_RELEASE_STRING_UTF_CHARS: usize = 170;
 pub(super) const JNI_GET_ARRAY_LENGTH: usize = 171;
 pub(super) const JNI_GET_OBJECT_ARRAY_ELEMENT: usize = 173;
 pub(super) const JNI_EXCEPTION_CHECK: usize = 228;
+pub(super) const JNI_NEW_OBJECT_A: usize = 30;
 
 pub(super) const JNI_CALL_STATIC_OBJECT_METHOD_A: usize = 116;
 pub(super) const JNI_NEW_STRING_UTF: usize = 167;
@@ -666,6 +673,9 @@ pub(super) const JNI_CALL_NONVIRTUAL_VOID_METHOD_A: usize = 93;
 // CallStatic*MethodA indices (for callOriginal on static methods)
 pub(super) const JNI_CALL_STATIC_VOID_METHOD_A: usize = 143;
 pub(super) const JNI_CALL_STATIC_BOOLEAN_METHOD_A: usize = 119;
+pub(super) const JNI_CALL_STATIC_BYTE_METHOD_A: usize = 122;
+pub(super) const JNI_CALL_STATIC_CHAR_METHOD_A: usize = 125;
+pub(super) const JNI_CALL_STATIC_SHORT_METHOD_A: usize = 128;
 pub(super) const JNI_CALL_STATIC_INT_METHOD_A: usize = 131;
 pub(super) const JNI_CALL_STATIC_LONG_METHOD_A: usize = 134;
 pub(super) const JNI_CALL_STATIC_FLOAT_METHOD_A: usize = 137;

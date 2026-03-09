@@ -8,7 +8,7 @@ use crate::ffi::hook as hook_ffi;
 use crate::jsapi::callback_util::{invoke_hook_callback_common, set_js_u64_property};
 use crate::value::JSValue;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::registry::HOOK_REGISTRY;
 
@@ -16,6 +16,7 @@ use super::registry::HOOK_REGISTRY;
 // Protected by JS_ENGINE lock (single-threaded JS execution).
 static CURRENT_NATIVE_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
 static CURRENT_NATIVE_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
+static CURRENT_NATIVE_ORIG_CALLED: AtomicBool = AtomicBool::new(false);
 
 /// Hook callback that calls the JS function (replace mode)
 pub(crate) unsafe extern "C" fn hook_callback_wrapper(
@@ -52,6 +53,10 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
     // Set global state for js_native_call_original
     CURRENT_NATIVE_CTX_PTR.store(ctx_ptr as usize, Ordering::Relaxed);
     CURRENT_NATIVE_TRAMPOLINE.store(trampoline, Ordering::Relaxed);
+    CURRENT_NATIVE_ORIG_CALLED.store(false, Ordering::Relaxed);
+
+    // Track whether the JS callback completed without exception and wrote back x0.
+    let mut result_was_set = false;
 
     invoke_hook_callback_common(
         ctx_usize,
@@ -80,6 +85,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         },
         // 处理返回值：从上下文对象读回 x0（replace mode 只恢复 x0）
         |ctx, js_ctx, _result| {
+            result_was_set = true;
             let cprop = CString::new("x0").unwrap();
             let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());
             let val = ffi::qjs_get_property(ctx, js_ctx, atom);
@@ -93,7 +99,15 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         },
     );
 
+    // Fallback: if the JS callback was skipped (engine busy) or threw an exception,
+    // treat the hook as transparent and invoke the original function.
+    if !result_was_set && trampoline != 0 && !CURRENT_NATIVE_ORIG_CALLED.load(Ordering::Relaxed) {
+        (*ctx_ptr).x[0] =
+            hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
+    }
+
     // Clear global state
+    CURRENT_NATIVE_ORIG_CALLED.store(false, Ordering::Relaxed);
     CURRENT_NATIVE_CTX_PTR.store(0, Ordering::Relaxed);
     CURRENT_NATIVE_TRAMPOLINE.store(0, Ordering::Relaxed);
 }
@@ -117,6 +131,7 @@ unsafe extern "C" fn js_native_call_original(
         );
     }
 
+    CURRENT_NATIVE_ORIG_CALLED.store(true, Ordering::Relaxed);
     let result = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);
 
     // Write result back to HookContext.x[0] so the thunk's final RET returns this value

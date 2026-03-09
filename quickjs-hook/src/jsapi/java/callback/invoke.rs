@@ -284,3 +284,487 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
     cleanup_local_refs(env, local_obj, cls);
     result
 }
+
+// ============================================================================
+// Java._invokeStaticMethod(className, methodName, methodSig, ...args)
+// ============================================================================
+//
+// Static method invocation helper used by Java.use(...).method(...).
+// - className:  "java.lang.Foo" / "java/lang/Foo"
+// - methodName: Java static method name (e.g. "bar")
+// - methodSig:  JNI signature string, e.g. "(Ljava/lang/String;I)V"
+// - args...:    JS arguments, converted to jvalue[] according to methodSig
+pub(super) unsafe extern "C" fn js_java_invoke_static_method(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 3 {
+        return js_throw_type_error(
+            ctx,
+            b"Java._invokeStaticMethod() requires at least 3 arguments: className, methodName, methodSig\0",
+        );
+    }
+
+    let class_arg = JSValue(*argv);
+    let method_arg = JSValue(*argv.add(1));
+    let sig_arg = JSValue(*argv.add(2));
+
+    let class_name = match read_string_arg(
+        ctx,
+        class_arg,
+        b"Java._invokeStaticMethod() className must be a string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let method_name = match read_string_arg(
+        ctx,
+        method_arg,
+        b"Java._invokeStaticMethod() methodName must be a string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let method_sig = match read_string_arg(
+        ctx,
+        sig_arg,
+        b"Java._invokeStaticMethod() methodSig must be a JNI signature string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let param_types = parse_jni_param_types(&method_sig);
+    let param_count = param_types.len();
+    if (argc - 3) < param_count as i32 {
+        return js_throw_type_error(
+            ctx,
+            b"Java._invokeStaticMethod() not enough JS arguments for method signature\0",
+        );
+    }
+
+    let return_type = get_return_type_from_sig(&method_sig);
+    let return_type_sig = get_return_type_sig(&method_sig);
+
+    let env = match get_thread_env() {
+        Ok(e) => e,
+        Err(msg) => return js_throw_internal_error(ctx, msg),
+    };
+
+    let cls = find_class_safe(env, &class_name);
+    if cls.is_null() || jni_check_exc(env) {
+        return js_throw_internal_error(
+            ctx,
+            format!("Java._invokeStaticMethod: FindClass('{}') failed", class_name),
+        );
+    }
+
+    let get_mid: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
+    let c_name = match CString::new(method_name.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            return cleanup_and_throw_type(
+                ctx,
+                env,
+                std::ptr::null_mut(),
+                cls,
+                b"Java._invokeStaticMethod() invalid methodName\0",
+            );
+        }
+    };
+    let c_sig = match CString::new(method_sig.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            return cleanup_and_throw_type(
+                ctx,
+                env,
+                std::ptr::null_mut(),
+                cls,
+                b"Java._invokeStaticMethod() invalid methodSig\0",
+            );
+        }
+    };
+
+    let mid = get_mid(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+    if mid.is_null() || jni_check_exc(env) {
+        return cleanup_and_throw_internal(
+            ctx,
+            env,
+            std::ptr::null_mut(),
+            cls,
+            format!(
+                "Java._invokeStaticMethod: GetStaticMethodID failed: {}.{}{}",
+                class_name, method_name, method_sig
+            ),
+        );
+    }
+
+    let jargs = build_jargs_from_argv(ctx, env, argv, 3, &param_types);
+    let jargs_ptr = if param_count > 0 {
+        jargs.as_ptr() as *const std::ffi::c_void
+    } else {
+        std::ptr::null()
+    };
+    let invoke_exception = || {
+        format!(
+            "Java._invokeStaticMethod: exception in {}.{}{}",
+            class_name, method_name, method_sig
+        )
+    };
+
+    let result = match return_type {
+        b'V' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            );
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_VOID_METHOD_A);
+            f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            ffi::qjs_undefined()
+        }
+        b'Z' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> u8;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_BOOLEAN_METHOD_A);
+            JSValue::bool(f(env, cls, mid, jargs_ptr) != 0).raw()
+        }
+        b'B' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> i8;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_BYTE_METHOD_A);
+            let ret = f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            JSValue::int(ret as i32).raw()
+        }
+        b'C' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> u16;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_CHAR_METHOD_A);
+            let ret = f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            let ch = std::char::from_u32(ret as u32).unwrap_or('\0');
+            JSValue::string(ctx, &ch.to_string()).raw()
+        }
+        b'S' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> i16;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_SHORT_METHOD_A);
+            let ret = f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            JSValue::int(ret as i32).raw()
+        }
+        b'I' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> i32;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_INT_METHOD_A);
+            let ret = f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            JSValue::int(ret).raw()
+        }
+        b'J' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> i64;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_LONG_METHOD_A);
+            let ret = f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            ffi::JS_NewBigUint64(ctx, ret as u64)
+        }
+        b'F' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> f32;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_FLOAT_METHOD_A);
+            let ret = f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            JSValue::float(ret as f64).raw()
+        }
+        b'D' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> f64;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_DOUBLE_METHOD_A);
+            let ret = f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            JSValue::float(ret).raw()
+        }
+        b'L' | b'[' => {
+            type F = unsafe extern "C" fn(
+                JniEnv,
+                *mut std::ffi::c_void,
+                *mut std::ffi::c_void,
+                *const std::ffi::c_void,
+            ) -> *mut std::ffi::c_void;
+            let f: F = jni_fn!(env, F, JNI_CALL_STATIC_OBJECT_METHOD_A);
+            let obj = f(env, cls, mid, jargs_ptr);
+            if jni_check_exc(env) {
+                if !obj.is_null() {
+                    let delete_local_ref: DeleteLocalRefFn =
+                        jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+                    delete_local_ref(env, obj);
+                }
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    std::ptr::null_mut(),
+                    cls,
+                    invoke_exception(),
+                );
+            }
+            match wrap_invoke_return_object(ctx, env, obj, &return_type_sig) {
+                Ok(value) => value,
+                Err(message) => {
+                    return cleanup_and_throw_internal(
+                        ctx,
+                        env,
+                        std::ptr::null_mut(),
+                        cls,
+                        message,
+                    );
+                }
+            }
+        }
+        _ => ffi::qjs_undefined(),
+    };
+
+    if matches!(return_type, b'Z' | b'B' | b'C' | b'S' | b'I' | b'J' | b'F' | b'D')
+        && jni_check_exc(env)
+    {
+        return cleanup_and_throw_internal(ctx, env, std::ptr::null_mut(), cls, invoke_exception());
+    }
+
+    cleanup_local_refs(env, std::ptr::null_mut(), cls);
+    result
+}
+
+// ============================================================================
+// Java._newObject(className, ctorSig, ...args)
+// ============================================================================
+//
+// Constructor invocation helper used by Java.use(...).$new(...).
+// - className: "java.lang.Foo" / "java/lang/Foo"
+// - ctorSig:   JNI signature string for <init>, e.g. "(Ljava/lang/String;I)V"
+// - args...:   JS arguments, converted to jvalue[] according to ctorSig
+//
+// Return value:
+// - object     → {__jptr, __jclass} wrapper (Proxy-wrapped on JS side)
+pub(super) unsafe extern "C" fn js_java_new_object(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 2 {
+        return js_throw_type_error(
+            ctx,
+            b"Java._newObject() requires at least 2 arguments: className, ctorSig\0",
+        );
+    }
+
+    let class_arg = JSValue(*argv);
+    let sig_arg = JSValue(*argv.add(1));
+
+    let class_name = match read_string_arg(
+        ctx,
+        class_arg,
+        b"Java._newObject() className must be a string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let ctor_sig = match read_string_arg(
+        ctx,
+        sig_arg,
+        b"Java._newObject() ctorSig must be a JNI signature string\0",
+    ) {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    if get_return_type_from_sig(&ctor_sig) != b'V' {
+        return js_throw_type_error(
+            ctx,
+            b"Java._newObject() ctorSig must be a constructor signature ending in V\0",
+        );
+    }
+
+    let param_types = parse_jni_param_types(&ctor_sig);
+    let param_count = param_types.len();
+    if (argc - 2) < param_count as i32 {
+        return js_throw_type_error(
+            ctx,
+            b"Java._newObject() not enough JS arguments for constructor signature\0",
+        );
+    }
+
+    let env = match get_thread_env() {
+        Ok(e) => e,
+        Err(msg) => return js_throw_internal_error(ctx, msg),
+    };
+
+    let cls = find_class_safe(env, &class_name);
+    if cls.is_null() || jni_check_exc(env) {
+        return js_throw_internal_error(
+            ctx,
+            format!("Java._newObject: FindClass('{}') failed", class_name),
+        );
+    }
+
+    let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+    let new_object_a: NewObjectAFn = jni_fn!(env, NewObjectAFn, JNI_NEW_OBJECT_A);
+
+    let c_ctor_name = CString::new("<init>").unwrap();
+    let c_sig = match CString::new(ctor_sig.as_str()) {
+        Ok(c) => c,
+        Err(_) => {
+            return cleanup_and_throw_type(
+                ctx,
+                env,
+                std::ptr::null_mut(),
+                cls,
+                b"Java._newObject() invalid ctorSig\0",
+            );
+        }
+    };
+
+    let mid = get_mid(env, cls, c_ctor_name.as_ptr(), c_sig.as_ptr());
+    if mid.is_null() || jni_check_exc(env) {
+        return cleanup_and_throw_internal(
+            ctx,
+            env,
+            std::ptr::null_mut(),
+            cls,
+            format!("Java._newObject: GetMethodID failed: {}.<init>{}", class_name, ctor_sig),
+        );
+    }
+
+    let jargs = build_jargs_from_argv(ctx, env, argv, 2, &param_types);
+    let jargs_ptr = if param_count > 0 {
+        jargs.as_ptr() as *const std::ffi::c_void
+    } else {
+        std::ptr::null()
+    };
+
+    let obj = new_object_a(env, cls, mid, jargs_ptr);
+    if obj.is_null() || jni_check_exc(env) {
+        return cleanup_and_throw_internal(
+            ctx,
+            env,
+            std::ptr::null_mut(),
+            cls,
+            format!(
+                "Java._newObject: exception in {}.<init>{}",
+                class_name, ctor_sig
+            ),
+        );
+    }
+
+    let class_sig = format!("L{};", class_name.replace('.', "/"));
+    let result = match wrap_invoke_return_object(ctx, env, obj, &class_sig) {
+        Ok(value) => value,
+        Err(message) => {
+            return cleanup_and_throw_internal(ctx, env, std::ptr::null_mut(), cls, message);
+        }
+    };
+
+    cleanup_local_refs(env, std::ptr::null_mut(), cls);
+    result
+}

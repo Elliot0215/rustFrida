@@ -5,10 +5,14 @@
     var _hook = Java.hook;
     var _unhook = Java.unhook;
     var _methods = Java._methods;
+    var _invokeStaticMethod = Java._invokeStaticMethod;
+    var _newObject = Java._newObject;
     var _getFieldAuto = Java._getFieldAuto;
     delete Java.hook;
     delete Java.unhook;
     delete Java._methods;
+    delete Java._invokeStaticMethod;
+    delete Java._newObject;
     delete Java._getFieldAuto;
 
     function _argsFrom(argsLike, start) {
@@ -34,6 +38,12 @@
     function _invokeJavaMethod(jptr, jcls, name, sig, args) {
         return _wrapJavaReturn(
             Java._invokeMethod.apply(Java, [jptr, jcls, name, sig].concat(args))
+        );
+    }
+
+    function _invokeJavaStaticMethod(jcls, name, sig, args) {
+        return _wrapJavaReturn(
+            _invokeStaticMethod.apply(Java, [jcls, name, sig].concat(args))
         );
     }
 
@@ -129,6 +139,60 @@
         }
         if (bestScore < 0) {
             throw new Error("No matching overload for " + jcls + "." + name
+                + " with " + jsArgs.length + " argument(s)");
+        }
+        return best.sig;
+    }
+
+    function _resolveStaticMethodSig(jcls, name, jsArgs) {
+        var methods = _methods(jcls);
+        var best = null;
+        var bestScore = -1;
+
+        for (var i = 0; i < methods.length; i++) {
+            var methodInfo = methods[i];
+            if (methodInfo.name !== name || !methodInfo.static) {
+                continue;
+            }
+            var score = _scoreOverload(methodInfo, jsArgs);
+            if (score > bestScore) {
+                best = methodInfo;
+                bestScore = score;
+            }
+        }
+
+        if (!best) {
+            throw new Error("No static method found: " + jcls + "." + name);
+        }
+        if (bestScore < 0) {
+            throw new Error("No matching static overload for " + jcls + "." + name
+                + " with " + jsArgs.length + " argument(s)");
+        }
+        return best.sig;
+    }
+
+    function _resolveConstructorSig(jcls, jsArgs) {
+        var methods = _methods(jcls);
+        var best = null;
+        var bestScore = -1;
+
+        for (var i = 0; i < methods.length; i++) {
+            var methodInfo = methods[i];
+            if (methodInfo.name !== "<init>") {
+                continue;
+            }
+            var score = _scoreOverload(methodInfo, jsArgs);
+            if (score > bestScore) {
+                best = methodInfo;
+                bestScore = score;
+            }
+        }
+
+        if (!best) {
+            throw new Error("No constructor found: " + jcls);
+        }
+        if (bestScore < 0) {
+            throw new Error("No matching constructor for " + jcls
                 + " with " + jsArgs.length + " argument(s)");
         }
         return best.sig;
@@ -369,13 +433,98 @@
         }
     });
 
+    function _invokeStaticWrapper(wrapper, argsLike) {
+        var args = _argsFrom(argsLike);
+        var sig;
+
+        if (wrapper._s === null) {
+            sig = typeof args[0] === "string" && args[0].charAt(0) === '('
+                ? args.shift()
+                : _resolveStaticMethodSig(wrapper._c, wrapper._m, args);
+        } else if (Array.isArray(wrapper._s)) {
+            throw new Error("Cannot invoke multiple overloads at once: "
+                + wrapper._c + "." + wrapper._m);
+        } else {
+            sig = wrapper._s;
+        }
+
+        return _invokeJavaStaticMethod(
+            wrapper._c,
+            wrapper._m === "$init" ? "<init>" : wrapper._m,
+            sig,
+            args
+        );
+    }
+
+    function _invokeConstructorWrapper(wrapper, argsLike) {
+        var args = _argsFrom(argsLike);
+        var sig;
+
+        if (wrapper._s === null) {
+            sig = typeof args[0] === "string" && args[0].charAt(0) === '('
+                ? args.shift()
+                : _resolveConstructorSig(wrapper._c, args);
+        } else if (Array.isArray(wrapper._s)) {
+            throw new Error("Cannot invoke multiple constructor overloads at once: "
+                + wrapper._c + "." + wrapper._m);
+        } else {
+            sig = wrapper._s;
+        }
+
+        return _wrapJavaReturn(
+            _newObject.apply(Java, [wrapper._c, sig].concat(args))
+        );
+    }
+
+    function _bindMethodWrapper(wrapper) {
+        var callable = function() {
+            if (wrapper._m === "$init") {
+                return _invokeConstructorWrapper(wrapper, arguments);
+            }
+            return _invokeStaticWrapper(wrapper, arguments);
+        };
+
+        callable.overload = function() {
+            return _bindMethodWrapper(MethodWrapper.prototype.overload.apply(wrapper, arguments));
+        };
+
+        Object.defineProperty(callable, "impl", {
+            get: function() {
+                return wrapper.impl;
+            },
+            set: function(fn) {
+                wrapper.impl = fn;
+            },
+            enumerable: true,
+            configurable: true
+        });
+
+        return callable;
+    }
+
     Java.use = function(cls) {
         var cache = {};
         var wrappers = {};
         return new Proxy({}, {
             get: function(_, prop) {
                 if (typeof prop !== "string") return undefined;
-                if (!wrappers[prop]) wrappers[prop] = new MethodWrapper(cls, prop, null, cache);
+                if (prop === "$new") {
+                    if (!cache._new) {
+                        cache._new = function() {
+                            var args = _argsFrom(arguments);
+                            var sig = typeof args[0] === "string" && args[0].charAt(0) === '('
+                                ? args.shift()
+                                : _resolveConstructorSig(cls, args);
+                            return _wrapJavaReturn(
+                                _newObject.apply(Java, [cls, sig].concat(args))
+                            );
+                        };
+                    }
+                    return cache._new;
+                }
+                if (!wrappers[prop]) {
+                    wrappers[prop] = _bindMethodWrapper(new MethodWrapper(cls, prop, null, cache));
+                }
                 return wrappers[prop];
             },
             ownKeys: function(_) {
@@ -383,6 +532,7 @@
                 var ms = _methods(cls);
                 var seen = {};
                 var keys = [];
+                keys.push("$new");
                 for (var i = 0; i < ms.length; i++) {
                     var n = ms[i].name === "<init>" ? "$init" : ms[i].name;
                     if (!seen[n]) { seen[n] = true; keys.push(n); }
