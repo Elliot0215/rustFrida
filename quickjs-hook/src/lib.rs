@@ -36,12 +36,38 @@ pub use completion::complete_script;
 pub use context::JSContext;
 pub use jsapi::console::set_console_callback;
 pub use jsapi::hook_api::cleanup_hooks;
+#[cfg(feature = "qbdi")]
+pub use jsapi::hook_api::preload_qbdi_helper;
+#[cfg(feature = "qbdi")]
+pub use jsapi::hook_api::shutdown_qbdi_helper;
 pub use jsapi::java::cleanup_java_hooks;
 pub use runtime::JSRuntime;
 pub use value::JSValue;
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+static QBDI_OUTPUT_DIR: OnceLock<String> = OnceLock::new();
+static QBDI_HELPER_BLOB: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+pub fn set_qbdi_output_dir(output_dir: impl Into<String>) {
+    let _ = QBDI_OUTPUT_DIR.set(output_dir.into());
+}
+
+pub fn set_qbdi_helper_blob(blob: Vec<u8>) {
+    *QBDI_HELPER_BLOB.lock().unwrap_or_else(|e| e.into_inner()) = Some(blob);
+}
+
+pub(crate) fn qbdi_output_dir() -> Option<&'static str> {
+    QBDI_OUTPUT_DIR.get().map(|s| s.as_str())
+}
+
+pub(crate) fn qbdi_helper_blob() -> Option<Vec<u8>> {
+    QBDI_HELPER_BLOB
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 /// Global JS engine instance (protected by Mutex).
 /// pub(crate) so hook_callback_wrapper can serialize concurrent JS_Call invocations.

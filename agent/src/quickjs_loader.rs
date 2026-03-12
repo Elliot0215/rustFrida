@@ -11,8 +11,11 @@ use libc::{
 };
 use quickjs_hook::{
     cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks, complete_script,
-    get_or_init_engine, init_hook_engine, load_script, set_console_callback,
+    get_or_init_engine, init_hook_engine, load_script, set_console_callback, set_qbdi_helper_blob,
+    set_qbdi_output_dir,
 };
+#[cfg(feature = "qbdi")]
+use quickjs_hook::{preload_qbdi_helper, shutdown_qbdi_helper};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -91,17 +94,36 @@ pub fn init() -> Result<(), String> {
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
 
+    if let Some(output_path) = crate::OUTPUT_PATH.get() {
+        set_qbdi_output_dir(output_path.clone());
+    }
+
     // 先设置 console callback，确保引擎初始化期间的日志（如 [jniIds]）能通过 socket 输出
     set_console_callback(|msg| {
-        write_stream(format!("[JS] {}\n", msg).as_bytes());
+        write_stream(format!("[JS] {}", msg).as_bytes());
     });
 
     // 初始化 JS 引擎（complete_script 依赖它）
     get_or_init_engine()?;
 
+    #[cfg(feature = "qbdi")]
+    if let Err(err) = preload_qbdi_helper() {
+        if err != "qbdi helper blob not configured" {
+            write_stream(format!("[qbdi] preload on jsinit failed: {}", err).as_bytes());
+        }
+    }
+
     ENGINE_INITIALIZED.store(true, Ordering::SeqCst);
 
     Ok(())
+}
+
+pub fn install_qbdi_helper(blob: Vec<u8>) {
+    set_qbdi_helper_blob(blob);
+    #[cfg(feature = "qbdi")]
+    if let Err(err) = preload_qbdi_helper() {
+        write_stream(format!("[qbdi] preload on helper install failed: {}", err).as_bytes());
+    }
 }
 
 /// Load and execute a JavaScript script
@@ -137,6 +159,11 @@ pub fn cleanup() {
     // Unhook all inline hooks while the JS context (ctx) is still valid
     log_msg("[quickjs] cleanup_hooks\n".to_string());
     cleanup_hooks();
+    #[cfg(feature = "qbdi")]
+    {
+        log_msg("[quickjs] shutdown_qbdi_helper\n".to_string());
+        shutdown_qbdi_helper();
+    }
     // Destroy JSEngine (JS_FreeContext + JS_FreeRuntime)
     log_msg("[quickjs] cleanup_engine\n".to_string());
     cleanup_engine();

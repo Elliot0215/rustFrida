@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +11,23 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::{log_agent, log_error, log_success};
+
+const FRAME_KIND_CMD: u8 = 1;
+#[cfg(feature = "qbdi")]
+const FRAME_KIND_QBDI_HELPER: u8 = 2;
+
+const FRAME_KIND_HELLO: u8 = 0x80;
+const FRAME_KIND_LOG: u8 = 0x81;
+const FRAME_KIND_COMPLETE: u8 = 0x82;
+const FRAME_KIND_EVAL_OK: u8 = 0x83;
+const FRAME_KIND_EVAL_ERR: u8 = 0x84;
+
+#[derive(Clone)]
+pub(crate) enum HostToAgentMessage {
+    Command(String),
+    #[cfg(feature = "qbdi")]
+    QbdiHelper(Vec<u8>),
+}
 
 /// 泛型同步通道：在多线程间传递单次值，支持超时等待。
 pub(crate) struct SyncChannel<T> {
@@ -104,23 +121,110 @@ pub(crate) fn eval_state() -> &'static SyncChannel<std::result::Result<String, S
     EVAL_RESULT.get_or_init(SyncChannel::new)
 }
 
-pub(crate) static GLOBAL_SENDER: OnceLock<Sender<String>> = OnceLock::new();
+pub(crate) static GLOBAL_SENDER: OnceLock<Sender<HostToAgentMessage>> = OnceLock::new();
 pub(crate) static AGENT_STAT: AtomicBool = AtomicBool::new(false);
 pub(crate) static AGENT_DISCONNECTED: AtomicBool = AtomicBool::new(false);
 
+pub(crate) fn send_command(sender: &Sender<HostToAgentMessage>, cmd: impl Into<String>) -> Result<(), std::sync::mpsc::SendError<HostToAgentMessage>> {
+    sender.send(HostToAgentMessage::Command(cmd.into()))
+}
+
+#[cfg(feature = "qbdi")]
+pub(crate) fn send_qbdi_helper(sender: &Sender<HostToAgentMessage>, blob: Vec<u8>) -> Result<(), std::sync::mpsc::SendError<HostToAgentMessage>> {
+    sender.send(HostToAgentMessage::QbdiHelper(blob))
+}
+
+fn write_frame(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
+    stream.write_all(&[kind])?;
+    stream.write_all(&(payload.len() as u32).to_le_bytes())?;
+    stream.write_all(payload)
+}
+
+fn read_frame(reader: &mut dyn Read) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut kind = [0u8; 1];
+    reader.read_exact(&mut kind)?;
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len)?;
+    let len = u32::from_le_bytes(len) as usize;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload)?;
+    Ok((kind[0], payload))
+}
+
 fn handle_socket_connection(stream: UnixStream) {
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    let mut reader = stream;
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                // EOF: agent disconnected or shutdown
+        match read_frame(&mut reader) {
+            Ok((kind, payload)) => match kind {
+                FRAME_KIND_HELLO => {
+                    log_success!("Agent 已连接");
+                    let stream_clone = match reader.try_clone() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log_error!("clone stream 失败: {}", e);
+                            return;
+                        }
+                    };
+                    thread::spawn(move || {
+                        let mut stream_clone = stream_clone;
+                        let (sd, rx) = channel();
+                        match GLOBAL_SENDER.set(sd) {
+                            Ok(_) => {}
+                            Err(_) => {
+                                log_error!("GLOBAL_SENDER already set!");
+                                return;
+                            }
+                        }
+                        AGENT_STAT.store(true, Ordering::Release);
+                        while let Ok(msg) = rx.recv() {
+                            let (kind, payload) = match msg {
+                                HostToAgentMessage::Command(cmd) => (FRAME_KIND_CMD, cmd.into_bytes()),
+                                #[cfg(feature = "qbdi")]
+                                HostToAgentMessage::QbdiHelper(blob) => (FRAME_KIND_QBDI_HELPER, blob),
+                            };
+                            if let Err(e) = write_frame(&mut stream_clone, kind, &payload) {
+                                log_error!("stream 写入失败: {}", e);
+                                AGENT_DISCONNECTED.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                    });
+                }
+                FRAME_KIND_COMPLETE => {
+                    let text = String::from_utf8(payload).unwrap_or_default();
+                    let candidates: Vec<String> = if text.is_empty() {
+                        vec![]
+                    } else {
+                        text.split('\t')
+                            .map(|s| s.to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    };
+                    complete_state().send(candidates);
+                }
+                FRAME_KIND_EVAL_OK => {
+                    eval_state().send(Ok(String::from_utf8(payload).unwrap_or_default()));
+                }
+                FRAME_KIND_EVAL_ERR => {
+                    let content = String::from_utf8(payload).unwrap_or_default().replace('\r', "\n");
+                    eval_state().send(Err(content));
+                }
+                FRAME_KIND_LOG => {
+                    let msg = String::from_utf8(payload).unwrap_or_default();
+                    let msg = msg.strip_suffix('\n').unwrap_or(&msg);
+                    if !msg.is_empty() {
+                        log_agent!("{}", msg);
+                    }
+                }
+                other => {
+                    log_error!("未知 agent frame kind: {}", other);
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 AGENT_DISCONNECTED.store(true, Ordering::Release);
                 break;
             }
-            Ok(_) => {}
             Err(e) => {
                 log_error!("读取连接失败: {}", e);
                 if e.kind() == std::io::ErrorKind::ConnectionReset {
@@ -131,64 +235,6 @@ fn handle_socket_connection(stream: UnixStream) {
                 }
                 break;
             }
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed == "HELLO_AGENT" {
-            log_success!("Agent 已连接");
-            let stream_clone = match reader.get_ref().try_clone() {
-                Ok(s) => s,
-                Err(e) => {
-                    log_error!("clone stream 失败: {}", e);
-                    return;
-                }
-            };
-            thread::spawn(move || {
-                let mut stream_clone = stream_clone;
-                let (sd, rx) = channel();
-                match GLOBAL_SENDER.set(sd) {
-                    Ok(_) => {}
-                    Err(_) => {
-                        log_error!("GLOBAL_SENDER already set!");
-                        return;
-                    }
-                }
-                AGENT_STAT.store(true, Ordering::Release);
-                while let Ok(msg) = rx.recv() {
-                    match stream_clone.write_all(format!("{}\n", msg).as_bytes()) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            log_error!("stream 写入失败: {}", e);
-                            AGENT_DISCONNECTED.store(true, Ordering::Release);
-                            break;
-                        }
-                    }
-                }
-            });
-        } else if let Some(complete_part) = trimmed.strip_prefix("COMPLETE:") {
-            // COMPLETE: 候选项以 \t 分隔（单行协议，避免多行截断问题）
-            let candidates: Vec<String> = if complete_part.is_empty() {
-                vec![]
-            } else {
-                complete_part
-                    .split('\t')
-                    .map(|s| s.to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect()
-            };
-            complete_state().send(candidates);
-        } else if trimmed.starts_with("EVAL_ERR:") {
-            // agent 侧用 \r 替换 \n 传输多行错误（含堆栈），此处还原
-            let content = trimmed["EVAL_ERR:".len()..].replace('\r', "\n");
-            eval_state().send(Err(content));
-        } else if trimmed.starts_with("EVAL:") {
-            eval_state().send(Ok(trimmed["EVAL:".len()..].to_string()));
-        } else {
-            log_agent!("{}", trimmed);
         }
     }
 }

@@ -9,7 +9,7 @@ use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 
-use crate::communication::{complete_state, eval_state};
+use crate::communication::{complete_state, eval_state, send_command, HostToAgentMessage};
 use crate::log_error;
 use crate::logger::{GRAY, GREEN, HIGHLIGHT_BG, HIGHLIGHT_FG, RED, RESET, YELLOW};
 
@@ -49,18 +49,6 @@ pub(crate) fn commands() -> &'static [(&'static str, &'static str, &'static str)
                 "hfl",
                 "<module> <offset>",
                 "Interceptor hook 指定偏移 [--features frida-gum 启用]",
-            ));
-        }
-        #[cfg(feature = "qbdi")]
-        {
-            v.push(("qfl", "<module> <offset>", "QBDI 追踪指定偏移 [qbdi ✓]"));
-        }
-        #[cfg(not(feature = "qbdi"))]
-        {
-            v.push((
-                "qfl",
-                "<module> <offset>",
-                "QBDI 追踪指定偏移 [--features qbdi 启用]",
             ));
         }
         v
@@ -112,13 +100,13 @@ impl Helper for CommandCompleter {}
 
 /// JS REPL 补全器：通过 socket 向 agent 发送 jscomplete 请求，同步等待结果。
 struct JsReplCompleter {
-    sender: Sender<String>,
+    sender: Sender<HostToAgentMessage>,
     /// Cache the last completion results for the hinter to display
     last_candidates: std::cell::RefCell<(String, Vec<String>)>,
 }
 
 impl JsReplCompleter {
-    fn new(sender: Sender<String>) -> Self {
+    fn new(sender: Sender<HostToAgentMessage>) -> Self {
         JsReplCompleter {
             sender,
             last_candidates: std::cell::RefCell::new((String::new(), vec![])),
@@ -133,7 +121,7 @@ impl JsReplCompleter {
         // 持锁 clear + 发命令 + wait，原子消除竞态窗口
         complete_state()
             .clear_then_recv(timeout, || {
-                let _ = sender.send(cmd);
+                let _ = send_command(&sender, cmd);
             })
             .unwrap_or_default()
     }
@@ -321,14 +309,14 @@ pub(crate) fn print_help() {
 /// Every line is sent as `loadjs <line>` to the agent.  Tab completion
 /// queries the live QuickJS global scope via `jscomplete`.
 /// Type `exit` or press Ctrl-D / Ctrl-C to return to the main prompt.
-pub(crate) fn run_js_repl(sender: &Sender<String>) {
+pub(crate) fn run_js_repl(sender: &Sender<HostToAgentMessage>) {
     use crate::logger::{BOLD, CYAN, DIM, RESET};
 
     // Auto-initialize JS engine: send jsinit and wait for EVAL confirmation.
     // Accept both Ok (just initialized) and Err containing "已初始化" (already was ready).
     {
         let result = eval_state().clear_then_recv(std::time::Duration::from_secs(5), || {
-            let _ = sender.send("jsinit".to_string());
+            let _ = send_command(sender, "jsinit");
         });
         match result {
             None => {
@@ -376,7 +364,7 @@ pub(crate) fn run_js_repl(sender: &Sender<String>) {
                 // 发送前清空 eval 状态
                 eval_state().clear();
                 let cmd = format!("loadjs {}", line);
-                if let Err(e) = sender.send(cmd) {
+                if let Err(e) = send_command(sender, cmd) {
                     log_error!("发送 JS 命令失败: {}", e);
                     break;
                 }

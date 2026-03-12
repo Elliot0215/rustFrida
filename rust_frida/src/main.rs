@@ -14,8 +14,11 @@ mod types;
 use crate::logger::{DIM, RESET};
 use args::Args;
 use clap::Parser;
+#[cfg(feature = "qbdi")]
+use communication::send_qbdi_helper;
 use communication::{
-    eval_state, start_socketpair_handler, AGENT_DISCONNECTED, AGENT_STAT, GLOBAL_SENDER,
+    eval_state, send_command, start_socketpair_handler, AGENT_DISCONNECTED, AGENT_STAT, GLOBAL_SENDER,
+    HostToAgentMessage,
 };
 use injection::{inject_debug, inject_to_process, watch_and_inject};
 use process::find_pid_by_name;
@@ -163,8 +166,7 @@ fn main() {
 
     // 等待 agent 连接，默认超时 30s（可通过 --connect-timeout 调整）
     {
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(args.connect_timeout);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(args.connect_timeout);
         log_info!("等待 agent 连接... (最长 {}s)", args.connect_timeout);
         while !AGENT_STAT.load(Ordering::Acquire) {
             // Spawn 模式：Ctrl+C 触发清理退出（100ms 轮询间隔内响应）
@@ -200,6 +202,14 @@ fn main() {
     }
     let sender = GLOBAL_SENDER.get().unwrap();
 
+    #[cfg(feature = "qbdi")]
+    {
+        if let Err(e) = send_qbdi_helper(sender, crate::injection::QBDI_HELPER_SO.to_vec()) {
+            log_error!("发送 QBDI helper 失败: {}", e);
+            std::process::exit(1);
+        }
+    }
+
     // Spawn 模式下需要延迟恢复的子进程 PID
     let spawn_pid: Option<u32> = if args.spawn.is_some() {
         target_pid.map(|p| p as u32)
@@ -215,7 +225,7 @@ fn main() {
 
                 // 等待 jsinit 确认引擎就绪
                 eval_state().clear();
-                if let Err(e) = sender.send("jsinit".to_string()) {
+                if let Err(e) = send_command(sender, "jsinit") {
                     log_error!("发送 jsinit 失败: {}", e);
                 } else {
                     match eval_state().recv_timeout(std::time::Duration::from_secs(10)) {
@@ -227,7 +237,7 @@ fn main() {
                             let script_line = script.replace('\n', "\r");
                             eval_state().clear();
                             let cmd = format!("loadjs {}", script_line);
-                            if let Err(e) = sender.send(cmd) {
+                            if let Err(e) = send_command(sender, cmd) {
                                 log_error!("发送 loadjs 失败: {}", e);
                             } else {
                                 // 等待脚本执行结果
@@ -268,8 +278,8 @@ fn main() {
     println!("  {DIM}输入 help 查看命令，exit 退出{RESET}");
 
     // 发送 shutdown 到 agent，随后等待 agent 完整清理并主动关闭 socket
-    let send_shutdown = |s: &std::sync::mpsc::Sender<String>| {
-        if let Err(e) = s.send("shutdown".to_string()) {
+    let send_shutdown = |s: &std::sync::mpsc::Sender<HostToAgentMessage>| {
+        if let Err(e) = send_command(s, "shutdown") {
             log_error!("发送 shutdown 失败: {}", e);
         } else {
             log_info!("已发送 shutdown，等待 agent 主动断开连接...");
@@ -311,12 +321,10 @@ fn main() {
                     run_js_repl(sender);
                     continue;
                 }
-                // 校验 hfl/qfl 必须带 <module> <offset> 两个参数
+                // 校验 hfl 必须带 <module> <offset> 两个参数
                 {
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if matches!(parts.first().copied(), Some("hfl") | Some("qfl"))
-                        && parts.len() < 3
-                    {
+                    if matches!(parts.first().copied(), Some("hfl")) && parts.len() < 3 {
                         log_warn!("用法: {} <module> <offset>", parts[0]);
                         continue;
                     }
@@ -330,7 +338,7 @@ fn main() {
                 if is_eval_cmd {
                     eval_state().clear();
                 }
-                match sender.send(line) {
+                match send_command(sender, line) {
                     Ok(_) => {}
                     Err(e) => {
                         log_error!("发送命令失败: {}", e);

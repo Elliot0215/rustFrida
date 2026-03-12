@@ -20,21 +20,19 @@ mod trace;
 
 #[cfg(feature = "frida-gum")]
 mod memory_dump;
-#[cfg(feature = "qbdi")]
-mod qbdi_trace;
 #[cfg(feature = "quickjs")]
 mod quickjs_loader;
 #[cfg(feature = "frida-gum")]
 mod stalker;
 
 use crate::communication::{
-    flush_cached_logs, log_msg, register_stream_fd, shutdown_stream, write_stream, GLOBAL_STREAM,
+    flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, read_frame, register_stream_fd,
+    send_complete, send_eval_err, send_eval_ok, send_hello, shutdown_stream, write_stream,
+    GLOBAL_STREAM,
 };
 use crate::crash_handler::{install_crash_handlers, install_panic_hook};
 use libc::{kill, pid_t, SIGSTOP};
 use std::ffi::c_void;
-use std::io::BufRead;
-use std::io::BufReader;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::process;
@@ -145,32 +143,33 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
     GLOBAL_STREAM
         .set(std::sync::Mutex::new(write_half))
         .unwrap();
-    write_stream(b"HELLO_AGENT\n");
+    send_hello();
     std::thread::sleep(Duration::from_millis(100));
     flush_cached_logs();
 
-    // 循环等待命令：BufReader + read_line 确保任意长度命令完整接收（无截断）
-    let mut reader = BufReader::new(sock);
-    let mut line = String::new();
+    let mut reader = sock;
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => {
-                // 连接关闭（EOF）
-                break;
-            }
-            Ok(_) => {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() {
-                    process_cmd(trimmed);
+        match read_frame(&mut reader) {
+            Ok((kind, payload)) => {
+                if is_cmd_frame(kind) {
+                    let cmd = String::from_utf8_lossy(&payload).trim().to_string();
+                    if !cmd.is_empty() {
+                        process_cmd(&cmd);
+                    }
+                } else if is_qbdi_helper_frame(kind) {
+                    #[cfg(feature = "quickjs")]
+                    quickjs_loader::install_qbdi_helper(payload);
+                } else {
+                    write_stream(format!("未知 frame kind: {}", kind).as_bytes());
                 }
                 if SHOULD_EXIT.load(Ordering::Relaxed) {
                     break;
                 }
             }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => {
                 // 读取错误
-                write_stream(format!("读取命令错误: {}\n", e).as_bytes());
+                write_stream(format!("读取命令错误: {}", e).as_bytes());
                 break;
             }
         }
@@ -185,15 +184,15 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
 #[cfg(feature = "quickjs")]
 fn eval_and_respond(script: &str, empty_err: &[u8]) {
     if script.is_empty() {
-        write_stream(empty_err);
+        send_eval_err(std::str::from_utf8(empty_err).unwrap_or("[quickjs] empty script"));
     } else if !quickjs_loader::is_initialized() {
-        write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes());
+        send_eval_err("[quickjs] JS 引擎未初始化，请先执行 jsinit");
     } else {
         match quickjs_loader::execute_script(script) {
-            Ok(result) => write_stream(format!("EVAL:{}\n", result).as_bytes()),
+            Ok(result) => send_eval_ok(&result),
             Err(e) => {
                 let e = e.replace('\n', "\r");
-                write_stream(format!("EVAL_ERR:{}\n", e).as_bytes());
+                send_eval_err(&e);
             }
         }
     }
@@ -241,25 +240,11 @@ fn process_cmd(command: &str) {
                 .unwrap_or(0);
             stalker::hfollow(md, offset)
         }
-        #[cfg(feature = "qbdi")]
-        Some("qfl") => {
-            let mut cmds = command.split_whitespace();
-            let md = cmds.nth(1).unwrap();
-            let offset = cmds
-                .next()
-                .and_then(|s| {
-                    let s = s.strip_prefix("0x").unwrap_or(s);
-                    usize::from_str_radix(s, 16).ok()
-                })
-                .unwrap_or(0);
-            qbdi_trace::qfollow(md, offset)
-        }
         #[cfg(feature = "quickjs")]
         Some("jsinit") => {
-            // Fix #2: 通过 EVAL:/EVAL_ERR: 协议应答，host 可用 eval_state 同步等待
             match quickjs_loader::init() {
-                Ok(_) => write_stream(b"EVAL:initialized\n"),
-                Err(e) => write_stream(format!("EVAL_ERR:{}\n", e).as_bytes()),
+                Ok(_) => send_eval_ok("initialized"),
+                Err(e) => send_eval_err(&e),
             }
         }
         #[cfg(feature = "quickjs")]
@@ -279,16 +264,15 @@ fn process_cmd(command: &str) {
         Some("jscomplete") => {
             let prefix = command.strip_prefix("jscomplete").unwrap_or("").trim();
             let result = quickjs_loader::complete(prefix);
-            // 直接写 socket，不走 log_msg（避免 [agent] 前缀干扰 host 解析）
-            write_stream(format!("COMPLETE:{}\n", result).as_bytes());
+            send_complete(&result);
         }
         #[cfg(feature = "quickjs")]
         Some("jsclean") => {
             if !quickjs_loader::is_initialized() {
-                write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化\n".as_bytes());
+                send_eval_err("[quickjs] JS 引擎未初始化");
             } else {
                 quickjs_loader::cleanup();
-                write_stream(b"EVAL:cleaned up\n");
+                send_eval_ok("cleaned up");
             }
         }
         // shutdown — 先完整清理并输出日志，最后由 agent 主动关闭 socket

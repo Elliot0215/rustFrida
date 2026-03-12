@@ -1,25 +1,65 @@
 //! agent 端 socket 通信模块
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Mutex, OnceLock};
 
+const FRAME_KIND_CMD: u8 = 1;
+const FRAME_KIND_QBDI_HELPER: u8 = 2;
+
+const FRAME_KIND_HELLO: u8 = 0x80;
+const FRAME_KIND_LOG: u8 = 0x81;
+const FRAME_KIND_COMPLETE: u8 = 0x82;
+const FRAME_KIND_EVAL_OK: u8 = 0x83;
+const FRAME_KIND_EVAL_ERR: u8 = 0x84;
+
 /// Write-half of the agent↔host socket, protected by Mutex to serialize messages
 pub static GLOBAL_STREAM: OnceLock<Mutex<UnixStream>> = OnceLock::new();
 pub static GLOBAL_STREAM_FD: OnceLock<i32> = OnceLock::new();
 
+fn write_frame(stream: &mut UnixStream, kind: u8, payload: &[u8]) -> std::io::Result<()> {
+    stream.write_all(&[kind])?;
+    stream.write_all(&(payload.len() as u32).to_le_bytes())?;
+    stream.write_all(payload)
+}
+
+pub(crate) fn read_frame(stream: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>)> {
+    let mut kind = [0u8; 1];
+    stream.read_exact(&mut kind)?;
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len)?;
+    let len = u32::from_le_bytes(len) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    Ok((kind[0], payload))
+}
+
 /// Write `data` to the global socket stream, serialized via Mutex.
 pub(crate) fn write_stream(data: &[u8]) {
     if let Some(m) = GLOBAL_STREAM.get() {
-        let _ = m.lock().unwrap_or_else(|e| e.into_inner()).write_all(data);
+        let _ = write_frame(
+            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
+            FRAME_KIND_LOG,
+            data,
+        );
     }
 }
 
 /// 直接通过原始 fd 写 socket，供崩溃处理等场景使用。
 pub(crate) fn write_stream_raw(data: &[u8]) {
     if let Some(fd) = GLOBAL_STREAM_FD.get() {
+        let mut header = [0u8; 5];
+        header[0] = FRAME_KIND_LOG;
+        header[1..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        let _ = unsafe {
+            libc::write(
+                *fd,
+                header.as_ptr() as *const libc::c_void,
+                header.len(),
+            )
+        };
         let mut offset = 0usize;
         while offset < data.len() {
             let wrote = unsafe {
@@ -35,6 +75,54 @@ pub(crate) fn write_stream_raw(data: &[u8]) {
             offset += wrote as usize;
         }
     }
+}
+
+pub(crate) fn send_hello() {
+    if let Some(m) = GLOBAL_STREAM.get() {
+        let _ = write_frame(
+            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
+            FRAME_KIND_HELLO,
+            &[],
+        );
+    }
+}
+
+pub(crate) fn send_complete(text: &str) {
+    if let Some(m) = GLOBAL_STREAM.get() {
+        let _ = write_frame(
+            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
+            FRAME_KIND_COMPLETE,
+            text.as_bytes(),
+        );
+    }
+}
+
+pub(crate) fn send_eval_ok(text: &str) {
+    if let Some(m) = GLOBAL_STREAM.get() {
+        let _ = write_frame(
+            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
+            FRAME_KIND_EVAL_OK,
+            text.as_bytes(),
+        );
+    }
+}
+
+pub(crate) fn send_eval_err(text: &str) {
+    if let Some(m) = GLOBAL_STREAM.get() {
+        let _ = write_frame(
+            &mut m.lock().unwrap_or_else(|e| e.into_inner()),
+            FRAME_KIND_EVAL_ERR,
+            text.as_bytes(),
+        );
+    }
+}
+
+pub(crate) fn is_cmd_frame(kind: u8) -> bool {
+    kind == FRAME_KIND_CMD
+}
+
+pub(crate) fn is_qbdi_helper_frame(kind: u8) -> bool {
+    kind == FRAME_KIND_QBDI_HELPER
 }
 
 pub(crate) static CACHE_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
