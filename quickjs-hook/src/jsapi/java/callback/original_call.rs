@@ -132,31 +132,46 @@ unsafe fn marshal_js_to_jvalue(
     }
 }
 
-/// Invoke cloned ArtMethod via JNI using provided jvalue args.
+/// Invoke original ArtMethod via JNI using provided jvalue args.
+///
+/// 2-ArtMethod 模型: 直接用原始 ArtMethod 地址作为 JNI method ID，
+/// 无需 clone，declaring_class_ 由 GC 自动维护。
 ///
 /// Shared by `js_call_original` (JS callback) and fallback path (JS engine busy).
 /// Returns the raw u64 return value for writing to HookContext.x[0].
 /// For void methods, returns 0.
-unsafe fn invoke_clone_jni(
+unsafe fn invoke_original_jni(
     env: JniEnv,
     art_method_addr: u64,
-    clone_addr: u64,
     class_global_ref: usize,
     this_obj: u64,
     return_type: u8,
     is_static: bool,
     jargs_ptr: *const std::ffi::c_void,
 ) -> u64 {
-    // 同步 clone 的 declaring_class_: GC 可能已移动 declaring class，
-    // clone (malloc'd) 不被 GC 追踪，declaring_class_ 可能 stale。
-    // 每次调用前从 original 拷贝到 clone，消除竞态。
-    if art_method_addr != 0 && clone_addr != 0 {
-        let dc = std::ptr::read_volatile(art_method_addr as *const u32);
-        std::ptr::write_volatile(clone_addr as *mut u32, dc);
-    }
     jni_check_exc(env);
 
-    let clone_mid = clone_addr as *mut std::ffi::c_void;
+    // TLS bypass: 告诉 art_router 当前线程在 callOriginal，不要路由这个方法
+    crate::jsapi::java::art_controller::set_call_original_bypass(art_method_addr);
+
+    let result = invoke_original_jni_inner(
+        env, art_method_addr, class_global_ref, this_obj, return_type, is_static, jargs_ptr,
+    );
+
+    crate::jsapi::java::art_controller::clear_call_original_bypass();
+    result
+}
+
+unsafe fn invoke_original_jni_inner(
+    env: JniEnv,
+    art_method_addr: u64,
+    class_global_ref: usize,
+    this_obj: u64,
+    return_type: u8,
+    is_static: bool,
+    jargs_ptr: *const std::ffi::c_void,
+) -> u64 {
+    let method_id = art_method_addr as *mut std::ffi::c_void;
     let cls = class_global_ref as *mut std::ffi::c_void;
     let this_ptr = this_obj as *mut std::ffi::c_void;
 
@@ -168,7 +183,7 @@ unsafe fn invoke_clone_jni(
                 JNI_CALL_NONVIRTUAL_VOID_METHOD_A,
                 cls,
                 this_ptr,
-                clone_mid,
+                method_id,
                 jargs_ptr,
                 is_static,
                 ()
@@ -183,7 +198,7 @@ unsafe fn invoke_clone_jni(
                 JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A,
                 cls,
                 this_ptr,
-                clone_mid,
+                method_id,
                 jargs_ptr,
                 is_static,
                 u8
@@ -198,7 +213,7 @@ unsafe fn invoke_clone_jni(
                 JNI_CALL_NONVIRTUAL_INT_METHOD_A,
                 cls,
                 this_ptr,
-                clone_mid,
+                method_id,
                 jargs_ptr,
                 is_static,
                 i32
@@ -213,7 +228,7 @@ unsafe fn invoke_clone_jni(
                 JNI_CALL_NONVIRTUAL_LONG_METHOD_A,
                 cls,
                 this_ptr,
-                clone_mid,
+                method_id,
                 jargs_ptr,
                 is_static,
                 i64
@@ -228,7 +243,7 @@ unsafe fn invoke_clone_jni(
                 JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A,
                 cls,
                 this_ptr,
-                clone_mid,
+                method_id,
                 jargs_ptr,
                 is_static,
                 f32
@@ -243,7 +258,7 @@ unsafe fn invoke_clone_jni(
                 JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A,
                 cls,
                 this_ptr,
-                clone_mid,
+                method_id,
                 jargs_ptr,
                 is_static,
                 f64
@@ -258,7 +273,7 @@ unsafe fn invoke_clone_jni(
                 JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A,
                 cls,
                 this_ptr,
-                clone_mid,
+                method_id,
                 jargs_ptr,
                 is_static,
                 *mut std::ffi::c_void
@@ -298,10 +313,10 @@ unsafe fn build_jargs_from_registers(
 
 /// JS CFunction: ctx.orig() or ctx.orig(arg0, arg1, ...)
 ///
-/// No arguments: invokes the clone with the original register arguments.
-/// With arguments: invokes the clone with user-specified arguments (JS → jvalue conversion).
+/// No arguments: invokes the original method with the original register arguments.
+/// With arguments: invokes the original method with user-specified arguments (JS → jvalue conversion).
 ///
-/// Invokes the cloned ArtMethod via JNI CallNonvirtual*MethodA / CallStatic*MethodA.
+/// 2-ArtMethod 模型: 直接用原始 ArtMethod 地址作为 JNI method ID 调用。
 /// Returns the method's return value as a JS value.
 ///
 /// Must be called from a hook context object created by java_hook_callback.
@@ -320,9 +335,8 @@ unsafe extern "C" fn js_call_original(
         );
     }
 
-    // Look up hook data for clone info
+    // Look up hook data
     let (
-        clone_addr,
         class_global_ref,
         return_type,
         return_type_sig,
@@ -353,7 +367,6 @@ unsafe extern "C" fn js_call_original(
             }
         };
         (
-            data.clone_addr,
             data.class_global_ref,
             data.return_type,
             data.return_type_sig.clone(),
@@ -363,12 +376,7 @@ unsafe extern "C" fn js_call_original(
         )
     }; // lock released
 
-    if clone_addr == 0 {
-        return ffi::JS_ThrowInternalError(
-            ctx,
-            b"orig: no ArtMethod clone available\0".as_ptr() as *const _,
-        );
-    }
+    // art_method_addr 已在上方检查 (!=0), 此处无需再检查
 
     let hook_ctx = &*ctx_ptr;
 
@@ -418,11 +426,10 @@ unsafe extern "C" fn js_call_original(
     };
 
     // 恢复 JNI trampoline 后, x[1] 是标准 JNI jobject (由 ART 转换)
-    // Invoke clone via shared JNI helper
-    let ret_raw = invoke_clone_jni(
+    // 2-ArtMethod 模型: 直接用原始 ArtMethod 作为 method ID 调用
+    let ret_raw = invoke_original_jni(
         env,
         art_method_addr,
-        clone_addr,
         class_global_ref,
         hook_ctx.x[1],
         return_type,

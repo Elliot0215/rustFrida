@@ -713,9 +713,7 @@ unsafe fn release_java_hook_resources(
         }
     }
 
-    if data.clone_addr != 0 {
-        libc::free(data.clone_addr as *mut std::ffi::c_void);
-    }
+    // 2-ArtMethod 模型: clone 已去掉，无需释放
 
     if data.class_global_ref != 0 {
         if let Some(env) = env_opt {

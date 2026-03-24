@@ -309,6 +309,13 @@ int hook_art_router_table_remove(uint64_t original);
 void hook_art_router_table_clear(void);
 
 /*
+ * Reverse lookup: given replacement ArtMethod*, return the original ArtMethod*.
+ * Used by callOriginal TLS bypass to match art_router entries.
+ * Returns 0 if not found.
+ */
+uint64_t hook_art_router_table_lookup_original(uint64_t replacement);
+
+/*
  * Dump all entries in the ART router lookup table (via hook_log).
  */
 void hook_art_router_table_dump(void);

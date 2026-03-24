@@ -12,7 +12,7 @@ use super::super::art_method::*;
 use super::super::callback::*;
 use super::super::jni_core::*;
 use super::install_support::{
-    alloc_art_method_clone, create_class_global_ref, create_replacement_art_method,
+    create_class_global_ref, create_replacement_art_method,
     install_per_method_router_hook, update_original_method_flags_for_hook, JavaHookInstallGuard,
 };
 
@@ -129,31 +129,21 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         }
     }
 
-    let clone_size = spec.size;
-    let clone_addr = match alloc_art_method_clone(art_method, clone_size) {
-        Ok(addr) => addr,
-        Err(msg) => return throw_internal_error(ctx, msg),
-    };
-
-    output_verbose(&format!(
-        "[java hook] Step 3 clone: backup={:#x} (size={})",
-        clone_addr, clone_size
-    ));
+    // 2-ArtMethod 模型: 不再分配 clone，callOriginal 直接用原始 ArtMethod
 
     let bridge = find_art_bridge_functions(env, ep_offset);
     let jni_trampoline = bridge.quick_generic_jni_trampoline;
     if jni_trampoline == 0 {
-        libc::free(clone_addr as *mut std::ffi::c_void);
         return throw_internal_error(ctx, "failed to find art_quick_generic_jni_trampoline");
     }
 
     let class_global_ref = match create_class_global_ref(env, &class_name) {
         Ok(gref) => gref,
         Err(msg) => {
-            libc::free(clone_addr as *mut std::ffi::c_void);
             return throw_internal_error(ctx, msg);
         }
     };
+    let clone_size = spec.size;
     let mut install_guard = JavaHookInstallGuard::new(
         art_method,
         spec.access_flags_offset,
@@ -162,7 +152,6 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         original_access_flags,
         original_data,
         original_entry_point,
-        clone_addr,
         class_global_ref,
     );
 
@@ -241,7 +230,6 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
         &bridge,
         ep_offset,
         env,
-        clone_addr,
         art_method,
         is_constructor,
     ) {
@@ -263,7 +251,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                     replacement_addr,
                     per_method_hook_target,
                 },
-                clone_addr,
+                clone_addr: 0, // 2-ArtMethod 模型: 不再使用 clone
                 class_global_ref,
                 return_type,
                 return_type_sig: get_return_type_sig(&actual_sig),

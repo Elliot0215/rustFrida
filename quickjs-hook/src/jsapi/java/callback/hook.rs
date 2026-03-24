@@ -83,7 +83,6 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     let art_method_addr = user_data as u64;
 
     // Copy callback data then release lock before QuickJS operations.
-    // Also extract clone info for fallback callOriginal when JS engine is busy.
     let (
         ctx_usize,
         callback_bytes,
@@ -92,7 +91,6 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         return_type,
         return_type_sig,
         param_types,
-        clone_addr,
         class_global_ref,
     ) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
@@ -127,7 +125,6 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             hook_data.return_type,
             hook_data.return_type_sig.clone(),
             hook_data.param_types.clone(),
-            hook_data.clone_addr,
             hook_data.class_global_ref,
         )
     }; // lock released
@@ -244,17 +241,16 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     if !result_was_set {
         let hook_ctx = &*ctx_ptr;
         let env: JniEnv = hook_ctx.x[0] as JniEnv;
-        if !env.is_null() && clone_addr != 0 {
+        if !env.is_null() {
             let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
             let jargs_ptr = if param_count > 0 {
                 jargs.as_ptr() as *const std::ffi::c_void
             } else {
                 std::ptr::null()
             };
-            let ret_raw = invoke_clone_jni(
+            let ret_raw = invoke_original_jni(
                 env,
                 art_method_addr,
-                clone_addr,
                 class_global_ref,
                 hook_ctx.x[1],
                 return_type,
@@ -367,7 +363,6 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
         return_type,
         return_type_sig,
         param_types,
-        clone_addr,
         class_global_ref,
     ) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
@@ -399,7 +394,6 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
             hook_data.return_type,
             hook_data.return_type_sig.clone(),
             hook_data.param_types.clone(),
-            hook_data.clone_addr,
             hook_data.class_global_ref,
         )
     }; // lock released
@@ -483,15 +477,15 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
         // 处理返回值
         |_ctx, _js_ctx, _result| {
             result_was_set = true;
-            // 返回值由 ctx.orig() 设置 (通过 invoke_clone_jni)
+            // 返回值由 ctx.orig() 设置 (通过 invoke_original_jni)
             // 如果 JS 没调 orig(), 返回值为 0/null
         },
     );
 
-    // Fallback + 默认路径: 调用 clone (原始方法) via JNI
+    // Fallback + 默认路径: 调用原始方法 via JNI (2-ArtMethod 模型)
     // JNI CallNonvirtualMethodA 会建立完整的 JNI transition frame
     if !result_was_set {
-        if !env.is_null() && clone_addr != 0 {
+        if !env.is_null() {
             let hook_ctx = &*ctx_ptr;
             let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
             let jargs_ptr = if param_count > 0 {
@@ -500,10 +494,9 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
                 std::ptr::null()
             };
             // x[1] 在 Layer 1/2 路径不是 receiver, 强制静态调用
-            let ret_raw = invoke_clone_jni(
+            let ret_raw = invoke_original_jni(
                 env,
                 art_method_addr,
-                clone_addr,
                 class_global_ref,
                 0, // receiver=0, 用静态调用
                 return_type,

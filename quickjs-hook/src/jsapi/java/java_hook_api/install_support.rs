@@ -25,7 +25,6 @@ pub(super) struct JavaHookInstallGuard {
     original_access_flags: u32,
     original_data: u64,
     original_entry_point: u64,
-    clone_addr: u64,
     replacement_addr: usize,
     class_global_ref: usize,
     redirect_installed: bool,
@@ -43,7 +42,6 @@ impl JavaHookInstallGuard {
         original_access_flags: u32,
         original_data: u64,
         original_entry_point: u64,
-        clone_addr: u64,
         class_global_ref: usize,
     ) -> Self {
         Self {
@@ -54,7 +52,6 @@ impl JavaHookInstallGuard {
             original_access_flags,
             original_data,
             original_entry_point,
-            clone_addr,
             replacement_addr: 0,
             class_global_ref,
             redirect_installed: false,
@@ -120,15 +117,12 @@ impl Drop for JavaHookInstallGuard {
                 libc::free(self.replacement_addr as *mut std::ffi::c_void);
             }
 
-            if self.clone_addr != 0 {
-                libc::free(self.clone_addr as *mut std::ffi::c_void);
-            }
-
             delete_global_ref_best_effort(self.class_global_ref);
         }
     }
 }
 
+#[allow(dead_code)]
 pub(super) unsafe fn alloc_art_method_clone(art_method: u64, clone_size: usize) -> Result<u64, String> {
     let ptr = libc::malloc(clone_size);
     if ptr.is_null() {
@@ -208,7 +202,6 @@ pub(super) unsafe fn install_per_method_router_hook(
     bridge: &ArtBridgeFunctions,
     ep_offset: usize,
     env: JniEnv,
-    clone_addr: u64,
     art_method: u64,
     _force_interpreter_route: bool,
 ) -> Result<Option<u64>, String> {
@@ -235,18 +228,7 @@ pub(super) unsafe fn install_per_method_router_hook(
         // stealth2: 修复 trampoline（hook engine 从 slot 读到的是清零字节）
         super::super::art_controller::try_fixup_trampoline_pub(trampoline, original_entry_point);
 
-        // clone 的 entry_point 设为 interpreter_bridge (对标 Frida):
-        // 让 callOriginal 走解释器执行 DEX bytecode，而不是 trampoline (relocated OAT code)。
-        // trampoline 的 PC 在 hook engine 内存中，不在原方法 OAT code range 内，
-        // 导致 WalkStack → GetDexPc 在原方法 CodeInfo 里找不到 StackMap entry → abort。
-        // 解释器路径产生正确的 frame 布局，WalkStack 可以安全遍历。
-        let clone_ep = if bridge.quick_to_interpreter_bridge != 0 {
-            bridge.quick_to_interpreter_bridge
-        } else {
-            trampoline as u64
-        };
-        std::ptr::write_volatile((clone_addr as usize + ep_offset) as *mut u64, clone_ep);
-        hook_ffi::hook_flush_cache((clone_addr as usize + ep_offset) as *mut std::ffi::c_void, 8);
+        // 2-ArtMethod 模型: 不再设置 clone entry_point，callOriginal 直接用原始 ArtMethod
 
         let actual_hook_target = if !hooked_target.is_null() {
             hooked_target as u64

@@ -718,9 +718,14 @@ unsafe extern "C" fn on_do_call_enter(ctx_ptr: *mut hook_ffi::HookContext, _user
     DO_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
     if let Some(replacement) = get_replacement_method(method) {
         DO_CALL_HIT_COUNT.fetch_add(1, Ordering::Relaxed);
-        // 递归防护: 检查 managedStack 是否表明这是 callOriginal 发起的调用
+        // 递归防护: TLS bypass (callOriginal) + managed stack check
+        ensure_bypass_key();
+        let bypass = libc::pthread_getspecific(BYPASS_KEY) as u64;
+        if bypass == method {
+            return; // callOriginal bypass
+        }
         if !should_replace_for_stack(replacement) {
-            return; // 递归情况，保持 original 不替换
+            return; // managed stack 递归
         }
         // 同步 declaring_class_: replacement (malloc'd) 不被 GC 追踪，
         // GC 移动 declaring class 后 replacement 的 declaring_class_ 可能 stale。
@@ -806,6 +811,49 @@ unsafe fn should_replace_for_stack(replacement: u64) -> bool {
     } else {
         true
     }
+}
+
+// ============================================================================
+// callOriginal bypass — TLS 标记防止 art_router 递归
+// ============================================================================
+
+static BYPASS_KEY_INIT: std::sync::Once = std::sync::Once::new();
+static mut BYPASS_KEY: libc::pthread_key_t = 0;
+
+fn ensure_bypass_key() {
+    BYPASS_KEY_INIT.call_once(|| unsafe {
+        libc::pthread_key_create(&mut BYPASS_KEY as *mut _, None);
+    });
+}
+
+/// callOriginal 前调用：设置当前线程 bypass 的 original ArtMethod 地址
+pub(crate) fn set_call_original_bypass(art_method: u64) {
+    ensure_bypass_key();
+    unsafe { libc::pthread_setspecific(BYPASS_KEY, art_method as *const _); }
+}
+
+/// callOriginal 后调用：清除 bypass
+pub(crate) fn clear_call_original_bypass() {
+    ensure_bypass_key();
+    unsafe { libc::pthread_setspecific(BYPASS_KEY, std::ptr::null()); }
+}
+
+/// C-callable：art_router thunk + DoCall hook 调用，判断是否应该路由。
+/// 返回 1 = 正常路由到 replacement，返回 0 = 跳过（callOriginal bypass 或 stack 递归）。
+#[no_mangle]
+pub unsafe extern "C" fn art_router_stack_check(replacement: u64) -> i32 {
+    // TLS bypass: callOriginal 期间当前线程设置了 bypass 的 original 地址
+    ensure_bypass_key();
+    let bypass = libc::pthread_getspecific(BYPASS_KEY) as u64;
+    if bypass != 0 {
+        // bypass 存的是 original ArtMethod 地址。
+        // art_router table 是 [original, replacement] 对，通过 C 侧查表反查。
+        if hook_ffi::hook_art_router_table_lookup_original(replacement) == bypass {
+            return 0; // callOriginal bypass
+        }
+    }
+    // Fallback: managed stack check (对标 Frida, 覆盖其他递归场景)
+    if should_replace_for_stack(replacement) { 1 } else { 0 }
 }
 
 /// 上次见到的非空 ArtMethod* (PrettyMethod 防护用)
@@ -919,12 +967,10 @@ unsafe fn synchronize_replacement_methods() {
 
         // --- Fix 1: declaring_class_ 同步 ---
         // 移动 GC 会更新原始 ArtMethod 的 declaring_class_ (offset 0, 4 bytes GcRoot)，
-        // 堆分配的 clone/replacement 不会被 GC 追踪，需要同步以防悬空引用。
+        // 堆分配的 replacement 不会被 GC 追踪，需要同步以防悬空引用。
+        // 2-ArtMethod 模型: clone 已去掉，只同步 replacement。
         {
             let declaring_class = std::ptr::read_volatile(art_method as *const u32);
-            if data.clone_addr != 0 {
-                std::ptr::write_volatile(data.clone_addr as *mut u32, declaring_class);
-            }
             // 同步 replacement 的 declaring_class_ (对标 Frida synchronize_replacement_methods)
             let HookType::Replaced { replacement_addr, .. } = &data.hook_type;
             if *replacement_addr != 0 {
