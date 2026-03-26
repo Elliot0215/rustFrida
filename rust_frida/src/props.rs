@@ -281,27 +281,47 @@ fn patch_prop_files(
                 let value_offset = name_offset - PROP_VALUE_MAX;
                 let serial_offset = value_offset - 4;
 
-                // 读取旧值
-                let old_end = data[value_offset..name_offset]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .unwrap_or(PROP_VALUE_MAX);
-                let old_value =
-                    String::from_utf8_lossy(&data[value_offset..value_offset + old_end])
-                        .to_string();
+                // 读取 serial 判断是否为 long property
+                let serial = u32::from_le_bytes(
+                    data[serial_offset..serial_offset + 4].try_into().unwrap(),
+                );
+                // long property 标记: value 区域包含 "Must use __system_property_read_callback"
+                let is_long = data[value_offset..value_offset + 10]
+                    .starts_with(b"Must use _");
 
-                // 写入新值（先清零再写入）
+                // 读取旧值
+                let old_value = if is_long {
+                    // long property: 实际值在 name 之后
+                    let long_start = name_offset + key.len() + 1; // name\0 之后
+                    // 对齐到 4 字节
+                    let long_start = (long_start + 3) & !3;
+                    if long_start < data.len() {
+                        let end = data[long_start..].iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(0);
+                        String::from_utf8_lossy(&data[long_start..long_start + end]).to_string()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    let old_end = data[value_offset..name_offset]
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(PROP_VALUE_MAX);
+                    String::from_utf8_lossy(&data[value_offset..value_offset + old_end])
+                        .to_string()
+                };
+
+                // 写入新值: 清零 value 区域 + 写入短值 + 重置 serial 为 short property
                 for byte in data[value_offset..value_offset + PROP_VALUE_MAX].iter_mut() {
                     *byte = 0;
                 }
                 let new_bytes = new_value.as_bytes();
                 data[value_offset..value_offset + new_bytes.len()].copy_from_slice(new_bytes);
 
-                // 更新 serial（递增到下一个偶数，表示写入完成的稳定状态）
-                let serial = u32::from_le_bytes(
-                    data[serial_offset..serial_offset + 4].try_into().unwrap(),
-                );
-                let new_serial = (serial | 1).wrapping_add(1);
+                // 设置 serial 为 short property 格式（清除 long property 标记）
+                // serial 格式: 偶数=stable, 低位=0 表示非 long
+                let new_serial = 2u32; // 最简单的 valid short serial
                 data[serial_offset..serial_offset + 4]
                     .copy_from_slice(&new_serial.to_le_bytes());
 

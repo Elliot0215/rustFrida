@@ -457,11 +457,12 @@ __attribute__((visibility("default")))
 int
 rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *datap)
 {
-    /* 每次 capset 调用时尝试 mount（幂等，重复 mount 无害）
-     * 此时 UID=0 + mount ns 已隔离 */
+    /* 在 cap drop 前执行 mount --bind
+     * 先 unshare(CLONE_NEWNS) 确保 mount 不传播到 zygote
+     * （Android 16 此时 ns 已隔离，unshare 幂等无害；
+     *  Android 12 此时 ns 未隔离，必须先 unshare） */
     if (datap != NULL)
     {
-        /* 即将 drop CAP_SYS_ADMIN → 在 drop 前执行 mount */
         char ap[] = "/dev/__properties__/.profiles/.active";
         char pd[128];
         int af = (int)raw_syscall6(__NR_openat, MY_AT_FDCWD, (long)ap, MY_O_RDONLY, 0, 0, 0);
@@ -473,6 +474,8 @@ rustfrida_zymbiote_replacement_capset(struct cap_header *hdrp, struct cap_data *
             {
                 while (nr > 0 && (pd[nr-1] == '\n' || pd[nr-1] == '\r')) nr--;
                 pd[nr] = '\0';
+                /* 确保独立 mount namespace（幂等） */
+                raw_syscall6(97 /*__NR_unshare*/, 0x00020000 /*CLONE_NEWNS*/, 0, 0, 0, 0, 0);
                 raw_syscall6(__NR_mount, (long)pd, (long)"/dev/__properties__",
                              0, MY_MS_BIND, 0, 0);
             }
