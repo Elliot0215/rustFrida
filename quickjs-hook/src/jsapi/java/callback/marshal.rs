@@ -2,6 +2,16 @@
 // ARM64 JNI calling convention helpers
 // ============================================================================
 
+/// 控制 marshal 是否跳过容器类型转换（List→Array, 数组→Array）。
+/// 用户直接调方法时设为 true，hook callback 上下文默认 false。
+std::thread_local! {
+    static SKIP_CONTAINER_CONVERSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn set_skip_container_conversion(skip: bool) {
+    SKIP_CONTAINER_CONVERSION.with(|c| c.set(skip));
+}
+
 /// 判断 JNI 类型签名是否表示浮点类型 (float/double)
 #[inline]
 fn is_floating_point_type(sig: Option<&str>) -> bool {
@@ -272,7 +282,10 @@ unsafe fn marshal_java_object_to_js_inner(
         return value;
     }
 
-    if depth < MAX_JAVA_CONTAINER_DEPTH {
+    // 容器自动转换（List→Array, 数组→Array）只在 hook callback 上下文中执行。
+    // 用户直接调用方法时（_invokeMethod/_invokeStaticMethod）不做容器转换，
+    // 返回 Proxy 引用让用户继续调用实例方法。
+    if depth < MAX_JAVA_CONTAINER_DEPTH && !SKIP_CONTAINER_CONVERSION.get() {
         if class_name.starts_with('[') {
             if let Some(value) = convert_java_array_to_js(
                 ctx,

@@ -153,6 +153,9 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
         )
     };
 
+    // 用户直接调用方法: 跳过容器类型转换（List→Array）
+    set_skip_container_conversion(true);
+
     // Dispatch based on return type using CallNonvirtual*MethodA (avoids needing all Call*MethodA indices)
     let result = match return_type {
         b'V' => {
@@ -281,9 +284,11 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
         _ => ffi::qjs_undefined(),
     };
 
+    set_skip_container_conversion(false);
     cleanup_local_refs(env, local_obj, cls);
     result
 }
+
 
 // ============================================================================
 // Java._invokeStaticMethod(className, methodName, methodSig, ...args)
@@ -413,6 +418,8 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             class_name, method_name, method_sig
         )
     };
+
+    set_skip_container_conversion(true);
 
     let result = match return_type {
         b'V' => {
@@ -631,6 +638,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
         return cleanup_and_throw_internal(ctx, env, std::ptr::null_mut(), cls, invoke_exception());
     }
 
+    set_skip_container_conversion(false);
     cleanup_local_refs(env, std::ptr::null_mut(), cls);
     result
 }
@@ -757,32 +765,14 @@ pub(super) unsafe extern "C" fn js_java_new_object(
         );
     }
 
-    // $new: String 和 boxed primitives → unbox 为 JS 值（不可变，无需 Proxy）
-    // 容器类型（List/Map/Set 等） → 保持 {__jptr, __jclass} 引用（Proxy 包装后可继续调方法）
-    let result = {
-        let jni_name = class_name.replace('.', "/");
-        let should_unbox = matches!(
-            jni_name.as_str(),
-            "java/lang/String"
-                | "java/lang/Integer"
-                | "java/lang/Long"
-                | "java/lang/Double"
-                | "java/lang/Float"
-                | "java/lang/Boolean"
-                | "java/lang/Byte"
-                | "java/lang/Short"
-                | "java/lang/Character"
-        );
-        if should_unbox {
-            let class_sig = format!("L{};", jni_name);
-            match wrap_invoke_return_object(ctx, env, obj, &class_sig) {
-                Ok(value) => value,
-                Err(_) => wrap_java_object_ref(ctx, env, obj, &class_name, false),
-            }
-        } else {
-            wrap_java_object_ref(ctx, env, obj, &class_name, false)
-        }
+    // $new: 跳过容器转换，String/boxed primitives 自动 unbox
+    set_skip_container_conversion(true);
+    let class_sig = format!("L{};", class_name.replace('.', "/"));
+    let result = match wrap_invoke_return_object(ctx, env, obj, &class_sig) {
+        Ok(value) => value,
+        Err(_) => ffi::qjs_null(),
     };
+    set_skip_container_conversion(false);
 
     cleanup_local_refs(env, std::ptr::null_mut(), cls);
     result
