@@ -129,7 +129,9 @@ type NativeHookContext = {
 
 type JavaHookContext = {
   thisObj?: JavaObjectProxy     // 实例方法的 this（静态方法无）
-  args: any[]                   // 参数数组
+                                // 字段: thisObj.field.value 读/写
+                                // 方法: thisObj.method(args) 调用
+  args: any[]                   // 参数数组（Object 参数自动包装为 Proxy）
   env: number | bigint          // JNIEnv*
   orig(...args: any[]): any     // 调原方法，不传参用原始参数
 }
@@ -251,6 +253,39 @@ var Process = Java.use("android.os.Process");
 console.log(Process.myPid());      // 调静态方法
 ```
 
+### 字段访问（Frida 兼容 .value 模式）
+
+字段通过 `.value` 读写，每次直接走 JNI，无缓存锁：
+
+```js
+// 静态字段
+var Build = Java.use("android.os.Build");
+console.log(Build.MODEL.value);          // 读: "Pixel 6"
+Build.MODEL.value = "FakeModel";         // 写
+
+// 实例字段（hook 回调中 / $new 创建的对象）
+var Point = Java.use("android.graphics.Point");
+var p = Point.$new(10, 20);
+console.log(p.x.value, p.y.value);      // 读: 10, 20
+p.x.value = 100;                         // 写: JVM 同步更新
+console.log(p.toString());               // "Point(100, 20)"
+
+// hook 中访问 this 字段
+Activity.onResume.impl = function(ctx) {
+    var name = ctx.thisObj.mComponent.value;  // 读实例字段
+    console.log("resuming:", name);
+    return ctx.orig();
+};
+```
+
+**字段/方法同名**：Java 允许同名字段和方法共存。此时返回 hybrid——既可调用（方法）又有 `.value`（字段）：
+
+```js
+var map = HashMap.$new();
+map.size();        // 调用 size() 方法
+map.size.value;    // 读取 size 字段
+```
+
 ### Java.ready
 
 Spawn 模式下 app ClassLoader 未就绪，用 `Java.ready` 延迟执行。PID 注入模式下立即执行。
@@ -293,7 +328,9 @@ Java.deoptimizeMethod("com.example.Test", "foo", "(I)V");  // 单方法降级
 | `Java.deoptimizeMethod(cls, method, sig)` | `string, string, string` | `boolean` |
 | `Java.setStealth(mode)` | `number (0/1/2)` | — |
 | `Java.getStealth()` | — | `number` |
-| `Java.getField(objPtr, cls, field, sig)` | `AddressLike, string, string, string` | `any` |
+| `obj.field.value` | — | `any` (读字段) |
+| `obj.field.value = x` | — | — (写字段) |
+| `Java.getField(objPtr, cls, field, sig)` | `AddressLike, string, string, string` | `any` (低层 API) |
 
 ---
 
@@ -451,6 +488,7 @@ Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi
 - **两种 hook 都建议 `return ctx.orig()`** 透传返回值
 - **Native hook 改参数/返回值：** `ctx.x0 = value` 或 `ctx.orig(newArg0, newArg1)`，`return value` 覆盖返回值
 - **Java hook 改参数/返回值：** `return ctx.orig(newArgs)` 改参数，`return value` 改返回值
+- **Java 字段访问必须用 `.value`：** `obj.field` 返回 FieldWrapper，`obj.field.value` 才是真实值
 - Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里
 - `Java.setStealth()` 必须在 `Java.use().impl` 之前调用
 - `callNative()` 仅支持整数/指针参数（最多 6 个）
