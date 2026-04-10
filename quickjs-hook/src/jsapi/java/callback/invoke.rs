@@ -168,8 +168,14 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             );
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_VOID_METHOD_A);
             f(env, local_obj, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
-                return cleanup_and_throw_internal(ctx, env, local_obj, cls, invoke_exception());
+            if let Some(exc_msg) = jni_take_exception(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    local_obj,
+                    cls,
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
+                );
             }
             ffi::qjs_undefined()
         }
@@ -183,8 +189,14 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> u8;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
-                return cleanup_and_throw_internal(ctx, env, local_obj, cls, invoke_exception());
+            if let Some(exc_msg) = jni_take_exception(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    local_obj,
+                    cls,
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
+                );
             }
             JSValue::bool(ret != 0).raw()
         }
@@ -198,8 +210,14 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> i32;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_INT_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
-                return cleanup_and_throw_internal(ctx, env, local_obj, cls, invoke_exception());
+            if let Some(exc_msg) = jni_take_exception(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    local_obj,
+                    cls,
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
+                );
             }
             match return_type {
                 b'I' => JSValue::int(ret).raw(),
@@ -222,8 +240,14 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> i64;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_LONG_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
-                return cleanup_and_throw_internal(ctx, env, local_obj, cls, invoke_exception());
+            if let Some(exc_msg) = jni_take_exception(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    local_obj,
+                    cls,
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
+                );
             }
             ffi::JS_NewBigUint64(ctx, ret as u64)
         }
@@ -237,8 +261,14 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> f32;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
-                return cleanup_and_throw_internal(ctx, env, local_obj, cls, invoke_exception());
+            if let Some(exc_msg) = jni_take_exception(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    local_obj,
+                    cls,
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
+                );
             }
             JSValue::float(ret as f64).raw()
         }
@@ -252,8 +282,14 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> f64;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A);
             let ret = f(env, local_obj, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
-                return cleanup_and_throw_internal(ctx, env, local_obj, cls, invoke_exception());
+            if let Some(exc_msg) = jni_take_exception(env) {
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    local_obj,
+                    cls,
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
+                );
             }
             JSValue::float(ret).raw()
         }
@@ -268,11 +304,17 @@ pub(super) unsafe extern "C" fn js_java_invoke_method(
             ) -> *mut std::ffi::c_void;
             let f: F = jni_fn!(env, F, JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A);
             let obj = f(env, local_obj, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 if !obj.is_null() {
                     delete_local_ref(env, obj);
                 }
-                return cleanup_and_throw_internal(ctx, env, local_obj, cls, invoke_exception());
+                return cleanup_and_throw_internal(
+                    ctx,
+                    env,
+                    local_obj,
+                    cls,
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
+                );
             }
             match wrap_invoke_return_object(ctx, env, obj, &return_type_sig) {
                 Ok(value) => value,
@@ -431,13 +473,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             );
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_VOID_METHOD_A);
             f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             ffi::qjs_undefined()
@@ -461,13 +503,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> i8;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_BYTE_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             JSValue::int(ret as i32).raw()
@@ -481,13 +523,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> u16;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_CHAR_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             let ch = std::char::from_u32(ret as u32).unwrap_or('\0');
@@ -502,13 +544,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> i16;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_SHORT_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             JSValue::int(ret as i32).raw()
@@ -522,13 +564,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> i32;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_INT_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             JSValue::int(ret).raw()
@@ -542,13 +584,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> i64;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_LONG_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             ffi::JS_NewBigUint64(ctx, ret as u64)
@@ -562,13 +604,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> f32;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_FLOAT_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             JSValue::float(ret as f64).raw()
@@ -582,13 +624,13 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> f64;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_DOUBLE_METHOD_A);
             let ret = f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 return cleanup_and_throw_internal(
                     ctx,
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             JSValue::float(ret).raw()
@@ -602,7 +644,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
             ) -> *mut std::ffi::c_void;
             let f: F = jni_fn!(env, F, JNI_CALL_STATIC_OBJECT_METHOD_A);
             let obj = f(env, cls, mid, jargs_ptr);
-            if jni_check_exc(env) {
+            if let Some(exc_msg) = jni_take_exception(env) {
                 if !obj.is_null() {
                     let delete_local_ref: DeleteLocalRefFn =
                         jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
@@ -613,7 +655,7 @@ pub(super) unsafe extern "C" fn js_java_invoke_static_method(
                     env,
                     std::ptr::null_mut(),
                     cls,
-                    invoke_exception(),
+                    format!("{}\n  Java: {}", invoke_exception(), exc_msg),
                 );
             }
             match wrap_invoke_return_object(ctx, env, obj, &return_type_sig) {

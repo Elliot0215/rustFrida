@@ -12,6 +12,7 @@
     var _writeField = Java._writeField;
     var _classLoaders = Java._classLoaders;
     var _findClassWithLoader = Java._findClassWithLoader;
+    var _findClassObject = Java._findClassObject;
     var _setClassLoader = Java._setClassLoader;
     delete Java.hook;
     delete Java.unhook;
@@ -23,6 +24,7 @@
     delete Java._writeField;
     delete Java._classLoaders;
     delete Java._findClassWithLoader;
+    delete Java._findClassObject;
     delete Java._setClassLoader;
 
     function _argsFrom(argsLike, start) {
@@ -83,32 +85,148 @@
         return res;
     }
 
-    function _isJsValueCompatible(jsVal, jniType) {
+    // Score a single JS value against a JNI parameter type.
+    //   * 返回 >= 0: 兼容，分数越高越精确（用于多 overload 消歧）
+    //   * 返回 -1:  不兼容，该 overload 应整体排除
+    //
+    // 评分原则: 精确匹配 10 > 父类/接口 6~8 > Object 5 > 通用 object 3
+    // 数值类型按 JS 值是整数还是浮点分级:
+    //   整数 JS number → int(10) > long(9) > short(8) > byte(7) > double(5) > float(4)
+    //   浮点 JS number → double(10) > float(9)；整数类型不匹配以避免截断
+    // JS 基础类型的对象参数可匹配 Java 装箱类 + 其祖先（Number/Object/Comparable 等）。
+    function _scoreJsParam(jsVal, jniType) {
         var t0 = jniType.charAt(0);
+
+        // null / undefined 只能填 L / [ 类型
         if (jsVal === null || jsVal === undefined) {
-            return t0 === 'L' || t0 === '[';
+            return (t0 === 'L' || t0 === '[') ? 5 : -1;
         }
+
         var jsType = typeof jsVal;
+
+        // --- 基础类型 ---
         if (t0 === 'Z') {
-            return jsType === "boolean" || jsType === "number";
+            if (jsType === "boolean") return 10;
+            if (jsType === "number") return 6;
+            return -1;
         }
-        if (t0 === 'B' || t0 === 'S' || t0 === 'I'
-            || t0 === 'F' || t0 === 'D') {
-            return jsType === "number";
+        if (t0 === 'C') {
+            // char: JS 单字符 string > JS 整数（code point）
+            if (jsType === "string" && jsVal.length === 1) return 10;
+            if (jsType === "number" && Number.isInteger(jsVal)
+                && jsVal >= 0 && jsVal <= 65535) return 7;
+            return -1;
         }
-        if (t0 === 'J') {
-            return jsType === "bigint" || jsType === "number";
-        }
-        if (t0 === 'L') {
-            if (jsType === "string") {
-                return jniType === "Ljava/lang/String;";
+        // 整数类型 I/J/S/B
+        if (t0 === 'I' || t0 === 'J' || t0 === 'S' || t0 === 'B') {
+            if (jsType === "bigint") {
+                // BigInt 只允许匹配 long
+                return t0 === 'J' ? 10 : -1;
             }
-            return jsType === "object";
+            if (jsType !== "number") return -1;
+            // 非整数不允许匹配整数类型（避免截断）
+            if (!Number.isInteger(jsVal)) return -1;
+            // 范围检查
+            if (t0 === 'I') {
+                if (jsVal < -2147483648 || jsVal > 2147483647) return -1;
+                return 10;  // int 是整数 JS 值的首选
+            }
+            if (t0 === 'J') return 9;  // long 总能装
+            if (t0 === 'S') {
+                if (jsVal < -32768 || jsVal > 32767) return -1;
+                return 8;
+            }
+            if (t0 === 'B') {
+                if (jsVal < -128 || jsVal > 127) return -1;
+                return 7;
+            }
         }
+        // 浮点类型 F/D
+        if (t0 === 'F' || t0 === 'D') {
+            if (jsType !== "number") return -1;
+            if (Number.isInteger(jsVal)) {
+                // 整数 JS 值也能匹配浮点，但分数低于整数类型
+                return t0 === 'D' ? 5 : 4;
+            }
+            return t0 === 'D' ? 10 : 9;
+        }
+
+        // --- 数组类型 ---
         if (t0 === '[') {
-            return Array.isArray(jsVal) || jsType === "object";
+            if (Array.isArray(jsVal)) return 8;
+            if (jsType === "object") return 4;
+            return -1;
         }
-        return false;
+
+        // --- L 类型（对象引用）---
+        if (t0 === 'L') {
+            // JS string → String / CharSequence / Serializable / Object
+            // 底层 marshal_js_to_jvalue 对任意 L 参数都能 NewStringUTF，所以放宽到 Object。
+            if (jsType === "string") {
+                if (jniType === "Ljava/lang/String;") return 10;
+                if (jniType === "Ljava/lang/CharSequence;") return 7;
+                if (jniType === "Ljava/lang/Comparable;") return 6;
+                if (jniType === "Ljava/io/Serializable;") return 6;
+                if (jniType === "Ljava/lang/Object;") return 5;
+                return -1;
+            }
+
+            // JS number → 精确装箱类型 > Number > Object
+            // autobox_primitive_to_jobject 根据 sig 精确选 Integer/Long/Float/Double/Short/Byte。
+            if (jsType === "number") {
+                if (jniType === "Ljava/lang/Integer;") return 10;
+                if (jniType === "Ljava/lang/Long;") return 9;
+                if (jniType === "Ljava/lang/Double;") return 9;
+                if (jniType === "Ljava/lang/Float;") return 8;
+                if (jniType === "Ljava/lang/Short;") return 8;
+                if (jniType === "Ljava/lang/Byte;") return 7;
+                if (jniType === "Ljava/lang/Number;") return 7;
+                if (jniType === "Ljava/lang/Comparable;") return 6;
+                if (jniType === "Ljava/io/Serializable;") return 6;
+                if (jniType === "Ljava/lang/Object;") return 5;
+                return -1;
+            }
+
+            // JS bigint → Long / Object
+            if (jsType === "bigint") {
+                if (jniType === "Ljava/lang/Long;") return 10;
+                if (jniType === "Ljava/lang/Number;") return 7;
+                if (jniType === "Ljava/lang/Object;") return 5;
+                return -1;
+            }
+
+            // JS boolean → Boolean / Object
+            if (jsType === "boolean") {
+                if (jniType === "Ljava/lang/Boolean;") return 10;
+                if (jniType === "Ljava/lang/Comparable;") return 6;
+                if (jniType === "Ljava/io/Serializable;") return 6;
+                if (jniType === "Ljava/lang/Object;") return 5;
+                return -1;
+            }
+
+            // JS object: 可能是 Java wrapper {__jptr,__jclass}，或普通 object
+            if (jsType === "object") {
+                // 如果是 Java wrapper 且 __jclass 精确匹配 L 类型的内部名
+                if (jsVal.__jptr !== undefined && typeof jsVal.__jclass === "string") {
+                    var innerName = "L" + jsVal.__jclass.replace(/\./g, "/") + ";";
+                    if (innerName === jniType) return 10;
+                    // 无法静态判断 isAssignableFrom；对 Object 给通用分
+                    if (jniType === "Ljava/lang/Object;") return 5;
+                    // 其它类: 先给中间分，运行时 marshal 会按 __jptr 传过去
+                    return 4;
+                }
+                return 3;
+            }
+
+            return -1;
+        }
+
+        return -1;
+    }
+
+    // 兼容性检查（保留旧名字供其它地方调用；内部走评分函数）
+    function _isJsValueCompatible(jsVal, jniType) {
+        return _scoreJsParam(jsVal, jniType) >= 0;
     }
 
     function _scoreOverload(methodInfo, jsArgs) {
@@ -119,10 +237,9 @@
 
         var score = 0;
         for (var i = 0; i < paramTypes.length; i++) {
-            if (!_isJsValueCompatible(jsArgs[i], paramTypes[i])) {
-                return -1;
-            }
-            score += /^[L[]/.test(paramTypes[i]) ? 1 : 2;
+            var s = _scoreJsParam(jsArgs[i], paramTypes[i]);
+            if (s < 0) return -1;
+            score += s;
         }
         return score;
     }
@@ -208,13 +325,29 @@
         return best.sig;
     }
 
-    function _makeInstanceMethodInvoker(target, name) {
-        return function() {
+    // Instance method invoker.
+    //
+    // 调用形式（优先级从高到低）:
+    //   1. lockedSig 非空（来自 .overload(...)）→ 直接用锁定签名
+    //   2. 首参是 "(...)..." → 当场 inline 签名，args.shift() 后当参数用
+    //   3. 否则走 _resolveInstanceMethodSig 自动根据参数类型匹配 overload
+    //
+    // 返回的是**普通 JS function**，因此 Function.prototype.call/apply/bind 原生可用:
+    //   svc.method.overload('java.lang.String').call(svc, 'hi')
+    //   svc.method.overload('int').apply(svc, [42])
+    // 注意: .call 的 thisArg 会被 JS 引擎赋给 `this`，但 invoker 内部闭包已经持有
+    // target (__jptr + __jclass)，不读 `this`，所以 thisArg 是形式上的（保持 Frida 语法兼容）。
+    function _makeInstanceMethodInvoker(target, name, lockedSig) {
+        var invoker = function() {
             var args = _argsFrom(arguments);
-            var sig = typeof args[0] === "string" && args[0].charAt(0) === '('
-                ? args.shift()
-                : _resolveInstanceMethodSig(target.__jclass, name, args);
-
+            var sig;
+            if (lockedSig) {
+                sig = lockedSig;
+            } else if (typeof args[0] === "string" && args[0].charAt(0) === '(') {
+                sig = args.shift();
+            } else {
+                sig = _resolveInstanceMethodSig(target.__jclass, name, args);
+            }
             return _invokeJavaMethod(
                 target.__jptr,
                 target.__jclass,
@@ -223,6 +356,14 @@
                 args
             );
         };
+
+        // Frida-兼容 .overload(...) — 返回锁定到指定签名的新 invoker（target 不变）
+        invoker.overload = function() {
+            var sig = _resolveSingleOverload(target.__jclass, name, arguments, null);
+            return _makeInstanceMethodInvoker(target, name, sig);
+        };
+
+        return invoker;
     }
 
     // ========================================================================
@@ -436,13 +577,47 @@
         return null;
     }
 
+    // 把 .overload(...) 的参数列表解析为单个 JNI 签名字符串。
+    // 两种合法输入:
+    //   (a) 单个 "(....)..." raw JNI 签名 → 直接返回
+    //   (b) Java 类型名列表 "java.lang.String", "int" → 拼成 "(Ljava/lang/String;I)" 去 _methods 里找唯一匹配
+    // 不处理数组批量语法（那是 hook 专用，保留在 MethodWrapper.prototype.overload 里）。
+    //
+    // methodsCache: 可选的 {methods?: [...]} 对象，命中则复用，否则调 _methods(cls) 并回填。
+    function _resolveSingleOverload(cls, name, overloadArgs, methodsCache) {
+        // (a) raw JNI signature
+        if (overloadArgs.length === 1
+            && typeof overloadArgs[0] === "string"
+            && overloadArgs[0].charAt(0) === '(') {
+            return overloadArgs[0];
+        }
+        // (b) Java type name list
+        var paramSig = "(";
+        for (var i = 0; i < overloadArgs.length; i++) {
+            paramSig += _jniType(overloadArgs[i]);
+        }
+        paramSig += ")";
+        var ms;
+        if (methodsCache && methodsCache.methods) {
+            ms = methodsCache.methods;
+        } else {
+            ms = _methods(cls);
+            if (methodsCache) methodsCache.methods = ms;
+        }
+        var m = name === "$init" ? "<init>" : name;
+        var sig = _findOverload(ms, m, paramSig);
+        if (!sig) {
+            throw new Error("No matching overload: " + cls + "." + name + paramSig);
+        }
+        return sig;
+    }
+
     // Frida-compatible overload: accepts Java type names as arguments
     // e.g. .overload("java.lang.String", "int") → matches JNI sig "(Ljava/lang/String;I)..."
     // Also accepts raw JNI signature: .overload("(Ljava/lang/String;)I")
     // Also accepts arrays for multiple overloads: .overload(["int","int"], ["java.lang.String"])
     MethodWrapper.prototype.overload = function() {
-        // Case 1: 数组语法，选择多个overload
-        // .overload(["int", "int"], ["java.lang.String"])
+        // Case 1: 数组语法，选择多个overload（hook 专用）
         if (arguments.length >= 1 && Array.isArray(arguments[0])) {
             var ms = _getMethods(this);
             var name = this._m === "$init" ? "<init>" : this._m;
@@ -462,24 +637,9 @@
             }
             return new MethodWrapper(this._c, this._m, sigs, this._cache);
         }
-        // Case 2: 原始JNI签名
-        if (arguments.length === 1 && typeof arguments[0] === "string"
-            && arguments[0].charAt(0) === '(') {
-            return new MethodWrapper(this._c, this._m, arguments[0], this._cache);
-        }
-        // Case 3: Java类型名（现有行为）
-        var paramSig = "(";
-        for (var i = 0; i < arguments.length; i++) {
-            paramSig += _jniType(arguments[i]);
-        }
-        paramSig += ")";
-        var ms = _getMethods(this);
-        var name = this._m === "$init" ? "<init>" : this._m;
-        var sig = _findOverload(ms, name, paramSig);
-        if (!sig) {
-            throw new Error("No matching overload: " + this._c + "." + this._m + paramSig);
-        }
-        return new MethodWrapper(this._c, this._m, sig, this._cache);
+        // Case 2/3: 单一 overload（raw JNI 签名或 Java 类型名）— 走共享 helper
+        var resolved = _resolveSingleOverload(this._c, this._m, arguments, this._cache);
+        return new MethodWrapper(this._c, this._m, resolved, this._cache);
     };
 
     Object.defineProperty(MethodWrapper.prototype, "impl", {
@@ -626,6 +786,29 @@
         return new Proxy({}, {
             get: function(_, prop) {
                 if (typeof prop !== "string") return undefined;
+                // $className: 返回类名字符串（与 instance proxy 对称）
+                // 不走字段/方法查找，避免被当作同名 Java 成员
+                if (prop === "$className") return cls;
+                // class: Frida 兼容语法糖，返回 java.lang.Class 实例包装器
+                //
+                // 使用 Java._findClassObject（内部 find_class_safe）而非 Class.forName，原因：
+                //   - forName(String) 用 caller 的 ClassLoader；agent 线程 caller 是 native，
+                //     解析出来的是 system loader，看不到 app 私有类（alipay bundle 更甚）
+                //   - find_class_safe 会优先走 rustFrida 缓存的 app ClassLoader.loadClass，
+                //     与 Java.use 的类查找路径完全一致，保证"能 Java.use 就能 .class"
+                if (prop === "class") {
+                    if (!cache._class) {
+                        try {
+                            cache._class = _wrapJavaReturn(_findClassObject(cls));
+                        } catch (e) {
+                            throw new Error(
+                                "Java.use('" + cls + "').class: _findClassObject failed: "
+                                + (e && e.message ? e.message : e)
+                            );
+                        }
+                    }
+                    return cache._class;
+                }
                 if (prop === "$new") {
                     if (!cache._new) {
                         cache._new = function() {

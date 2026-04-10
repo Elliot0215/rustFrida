@@ -85,6 +85,7 @@ pub(super) type GetStaticMethodIdFn =
     unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const c_char, *const c_char) -> *mut std::ffi::c_void;
 pub(super) type ExcCheckFn = unsafe extern "C" fn(JniEnv) -> u8;
 pub(super) type ExcClearFn = unsafe extern "C" fn(JniEnv);
+pub(super) type ExcOccurredFn = unsafe extern "C" fn(JniEnv) -> *mut std::ffi::c_void;
 pub(super) type DeleteLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void);
 pub(super) type NewLocalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
 pub(super) type NewGlobalRefFn = unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
@@ -205,6 +206,125 @@ pub(super) unsafe fn jni_check_exc(env: JniEnv) -> bool {
     } else {
         false
     }
+}
+
+/// Check for a pending JNI exception and extract its toString() + cause chain
+/// as a human-readable string. Always clears the exception on return.
+///
+/// Returns `Some(msg)` if there was an exception, `None` otherwise.
+///
+/// Format: `"<ClassName>: <message> [caused by: ...]"`
+///
+/// Safe to call during hook callbacks — only uses JNI FindClass/GetMethodID/
+/// CallObjectMethod (no WalkStack). Bounded recursion depth (3 levels) on
+/// cause chain to avoid infinite loops from self-referencing causes.
+pub(super) unsafe fn jni_take_exception(env: JniEnv) -> Option<String> {
+    let check: ExcCheckFn = jni_fn!(env, ExcCheckFn, JNI_EXCEPTION_CHECK);
+    if check(env) == 0 {
+        return None;
+    }
+
+    let occurred: ExcOccurredFn = jni_fn!(env, ExcOccurredFn, JNI_EXCEPTION_OCCURRED);
+    let throwable = occurred(env);
+
+    // 必须先 clear 才能对 throwable 调用其它 JNI 方法
+    let clear: ExcClearFn = jni_fn!(env, ExcClearFn, JNI_EXCEPTION_CLEAR);
+    clear(env);
+
+    if throwable.is_null() {
+        return Some("<null throwable>".to_string());
+    }
+
+    let msg = format_throwable_chain(env, throwable, 0);
+
+    let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+    delete(env, throwable);
+
+    Some(msg)
+}
+
+/// 递归提取 throwable 的 toString() + cause 链。depth 上限 3 层。
+unsafe fn format_throwable_chain(env: JniEnv, throwable: *mut std::ffi::c_void, depth: usize) -> String {
+    if throwable.is_null() {
+        return "<null>".to_string();
+    }
+
+    // 查找 java.lang.Throwable（缓存下来也行，但单次开销可接受）
+    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+    let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
+    let call_obj: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
+    let get_chars: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
+    let rel_chars: ReleaseStringUtfCharsFn = jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
+    let delete: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let throwable_cls_name = CString::new("java/lang/Throwable").unwrap();
+    let throwable_cls = find_class(env, throwable_cls_name.as_ptr());
+    // 必须捕获 FindClass 可能的异常
+    let check: ExcCheckFn = jni_fn!(env, ExcCheckFn, JNI_EXCEPTION_CHECK);
+    if check(env) != 0 {
+        clear_exc(env);
+    }
+    if throwable_cls.is_null() {
+        return "<Throwable class not found>".to_string();
+    }
+
+    let to_string_name = CString::new("toString").unwrap();
+    let to_string_sig = CString::new("()Ljava/lang/String;").unwrap();
+    let to_string_mid = get_mid(env, throwable_cls, to_string_name.as_ptr(), to_string_sig.as_ptr());
+    if check(env) != 0 {
+        clear_exc(env);
+    }
+
+    let get_cause_name = CString::new("getCause").unwrap();
+    let get_cause_sig = CString::new("()Ljava/lang/Throwable;").unwrap();
+    let get_cause_mid = get_mid(env, throwable_cls, get_cause_name.as_ptr(), get_cause_sig.as_ptr());
+    if check(env) != 0 {
+        clear_exc(env);
+    }
+
+    let mut result = String::new();
+
+    if !to_string_mid.is_null() {
+        let jstr = call_obj(env, throwable, to_string_mid, std::ptr::null());
+        if check(env) != 0 {
+            clear_exc(env);
+            result.push_str("<toString threw>");
+        } else if !jstr.is_null() {
+            let chars = get_chars(env, jstr, std::ptr::null_mut());
+            if !chars.is_null() {
+                result.push_str(&std::ffi::CStr::from_ptr(chars).to_string_lossy());
+                rel_chars(env, jstr, chars);
+            }
+            delete(env, jstr);
+        }
+    } else {
+        result.push_str("<toString mid not found>");
+    }
+
+    // 递归提取 cause（最多 3 层，防止循环引用）
+    const MAX_CAUSE_DEPTH: usize = 3;
+    if depth < MAX_CAUSE_DEPTH && !get_cause_mid.is_null() {
+        let cause = call_obj(env, throwable, get_cause_mid, std::ptr::null());
+        if check(env) != 0 {
+            clear_exc(env);
+        } else if !cause.is_null() {
+            let cause_msg = format_throwable_chain(env, cause, depth + 1);
+            result.push_str("\n  Caused by: ");
+            result.push_str(&cause_msg);
+            delete(env, cause);
+        }
+    } else if depth >= MAX_CAUSE_DEPTH {
+        result.push_str("\n  Caused by: <truncated>");
+    }
+
+    delete(env, throwable_cls);
+    result
+}
+
+#[inline]
+unsafe fn clear_exc(env: JniEnv) {
+    let clear: ExcClearFn = jni_fn!(env, ExcClearFn, JNI_EXCEPTION_CLEAR);
+    clear(env);
 }
 
 /// Check if a 64-bit value looks like a valid ARM64 code pointer.
@@ -538,6 +658,7 @@ pub(super) const JNI_GET_SUPERCLASS: usize = 10;
 pub(super) const JNI_TO_REFLECTED_METHOD: usize = 9;
 #[allow(dead_code)]
 pub(super) const JNI_TO_REFLECTED_FIELD: usize = 12;
+pub(super) const JNI_EXCEPTION_OCCURRED: usize = 15;
 pub(super) const JNI_EXCEPTION_CLEAR: usize = 17;
 pub(super) const JNI_PUSH_LOCAL_FRAME: usize = 19;
 pub(super) const JNI_POP_LOCAL_FRAME: usize = 20;

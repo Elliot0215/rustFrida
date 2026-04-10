@@ -257,13 +257,28 @@ pub(crate) unsafe fn ensure_function_arg(
 
 /// Throw a type error from a static byte string.
 pub(crate) unsafe fn throw_type_error(ctx: *mut ffi::JSContext, error_msg: &[u8]) -> ffi::JSValue {
+    // error_msg 是 &[u8] 常量短字符串（不超 256 字节），继续用内置路径
     ffi::JS_ThrowTypeError(ctx, error_msg.as_ptr() as *const _)
 }
 
 /// Throw an internal error from an owned Rust string.
+///
+/// 绕开 QuickJS `JS_ThrowInternalError` 内部 `char buf[256]` + vsnprintf 的双重坑:
+///   1. 256 字节硬截断 (Java 异常 + cause 链容易超过)
+///   2. 消息被当 printf 格式字符串 (含 % 会被误解析/崩溃)
+///
+/// 使用 `qjs_throw_error_with_message` 直接 `new InternalError(msg)` 走 JS 构造器路径，
+/// 消息长度无限制，`%` 原样保留。
 pub(crate) unsafe fn throw_internal_error(ctx: *mut ffi::JSContext, message: impl AsRef<str>) -> ffi::JSValue {
-    let err = CString::new(message.as_ref()).unwrap();
-    ffi::JS_ThrowInternalError(ctx, err.as_ptr())
+    let msg = message.as_ref();
+    let bytes = msg.as_bytes();
+    let class_name = b"InternalError\0";
+    ffi::qjs_throw_error_with_message(
+        ctx,
+        class_name.as_ptr() as *const std::os::raw::c_char,
+        bytes.as_ptr() as *const std::os::raw::c_char,
+        bytes.len(),
+    )
 }
 
 /// Set a u64 property on a JS object as BigUint64.

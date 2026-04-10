@@ -545,6 +545,43 @@ unsafe extern "C" fn js_java_find_class_with_loader(
     result
 }
 
+/// Java._findClassObject(name) — 返回指定类名对应的 java.lang.Class 实例（JS wrapper）。
+///
+/// 与 Java.use 不同的是: 这里返回的是**真正的** java.lang.Class 对象 Proxy，
+/// 可以作为参数传递给需要 Class<?> 的 Java 方法（等价于 Java 源码里的 Foo.class）。
+///
+/// 使用 find_class_safe 内部路径: 先尝试缓存的 app ClassLoader.loadClass，
+/// fallback 到 JNI FindClass。对 app 私有类 / bundle 动态加载类都能命中，
+/// 比 Class.forName(String) 的 caller-ClassLoader 单参版本更可靠。
+unsafe extern "C" fn js_java_find_class_object(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    if argc < 1 {
+        return throw_type_error(ctx, b"Java._findClassObject() requires 1 argument: className\0");
+    }
+    let class_name = match JSValue(*argv).to_string(ctx) {
+        Some(v) => v,
+        None => return throw_type_error(ctx, b"Java._findClassObject() className must be a string\0"),
+    };
+
+    let env = match ensure_jni_initialized() {
+        Ok(env) => env,
+        Err(msg) => return throw_internal_error(ctx, msg),
+    };
+
+    let cls = reflect::find_class_safe(env, &class_name);
+    if cls.is_null() {
+        return throw_internal_error(ctx, format!("class not found: {}", class_name));
+    }
+
+    // Wrap jclass（本身就是 java.lang.Class 实例）为 JS Proxy
+    // marshal_local_java_object_to_js 会做 NewGlobalRef + 释放 local ref
+    marshal_local_java_object_to_js(ctx, env, cls, Some("java.lang.Class"))
+}
+
 unsafe extern "C" fn js_java_set_classloader(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -673,6 +710,13 @@ pub fn register_java_api(ctx: &JSContext) {
             "_findClassWithLoader",
             js_java_find_class_with_loader,
             2,
+        );
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_findClassObject",
+            js_java_find_class_object,
+            1,
         );
         add_cfunction_to_object(ctx_ptr, java_obj, "_setClassLoader", js_java_set_classloader, 1);
 
