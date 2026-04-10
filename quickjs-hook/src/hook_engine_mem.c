@@ -681,14 +681,16 @@ void* hook_mmap_near(void* target, size_t alloc_size) {
     return hook_mmap_near_range(target, alloc_size, (int64_t)1 << 32);
 }
 
-/* 创建新 pool，限定 ±max_range 范围 */
-static ExecPool* create_pool_near_range(void* target, int64_t max_range) {
+/* 创建新 pool，限定 ±max_range 范围，pool 大小 pool_size 字节。
+ * pool_size 必须是 page_size 的整数倍。传 0 时退化为 EXEC_POOL_SIZE。 */
+static ExecPool* create_pool_near_range_sized(void* target, int64_t max_range, size_t pool_size) {
     if (g_engine.pool_count >= MAX_EXEC_POOLS) {
-        hook_log("create_pool_near_range: pool count %d reached MAX_EXEC_POOLS", g_engine.pool_count);
+        hook_log("create_pool_near_range_sized: pool count %d reached MAX_EXEC_POOLS", g_engine.pool_count);
         return NULL;
     }
+    if (pool_size == 0) pool_size = EXEC_POOL_SIZE;
 
-    void* ptr = hook_mmap_near_range(target, EXEC_POOL_SIZE, max_range);
+    void* ptr = hook_mmap_near_range(target, pool_size, max_range);
     if (ptr == MAP_FAILED) return NULL;
 
     /* 标记 VMA 名称便于 /proc/self/maps 识别 */
@@ -698,14 +700,19 @@ static ExecPool* create_pool_near_range(void* target, int64_t max_range) {
 #ifndef PR_SET_VMA_ANON_NAME
 #define PR_SET_VMA_ANON_NAME 0
 #endif
-    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, (unsigned long)ptr, EXEC_POOL_SIZE,
+    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, (unsigned long)ptr, pool_size,
           (unsigned long)"wwb_hook_pool");
 
     ExecPool* pool = &g_engine.pools[g_engine.pool_count++];
     pool->base = ptr;
-    pool->size = EXEC_POOL_SIZE;
+    pool->size = pool_size;
     pool->used = 0;
     return pool;
+}
+
+/* 创建新 pool，限定 ±max_range 范围，使用默认 EXEC_POOL_SIZE */
+static ExecPool* create_pool_near_range(void* target, int64_t max_range) {
+    return create_pool_near_range_sized(target, max_range, EXEC_POOL_SIZE);
 }
 
 /* 创建新 pool（默认 ±4GB）— 保持现有调用方兼容 */
@@ -820,8 +827,13 @@ void* hook_alloc_near(size_t size, void* target) {
 }
 
 /* 在 target ±max_range 范围内分配可执行内存。
- * 与 hook_alloc_near 不同: 不会 fallback 到 generic pool。
- * 用途: stealth2 B 指令需要 ±128MB 范围。 */
+ * 与 hook_alloc_near 不同: 不会 fallback 到远距离 generic pool。
+ * 用途: stealth2 B 指令 ±128MB / stealth1 wxshadow ADRP ±4GB。
+ *
+ * Phase 2 采用分级池大小策略：优先尝试 64KB (EXEC_POOL_SIZE) 以摊薄后续调用成本，
+ * 失败则逐级降级到 16KB、单页，只要能装下本次请求的 size 就行。
+ * 这能应对 mapping 紧凑的进程（ART JIT/boot image 堆叠时 ±128MB 内可能连一个 64KB
+ * 空隙都没有，但 4KB~16KB 的小空隙往往存在）。 */
 void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
     if (!g_engine.initialized || !target) return NULL;
     size = (size + 7) & ~7;
@@ -844,16 +856,37 @@ void* hook_alloc_near_range(size_t size, void* target, int64_t max_range) {
         }
     }
 
-    /* Phase 2: 创建 pool (maps 空隙扫描，限定 ±max_range) */
-    ExecPool* pool = create_pool_near_range(target, max_range);
-    if (pool) {
-        void* ptr = alloc_from_pool(pool, size);
-        if (ptr) return ptr;
+    /* Phase 2: 分级创建 pool — 64KB → 16KB → 单页 */
+    long page_size_l = sysconf(_SC_PAGESIZE);
+    size_t page_size = page_size_l > 0 ? (size_t)page_size_l : 4096u;
+    /* 本次请求 size 的 page 对齐下界，低于这个值的 pool size 不用尝试 */
+    size_t min_pool = (size + page_size - 1) & ~(page_size - 1);
+
+    const size_t pool_sizes[] = {
+        EXEC_POOL_SIZE,        /* 64KB: 首选，可摊薄后续小请求 */
+        16u * 1024u,           /* 16KB: 空隙较小时退路 */
+        page_size,             /* 单页: 最后兜底 */
+    };
+    for (size_t i = 0; i < sizeof(pool_sizes) / sizeof(pool_sizes[0]); i++) {
+        size_t ps = pool_sizes[i];
+        if (ps < min_pool) continue;
+        /* 避免重复尝试相同 size（例如 page_size==16KB 时前两档退化同值） */
+        int duplicate = 0;
+        for (size_t j = 0; j < i; j++) {
+            if (pool_sizes[j] == ps) { duplicate = 1; break; }
+        }
+        if (duplicate) continue;
+
+        ExecPool* pool = create_pool_near_range_sized(target, max_range, ps);
+        if (pool) {
+            void* ptr = alloc_from_pool(pool, size);
+            if (ptr) return ptr;
+        }
     }
 
-    /* 不 fallback — 调用方需要保证距离 */
-    hook_log("hook_alloc_near_range: FAILED for target %p within ±%lld",
-             target, (long long)max_range);
+    /* 不 fallback 到远距离 — 调用方需要保证距离 */
+    hook_log("hook_alloc_near_range: FAILED for target %p within ±%lld (request size=%zu, min_pool=%zu)",
+             target, (long long)max_range, size, min_pool);
     return NULL;
 }
 
