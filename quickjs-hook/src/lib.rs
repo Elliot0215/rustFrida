@@ -114,13 +114,18 @@ unsafe extern "C" fn hook_engine_log_impl(msg: *const std::os::raw::c_char) {
         return;
     }
     let s = std::ffi::CStr::from_ptr(msg).to_string_lossy();
-    // Java hook 相关前缀 ([art_router]/[dump_code]) 默认静音，仅 verbose 模式输出
-    let is_java_hook_log = s.starts_with("[art_router]") || s.starts_with("[dump_code]");
     let formatted = format!("[hook_engine] {}", s);
-    if is_java_hook_log {
-        crate::jsapi::console::output_verbose(&formatted);
-    } else {
+    // 错误/警告永远输出（失败类消息对排错重要），其余全部 verbose 静默
+    // 识别关键字: FAILED/failed/失败/ERROR/\033[31m (ANSI 红色)
+    let is_error = s.contains("FAILED")
+        || s.contains("failed")
+        || s.contains("失败")
+        || s.contains("ERROR")
+        || s.contains("\x1b[31m");
+    if is_error {
         crate::jsapi::console::output_message(&formatted);
+    } else {
+        crate::jsapi::console::output_verbose(&formatted);
     }
 }
 
