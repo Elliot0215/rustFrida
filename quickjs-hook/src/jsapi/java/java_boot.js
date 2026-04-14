@@ -14,6 +14,8 @@
     var _findClassWithLoader = Java._findClassWithLoader;
     var _findClassObject = Java._findClassObject;
     var _setClassLoader = Java._setClassLoader;
+    var _enumerateInstances = Java._enumerateInstances;
+    var _releaseInstanceRefs = Java._releaseInstanceRefs;
     delete Java.hook;
     delete Java.unhook;
     delete Java._methods;
@@ -26,6 +28,8 @@
     delete Java._findClassWithLoader;
     delete Java._findClassObject;
     delete Java._setClassLoader;
+    delete Java._enumerateInstances;
+    delete Java._releaseInstanceRefs;
 
     function _argsFrom(argsLike, start) {
         var args = [];
@@ -463,8 +467,8 @@
     //     1) 显式签名: obj.method("(Ljava/lang/String;)V", "arg")
     //     2) 自动匹配: obj.method("arg")
     // - 快捷调用:   obj.$call("methodName", "(sig)", ...args)
-    function _wrapJavaObj(ptr, cls) {
-        var target = {__jptr: ptr, __jclass: cls};
+    // 内部：用已存在的 target 创建 Proxy（共享 mutable target 用于"释放"语义）
+    function _wrapJavaObjOnTarget(target) {
         var fieldWrappers = {};  // per-instance FieldWrapper 缓存
 
         var handler = {
@@ -532,6 +536,11 @@
             }
         };
         return new Proxy(target, handler);
+    }
+
+    // 公共：从 ptr+cls 直接创建 wrapper（多数路径用这个）
+    function _wrapJavaObj(ptr, cls) {
+        return _wrapJavaObjOnTarget({__jptr: ptr, __jclass: cls});
     }
 
     function MethodWrapper(cls, method, sig, cache) {
@@ -956,5 +965,81 @@
 
     Java.setClassLoader = function(loader) {
         return _setClassLoader(_normalizeLoaderArg(loader));
+    };
+
+    // ========================================================================
+    // Java.choose(className, {onMatch, onComplete}) — Frida 兼容
+    //
+    // 枚举 ART heap 上指定类（默认精确匹配，subtypes:true 含子类）的所有存活实例，
+    // 每个实例自动包装为 Proxy（可直接 .method()/.field.value）。
+    //
+    // callbacks:
+    //   onMatch(instance): 对每个 instance 触发；返回 "stop" 提前结束。
+    //   onComplete(): 枚举结束（或被 stop）后触发，可选。
+    //   subtypes: bool — 是否包含子类（rustFrida 扩展，Frida 无此参数）
+    //   maxCount: int — 最多枚举多少实例。默认 16384，防止 String 这类高频类
+    //                  瞬间填满 JNI global ref table。0 表示不限。
+    //
+    // **生命周期**：传给 onMatch 的 wrapper 仅在 onMatch 执行期间有效。函数返回
+    // 后我们会立即 DeleteGlobalRef，wrapper.__jptr 被置 0。如果你想把实例存到
+    // 全局变量，**必须**在 onMatch 内自己 NewGlobalRef（或调 obj.toString() 提前
+    // 拷贝你需要的字段值）。这与 Frida 行为一致。
+    // ========================================================================
+    var DEFAULT_MAX_COUNT = 16384;
+    Java.choose = function(className, callbacks, includeSubtypes) {
+        if (typeof className !== "string" || className.length === 0) {
+            throw new Error("Java.choose(className, callbacks) requires a non-empty string className");
+        }
+        if (!callbacks || typeof callbacks !== "object") {
+            throw new Error("Java.choose(className, callbacks) requires a callbacks object");
+        }
+        var onMatch = callbacks.onMatch;
+        var onComplete = callbacks.onComplete;
+        if (typeof onMatch !== "function") {
+            throw new Error("Java.choose: callbacks.onMatch must be a function");
+        }
+
+        // 接受第三参（位置）或 callbacks.subtypes
+        var sub = includeSubtypes === true || callbacks.subtypes === true;
+        var maxCount = (typeof callbacks.maxCount === "number" && callbacks.maxCount >= 0)
+            ? callbacks.maxCount
+            : DEFAULT_MAX_COUNT;
+
+        var raw = _enumerateInstances(className, !!sub, maxCount);
+        // 我们给每个 wrapped 用单独 target 对象，并保留引用 —— release 时把 __jptr
+        // 置 0 让 wrapper 即使被 onMatch 保存到外部也立即变成"空指针"，访问其方法
+        // 会拿到 jptr=0，而不是 dangling 的 stale handle。
+        var liveTargets = [];
+        try {
+            for (var i = 0; i < raw.length; i++) {
+                var entry = raw[i];
+                if (!entry || entry.__jptr === undefined || entry.__jptr === 0n
+                        || entry.__jptr === 0) continue;
+                var target = {__jptr: entry.__jptr, __jclass: entry.__jclass || className};
+                liveTargets.push(target);
+                var wrapped = _wrapJavaObjOnTarget(target);
+                var ret;
+                try {
+                    ret = onMatch(wrapped);
+                } catch (e) {
+                    console.log("[Java.choose] onMatch(" + i + ") error: " + e);
+                    continue;
+                }
+                if (ret === "stop") break;
+            }
+        } finally {
+            // 1) 释放 native global refs
+            try { _releaseInstanceRefs(raw); }
+            catch (e) { console.log("[Java.choose] release error: " + e); }
+            // 2) 把所有用户可能保存的 wrapper 的 __jptr 都置 0，断绝 dangling 访问
+            for (var k = 0; k < liveTargets.length; k++) {
+                liveTargets[k].__jptr = 0;
+            }
+        }
+
+        if (typeof onComplete === "function") {
+            try { onComplete(); }
+            catch (e) { console.log("[Java.choose] onComplete error: " + e); }
+        }
     };
 })();

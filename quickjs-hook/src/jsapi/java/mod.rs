@@ -34,6 +34,8 @@ mod art_controller;
 mod art_method;
 mod art_thread;
 mod callback;
+mod heap_scan;
+mod java_choose_api;
 mod java_field_api;
 mod java_hook_api;
 mod java_inspect_api;
@@ -57,6 +59,7 @@ use crate::jsapi::hook_api::StealthMode;
 use art_controller::{set_stealth_mode, stealth_mode};
 use art_method::{resolve_art_method, try_invalidate_jit_cache};
 use callback::*;
+use java_choose_api::*;
 use java_field_api::*;
 use java_hook_api::*;
 use java_inspect_api::*;
@@ -719,6 +722,22 @@ pub fn register_java_api(ctx: &JSContext) {
             1,
         );
         add_cfunction_to_object(ctx_ptr, java_obj, "_setClassLoader", js_java_set_classloader, 1);
+        // Java.choose() backend: 走 VMDebug.getInstancesOfClasses 枚举堆上实例
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_enumerateInstances",
+            js_java_enumerate_instances,
+            3,
+        );
+        // Java.choose() 配套：批量释放 wrapper 持有的 JNI global refs
+        add_cfunction_to_object(
+            ctx_ptr,
+            java_obj,
+            "_releaseInstanceRefs",
+            js_java_release_instance_refs,
+            1,
+        );
 
         // Set Java object on global
         global.set_property(ctx.as_ptr(), "Java", JSValue(java_obj));
