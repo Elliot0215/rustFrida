@@ -40,7 +40,7 @@ struct Elf64Sym {
     st_name: u32,
     st_info: u8,
     _st_other: u8,
-    _st_shndx: u16,
+    st_shndx: u16,
     st_value: u64,
     _st_size: u64,
 }
@@ -50,6 +50,32 @@ impl Elf64Sym {
     #[inline]
     fn st_type(&self) -> u8 {
         self.st_info & 0xf
+    }
+
+    /// ELF64_ST_BIND(st_info): high nibble is binding class (LOCAL/GLOBAL/WEAK).
+    #[inline]
+    fn st_bind(&self) -> u8 {
+        self.st_info >> 4
+    }
+}
+
+/// ELF64 RELA relocation entry (aarch64 always uses RELA).
+#[repr(C)]
+struct Elf64Rela {
+    r_offset: u64,
+    r_info: u64,
+    _r_addend: i64,
+}
+
+impl Elf64Rela {
+    #[inline]
+    fn r_sym(&self) -> u32 {
+        (self.r_info >> 32) as u32
+    }
+
+    #[inline]
+    fn r_type(&self) -> u32 {
+        (self.r_info & 0xffff_ffff) as u32
     }
 }
 
@@ -71,11 +97,28 @@ struct Elf64Shdr {
 const PT_LOAD: u32 = 1;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
+const SHT_RELA: u32 = 4;
 const SHT_DYNSYM: u32 = 11;
+
+/// Special section index: undefined (imported) symbol.
+const SHN_UNDEF: u16 = 0;
+
+/// Symbol bindings (upper nibble of st_info).
+const STB_GLOBAL: u8 = 1;
+const STB_WEAK: u8 = 2;
+
+/// Symbol types (lower nibble of st_info).
+const STT_OBJECT: u8 = 1;
+const STT_FUNC: u8 = 2;
 /// GNU extension: symbol is an indirect function resolver (IFUNC).
 /// The `st_value` is a resolver function to be called at runtime to get
 /// the actual implementation address.
 const STT_GNU_IFUNC: u8 = 10;
+
+/// AArch64 dynamic relocation types (relevant subset).
+const R_AARCH64_ABS64: u32 = 257;
+const R_AARCH64_GLOB_DAT: u32 = 1025;
+const R_AARCH64_JUMP_SLOT: u32 = 1026;
 
 // ============================================================================
 // Unrestricted linker API — Frida-style namespace bypass

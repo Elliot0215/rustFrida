@@ -70,51 +70,52 @@ unsafe fn elf_module_find_symbols(
     result
 }
 
+/// Bionic's ARM64 IFUNC resolver argument block.
+/// Reference: `linker/linker_relocate.cpp`.
+#[repr(C)]
+struct IfuncArg {
+    size: u64,
+    hwcap: u64,
+    hwcap2: u64,
+}
+
+const IFUNC_ARG_HWCAP: u64 = 1 << 62;
+
+/// Lazily-initialized (hwcap_arg, ifunc_arg) tuple reused by every IFUNC call.
+fn ifunc_resolver_context() -> (u64, &'static IfuncArg) {
+    static CTX: std::sync::OnceLock<(u64, IfuncArg)> = std::sync::OnceLock::new();
+    let cached = CTX.get_or_init(|| unsafe {
+        let arg = IfuncArg {
+            size: std::mem::size_of::<IfuncArg>() as u64,
+            hwcap: libc::getauxval(libc::AT_HWCAP),
+            hwcap2: libc::getauxval(libc::AT_HWCAP2),
+        };
+        let hwcap_arg = arg.hwcap | IFUNC_ARG_HWCAP;
+        (hwcap_arg, arg)
+    });
+    (cached.0, &cached.1)
+}
+
+/// Call an IFUNC resolver with the bionic (hwcap, &arg) ABI; returns the resolved
+/// runtime address, or 0 if the resolver returns null.
+unsafe fn resolve_ifunc_address(resolver_addr: u64) -> u64 {
+    if resolver_addr == 0 {
+        return 0;
+    }
+    type IfuncResolver = unsafe extern "C" fn(u64, *const IfuncArg) -> u64;
+    let resolver: IfuncResolver = std::mem::transmute(resolver_addr);
+    let (hwcap_arg, arg) = ifunc_resolver_context();
+    resolver(hwcap_arg, arg)
+}
+
 /// Call IFUNC resolvers to replace resolver addresses with real implementation
-/// addresses.
-///
-/// Bionic's ARM64 IFUNC ABI (linker/linker_relocate.cpp):
-///   ```c
-///   typedef ElfW(Addr) (*resolver_t)(uint64_t, __ifunc_arg_t*);
-///   static __ifunc_arg_t arg = {
-///       ._size   = sizeof(__ifunc_arg_t),
-///       ._hwcap  = getauxval(AT_HWCAP),
-///       ._hwcap2 = getauxval(AT_HWCAP2),
-///   };
-///   resolver(arg._hwcap | _IFUNC_ARG_HWCAP, &arg);
-///   ```
-/// where `_IFUNC_ARG_HWCAP == 1ULL << 62`.
+/// addresses for symbols captured by the batch lookup above.
 unsafe fn resolve_ifunc_entries(ifunc_names: &HashSet<String>, result: &mut HashMap<String, u64>) {
-    if ifunc_names.is_empty() {
-        return;
-    }
-
-    #[repr(C)]
-    struct IfuncArg {
-        size: u64,
-        hwcap: u64,
-        hwcap2: u64,
-    }
-
-    const IFUNC_ARG_HWCAP: u64 = 1 << 62;
-
-    let arg = IfuncArg {
-        size: std::mem::size_of::<IfuncArg>() as u64,
-        hwcap: libc::getauxval(libc::AT_HWCAP),
-        hwcap2: libc::getauxval(libc::AT_HWCAP2),
-    };
-    let hwcap_arg = arg.hwcap | IFUNC_ARG_HWCAP;
-
     for name in ifunc_names {
         let Some(resolver_addr) = result.get(name).copied() else {
             continue;
         };
-        if resolver_addr == 0 {
-            continue;
-        }
-        type IfuncResolver = unsafe extern "C" fn(u64, *const IfuncArg) -> u64;
-        let resolver: IfuncResolver = std::mem::transmute(resolver_addr);
-        let resolved = resolver(hwcap_arg, &arg);
+        let resolved = resolve_ifunc_address(resolver_addr);
         if resolved != 0 {
             result.insert(name.clone(), resolved);
         }
