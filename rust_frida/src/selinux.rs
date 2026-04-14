@@ -852,7 +852,9 @@ fn write_policy_file(path: &str, data: &[u8]) -> Result<(), String> {
 
 // ─── 公共 API ───
 
-pub fn patch_selinux_for_spawn() -> Result<(), String> {
+/// 修补 SELinux 策略，允许目标进程访问 memfd/socket/ptrace 等注入所需资源。
+/// 所有注入模式（spawn/server/--pid/--name）均调用。
+pub fn patch_selinux() -> Result<(), String> {
     if SELINUX_PATCHED.load(Ordering::Relaxed) {
         log_verbose!("SELinux 策略已修补，跳过");
         return Ok(());

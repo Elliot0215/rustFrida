@@ -285,6 +285,37 @@ unhook(Module.findExportByName("libc.so", "open"));
 var pid = callNative(Module.findExportByName("libc.so", "getpid"));
 ```
 
+### NativeFunction（任意签名调用）
+
+Frida 兼容 API，任意参数数量（寄存器用完自动栈溢出，上限 256 个栈参数）。
+
+```js
+var open = new NativeFunction(
+    Module.findExportByName("libc.so", "open"),
+    "int",                            // 返回类型
+    ["pointer", "int"]                // 参数类型
+);
+var fd = open(Memory.allocUtf8String("/tmp/foo"), 0);
+
+var atan2 = new NativeFunction(
+    Module.findExportByName("libm.so", "atan2"),
+    "double",
+    ["double", "double"]
+);
+atan2(1.0, 2.0);
+```
+
+**支持的类型**：`void`, `bool`, `char`/`uchar`, `int8`/`uint8`, `short`/`ushort`, `int16`/`uint16`, `int`/`uint`, `int32`/`uint32`, `long`/`ulong` (64-bit), `int64`/`uint64`, `size_t`/`ssize_t`, `pointer`, `float`, `double`。
+
+AAPCS64 调用约定：整数/指针先填 x0-x7，浮点先填 d0-d7（两队列独立），超出部分自动压栈。不支持 struct-by-value。
+
+### Memory 堆分配
+
+```js
+var buf = Memory.alloc(128);                 // 分配 128 字节 RWX 内存 → NativePointer
+var str = Memory.allocUtf8String("hello");   // 分配并写入 UTF-8 字符串 → NativePointer
+```
+
 ### Stealth 模式
 
 ```js
@@ -302,6 +333,9 @@ hook(target, callback, true)            // true = WXSHADOW
 | `hook(target, callback, stealth?)` | `AddressLike, Function, number?` | `boolean` |
 | `unhook(target)` | `AddressLike` | `boolean` |
 | `callNative(func, ...args)` | `AddressLike, ...AddressLike` (最多6个) | `number \| bigint` |
+| `new NativeFunction(addr, retType, argTypes)` | `AddressLike, string, string[]` | `Function` (可调用，任意签名) |
+| `Memory.alloc(size)` | `number` | `NativePointer` (RWX 堆内存) |
+| `Memory.allocUtf8String(s)` | `string` | `NativePointer` |
 | `diagAllocNear(addr)` | `AddressLike` | `undefined` |
 
 ---
@@ -518,7 +552,7 @@ hook(Jni.addr("RegisterNatives"), function(ctx) {
 
 | API | 参数 | 返回 |
 | --- | --- | --- |
-| `Module.findExportByName(module, symbol)` | `string, string` | `NativePointer \| null` |
+| `Module.findExportByName(module, symbol)` | `string, string` | `NativePointer \| null`（ELF 直查 + IFUNC 解析）|
 | `Module.findBaseAddress(module)` | `string` | `NativePointer \| null` |
 | `Module.findByAddress(addr)` | `AddressLike` | `ModuleInfo \| null` |
 | `Module.enumerateModules()` | — | `ModuleInfo[]` |

@@ -186,6 +186,10 @@ fn main() {
         }
     } else if let Some(pid) = resolved_pid {
         // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
+        // 注入前 patch SELinux policy，确保目标进程能读写 memfd
+        if let Err(e) = crate::selinux::patch_selinux() {
+            log_warn!("SELinux patch 失败（非致命）: {}", e);
+        }
         match inject_via_bootstrapper(pid, &string_overrides) {
             Ok(fd) => (Some(pid), fd),
             Err(e) => {

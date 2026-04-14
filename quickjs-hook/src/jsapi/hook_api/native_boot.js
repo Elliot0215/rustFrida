@@ -35,12 +35,11 @@
 //     a=x0, c=x1, b=d0
 //   - Return: int/pointer in x0, float/double in d0
 //
-// Limits (current implementation):
-//   - Max 8 integer args (no stack spill)
-//   - Max 8 float args  (no stack spill)
+// Limits:
+//   - Integer/pointer args: x0-x7, overflow spills to stack
+//   - Float/double args:   d0-d7, overflow spills to stack
+//   - Max 256 stack-spilled args (2KB stack region)
 //   - Struct-by-value not supported
-//
-// These limits cover ~99% of real-world libc / Android system calls.
 
 (function() {
     "use strict";

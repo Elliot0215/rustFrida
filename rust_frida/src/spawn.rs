@@ -334,7 +334,7 @@ pub(crate) fn ensure_zymbiote_loaded() -> Result<(), String> {
 
     if !already_initialized {
         // 修补 SELinux 策略，允许子进程连接 abstract socket
-        if let Err(e) = crate::selinux::patch_selinux_for_spawn() {
+        if let Err(e) = crate::selinux::patch_selinux() {
             log_warn!("SELinux 策略修补失败: {}（继续尝试注入）", e);
         }
 
