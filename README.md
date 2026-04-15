@@ -607,21 +607,38 @@ Memory.flushCodeCache(code, 16);
 - 写入可执行代码后**必须**调 `Memory.flushCodeCache` 刷 ARM64 I-cache（DC CVAU + IC IVAU + ISB），否则 CPU 可能执行到 stale 指令
 - `writeXxx` 自动 mprotect 目标页为 RW，写完还原；只读段也能写
 
-**writeBytes / writest — 隐身指令写入**
+**writeBytes / writest — 两种写入语义**
 
-| API | read 可见? | 长度限制 | 地址要求 |
-| --- | --- | --- | --- |
-| `p.writeBytes(bytes, 0)` 或省略 | 可见 | 任意 | 任意 |
-| `p.writeBytes(bytes, 1)` | 不可见 | 单页内（<4KB） | r-x 页 |
-| `p.writest(bytes)` | 不可见 | 任意（4B 倍数指令流） | 4B 对齐，同地址不可重装 |
+| API | 语义 | read 可见? | 长度 | 地址 |
+| --- | --- | --- | --- | --- |
+| `p.writeBytes(bytes, 0)` 或省略 | **直接覆盖** N 字节 | 可见 | 任意字节数 | 任意 |
+| `p.writeBytes(bytes, 1)` | **直接覆盖** N 字节（wxshadow 隐身） | 不可见 | <4KB（单页内） | r-x 页 |
+| `p.writest(bytes)` | **1 条指令 → N 条指令替换** | 不可见 | 任意（4B 倍数指令流） | 4B 对齐，同地址不可重装 |
+
+**关键区别**：
+
+- `writeBytes`：**逐字节原地覆盖**，用户的 `bytes` 原样落到 `[addr, addr+N)`。语义 = 内存 memcpy。
+- `writest`：**替换 `addr` 位置的 1 条原指令为 N 条用户指令**；原第 2 条及以后不变；执行完用户指令后自动 fall-through 到原第 2 条继续。语义 = "patch this one instruction with my block"。
+
+示例 `writest(addr, [X; Y; Z])` 执行流：
+
+```
+原：  addr:   A (第 1 条, 被替换)
+      addr+4: B (第 2 条)
+      addr+8: C
+      ...
+
+patch 后执行：  X → Y → Z → B → C → ...
+              （原 A 丢失，N 条 user 指令接管；B 之后保留）
+```
 
 ```js
 var addr = Module.findExportByName("libc.so", "getpid");
 
-// 隐身写: getpid() 返回 42, 但 readByteArray 仍看到原字节
+// writeBytes(1): 逐字节覆盖 + wxshadow 隐身. getpid() → 42, 但 readByteArray 仍看到原字节
 addr.writeBytes(new Uint8Array([0x40,0x05,0x80,0xd2, 0xc0,0x03,0x5f,0xd6]), 1);
 
-// 多指令替换 (PC-relative 指令会被自动修正)
+// writest: 1 → N 替换 (PC-relative 自动修正). 原第一条被这 3 条替代
 addr.writest(new Uint8Array([
     0x80,0x46,0x82,0x52,  // MOVZ W0, #0x1234
     0xa0,0x79,0xb5,0x72,  // MOVK W0, #0xABCD, LSL #16
@@ -630,10 +647,17 @@ addr.writest(new Uint8Array([
 // getpid() → 0xABCD1234
 ```
 
-- `writest` 的 patch 若不以 RET/B 结尾，执行完会自动 fall-through 到 `addr + 4`（跳过原第一条指令）
-- patch 中 `ADR / ADRP / BL / LDR literal / CBZ / TBZ / B.cond` 等 PC-relative 指令会被自动重写
-- patch 内部的跨指令分支（`B .+offset` 等）在 patch ≤ 64 条指令（256B）时正确工作；超过会被当作跳出 patch
-- `writest` 同一地址已装过后再调会抛错；如需换 patch，先 `unhook(addr)`
+**writest 特性**：
+- patch 不以 RET/B 结尾时，末尾**自动追加** fall-through 到原第 2 条指令
+- patch 内的 `ADR / ADRP / BL / LDR literal / CBZ / TBZ / B.cond` 等 PC-relative 指令会被自动 relocate 到 slot 位置
+- patch 内部跨指令分支（`B .+offset` 等）在 ≤ 64 条指令（256B）内正确工作
+- 同地址已装过 patch 再调 `writest` 会抛错（保持一次性语义），需先 `unhook(addr)` 清除
+- `unhook(addr)` 会还原 writest 留下的 patch（和 hook 共用同一个入口）
+
+**什么时候用哪个**：
+- 想原地修改任意字节、结构体字段、字符串、数据表 → `writeBytes`
+- 想把一条指令替换为自己写的指令块（包括 PC-relative 控制流）→ `writest`
+- 想保留原指令 + 插入 callback 逻辑 → `hook(addr, fn, 2)` + `ctx.callOriginal()`
 
 ## Module
 
