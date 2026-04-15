@@ -602,87 +602,42 @@ Memory.flushCodeCache(code, 16);
 | `Memory.flushCodeCache(addr, size)` | `AddressLike, number` | `undefined` |
 
 **约束**：
-- 无效地址抛 `RangeError`，不会崩进程；`readCString` 超过 4096B 也抛
-- `Memory.alloc` 是 RWX 堆内存，JS 上下文销毁时自动释放；勿 `munmap`
-- 写入可执行代码后**必须**调 `Memory.flushCodeCache` 刷 ARM64 I-cache（DC CVAU + IC IVAU + ISB），否则 CPU 可能执行到 stale 指令
-- **`writeXxx` 不再自动 mprotect**：只读段写入会抛 "target page is not writable"；需先调 `Memory.protect(addr, size, "rwx")` 显式开写权限，避免跨页 mprotect / 权限恢复失败等隐性问题
+- 无效地址抛 `RangeError`；`readCString` 超过 4096B 抛
+- `Memory.alloc` 是 RWX 堆内存，GC 时自动释放；勿 `munmap`
+- 写入代码后必须 `Memory.flushCodeCache` 刷 I-cache
+- `writeXxx` 不会自动 mprotect；只读段写入抛错，需先 `Memory.protect`
 
-**Memory.protect**
+### Memory.protect / writeBytes / writest
 
-| API | 参数 | 返回 |
-| --- | --- | --- |
-| `Memory.protect(addr, size, prot)` | `AddressLike, number, "rwx" 风格` | `true`（失败抛 RangeError + errno） |
+| API | 适用段 | read 可见 | 用途 |
+| --- | --- | --- | --- |
+| `Memory.protect(addr, size, "rwx")` | 任意 | — | 改页权限（页级 mprotect） |
+| `p.writeBytes(bytes, 0)` 默认 | 可写段 | 可见 | 覆盖 N 字节（数据/结构体） |
+| `p.writeBytes(bytes, 1)` | r-x | 不可见 | wxshadow 覆盖 N 字节（短 patch，单页内） |
+| `p.writest(bytes)` | r-x | 不可见 | 1 条指令 → N 条指令替换（PC-rel 自动 relocate） |
 
-```js
-// 给只读段开写权限然后 patch, 改完可恢复
-Memory.protect(addr, 8, "rwx");
-addr.writeU64(0xdeadbeefn);
-Memory.protect(addr, 8, "r-x");
-```
-
-`protection` 三字符 `r`/`w`/`x`/`-`，例 `"rwx"` `"r-x"` `"rw-"` `"---"`。addr 自动 round-down 到页首、size 自动 round-up 到页尾。**只在 `Memory` 命名空间，不挂 `NativePointer.prototype`** — protect 是页级语义，挂指针上容易误导。
-
-**writeBytes / writest — 三种写入场景**
-
-| API | 语义 | 用途 | read 可见? | 长度 | 适用段 |
-| --- | --- | --- | --- | --- | --- |
-| `p.writeBytes(bytes, 0)` 或省略 | **直接覆盖** N 字节 | 改数据/结构体/字符串 | 可见 | 任意 | **任意段**（自动 mprotect） |
-| `p.writeBytes(bytes, 1)` | **直接覆盖** N 字节 + wxshadow 隐身 | **patch 代码指令**（短） | 不可见 | <4KB | **仅 r-x 段** |
-| `p.writest(bytes)` | **1 条指令 → N 条指令替换** + recomp 隐身 | **patch 代码指令**（任意长 + PC-rel 安全） | 不可见 | 任意（4B 倍数指令流） | **仅 r-x 段** |
-
-**两种"隐身"机制**都是专门给**代码指令 patch** 用的：
-
-- `writeBytes(bytes, 1)`：走内核 `wxshadow PATCH`——为目标页创建一个 shadow 页，shadow 只对 CPU 取指可见，数据读仍返回原页字节。**只支持 r-x 代码页**，rw- 数据段会被 kernel 拒（`rc=-8`）。
-- `writest`：基于 recomp 副本页——整页 1:1 复制一份，通过 prctl 注册把 CPU 取指透明重定向到副本页，原页完全不动。**只对 r-x 代码段有效**（数据段没有指令流，不会被 recomp；强行 writest 会报 "页未重编译" 等错误）。
-
-**如果想改数据段字节**（结构体、flag、字符串），**只有 `writeBytes(bytes, 0)`**（普通 mprotect 路径）—— 其他两个只能 patch 代码。
-
-**关键区别**：
-
-- `writeBytes`：**逐字节原地覆盖**，用户的 `bytes` 原样落到 `[addr, addr+N)`。语义 = 内存 memcpy。
-- `writest`：**替换 `addr` 位置的 1 条原指令为 N 条用户指令**；原第 2 条及以后不变；执行完用户指令后自动 fall-through 到原第 2 条继续。语义 = "patch this one instruction with my block"。
-
-示例 `writest(addr, [X; Y; Z])` 执行流：
-
-```
-原：  addr:   A (第 1 条, 被替换)
-      addr+4: B (第 2 条)
-      addr+8: C
-      ...
-
-patch 后执行：  X → Y → Z → B → C → ...
-              （原 A 丢失，N 条 user 指令接管；B 之后保留）
-```
+`unhook(addr)` 统一清理 hook / writest / writeBytes(1) 留下的 patch。
 
 ```js
 var addr = Module.findExportByName("libc.so", "getpid");
 
-// writeBytes(1): 逐字节覆盖 + wxshadow 隐身. getpid() → 42, 但 readByteArray 仍看到原字节
+// 隐身短 patch: getpid() → 42, readByteArray 仍看原字节
 addr.writeBytes(new Uint8Array([0x40,0x05,0x80,0xd2, 0xc0,0x03,0x5f,0xd6]), 1);
 
-// writest: 1 → N 替换 (PC-relative 自动修正). 原第一条被这 3 条替代
+// 指令级替换: 原第一条指令被这 3 条顶替, 原第二条及以后保留
 addr.writest(new Uint8Array([
     0x80,0x46,0x82,0x52,  // MOVZ W0, #0x1234
     0xa0,0x79,0xb5,0x72,  // MOVK W0, #0xABCD, LSL #16
     0xc0,0x03,0x5f,0xd6,  // RET
 ]));
-// getpid() → 0xABCD1234
+
+// 写数据段: 先开写权限
+Memory.protect(dataAddr, 8, "rwx");
+dataAddr.writeU64(0xdeadbeefn);
+Memory.protect(dataAddr, 8, "r--");
 ```
 
-**writest 特性**：
-- patch 不以 RET/B 结尾时，末尾**自动追加** fall-through 到原第 2 条指令
-- patch 内的 `ADR / ADRP / BL / LDR literal / CBZ / TBZ / B.cond` 等 PC-relative 指令会被自动 relocate 到 slot 位置
-- patch 内部跨指令分支（`B .+offset` 等）在 ≤ 64 条指令（256B）内正确工作
-- 同地址已装过 patch 再调 `writest` 会抛错（保持一次性语义），需先 `unhook(addr)` 清除
-- `unhook(addr)` 会还原 writest 留下的 patch（和 hook 共用同一个入口）
-
-**什么时候用哪个**：
-- 想原地修改任意字节、结构体字段、字符串、数据表 → `writeBytes(bytes, 0)`（唯一能写数据段的）
-- 想**短指令 patch 且不暴露**（V-OS 反检测、代码完整性校验绕过）→ `writeBytes(bytes, 1)`（wxshadow，单页内）
-- 想**任意长度指令 patch**（含 PC-relative / 内部分支） → `writest(bytes)`（recomp）
-- 想**保留原指令 + 插入 callback 逻辑** → `hook(addr, fn, 2)` + `ctx.callOriginal()`
-
-`writeBytes(bytes, 1)` 和 `writest(bytes)` **都只能写 r-x 代码段**—— 两者是同一用途（隐身 patch 指令）的两种粒度：短直覆盖 vs 指令级替换 + PC-rel 自动修正。数据段 patch 只能用 `writeBytes(bytes, 0)`。
+**writest 细节**：patch 不带 RET/B 时末尾自动 fall-through 到 `addr+4`；`ADR/ADRP/BL/LDR literal/CBZ/TBZ/B.cond` 自动 relocate；patch 内部分支 ≤64 条指令有效；同地址重装需先 `unhook`。
 
 ## Module
 
