@@ -5,6 +5,40 @@ use super::writest::extract_bytes;
 use crate::ffi;
 use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+/// 追踪 writeBytes(bytes, 1) 装过的 wxshadow patch 地址, 供 cleanup 批量
+/// wxshadow_release. 这些 patch 不走 hook_engine, 不在 g_engine.hooks 链表上,
+/// hook_engine_cleanup 看不到它们.
+static WXSHADOW_PATCH_ADDRS: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+fn track_wxshadow_addr(addr: u64) {
+    let mut guard = WXSHADOW_PATCH_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(HashSet::new).insert(addr);
+}
+
+pub(crate) fn untrack_wxshadow_addr(addr: u64) {
+    let mut guard = WXSHADOW_PATCH_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(set) = guard.as_mut() {
+        set.remove(&addr);
+    }
+}
+
+/// 清理所有 writeBytes(bytes, 1) 装过的 wxshadow patch. cleanup 时在
+/// hook_engine_cleanup 之后调用, 释放内核 shadow 页, 防止 --pid 场景下
+/// agent dlclose 后 patch 残留.
+pub fn cleanup_wxshadow_patches() {
+    let addrs = {
+        let mut guard = WXSHADOW_PATCH_ADDRS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.take().unwrap_or_default()
+    };
+    for addr in addrs {
+        unsafe {
+            ffi::hook::wxshadow_release(addr as *mut std::ffi::c_void);
+        }
+    }
+}
 
 /// 生成 Memory.writeXXX(ptr, value) 和 ptr.writeXXX(value) 双风格 write 函数。
 /// rem_argv 指向 value（自动剥离 Memory 风格的 addr 参数）。
@@ -148,6 +182,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
                 );
             }
             ffi::hook::hook_flush_cache(addr as *mut _, bytes.len());
+            track_wxshadow_addr(addr);
             JSValue::undefined().raw()
         }
         other => {

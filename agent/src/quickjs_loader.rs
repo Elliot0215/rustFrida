@@ -9,9 +9,9 @@ use crate::vma_name::set_anon_vma_name_raw;
 use libc::{munmap, sysconf, MAP_FAILED, _SC_PAGESIZE};
 
 use quickjs_hook::{
-    cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks, complete_script, get_or_init_engine,
-    init_hook_engine, load_script, load_script_with_filename, set_console_callback, set_qbdi_helper_blob,
-    set_qbdi_output_dir,
+    cleanup_engine, cleanup_hook_engine, cleanup_hooks, cleanup_java_hooks, cleanup_wxshadow_patches,
+    complete_script, get_or_init_engine, init_hook_engine, load_script, load_script_with_filename,
+    set_console_callback, set_qbdi_helper_blob, set_qbdi_output_dir,
 };
 #[cfg(feature = "qbdi")]
 use quickjs_hook::{preload_qbdi_helper, shutdown_qbdi_helper};
@@ -206,6 +206,10 @@ pub fn cleanup() {
     // Reset hook engine state and free the executable pool metadata
     log_msg("[quickjs] cleanup_hook_engine\n".to_string());
     cleanup_hook_engine();
+    // 清理 writeBytes(bytes, 1) 装的 wxshadow patch. 这些不进 hook_engine,
+    // 所以 hook_engine_cleanup 看不到, 需要独立的轨迹清理.
+    log_msg("[quickjs] cleanup_wxshadow_patches\n".to_string());
+    cleanup_wxshadow_patches();
     // 最后释放 recomp 页: prctl release 注销重定向，内核恢复原始页 X 权限。
     // 必须在所有 hook cleanup 之后: OAT patch restore 需要写 recomp 页，
     // hook_engine_cleanup 恢复 slot 原始字节也在 recomp 跳板区。

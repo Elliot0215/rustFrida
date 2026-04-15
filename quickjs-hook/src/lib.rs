@@ -38,6 +38,7 @@ pub use context::JSContext;
 pub use jsapi::console::{set_console_callback, set_verbose};
 pub use jsapi::deferred_java_init;
 pub use jsapi::hook_api::cleanup_hooks;
+pub use jsapi::memory::cleanup_wxshadow_patches;
 #[cfg(feature = "qbdi")]
 pub use jsapi::hook_api::preload_qbdi_helper;
 #[cfg(feature = "qbdi")]

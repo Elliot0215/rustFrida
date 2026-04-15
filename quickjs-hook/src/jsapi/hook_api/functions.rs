@@ -117,9 +117,6 @@ unsafe fn install_hook(
 
     let callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
 
-    // stealth=0: 普通 mprotect+memcpy
-    // stealth=1: wxshadow 影子页写
-    // stealth=2: recomp slot — slot 已 RWX 可直写, thunk 允许远距离 (slot 容纳 16/20B patch 不溢出)
     let stealth_flag = match mode {
         StealthMode::WxShadow => 1,
         StealthMode::Recomp => 2,
@@ -196,6 +193,9 @@ pub(crate) unsafe extern "C" fn js_unhook(
     let slot_cleared = crate::recomp::try_revert_slot_patch(addr as usize);
     let wxshadow_released =
         ffi::hook::wxshadow_release(addr as *mut std::ffi::c_void) == 0;
+    if wxshadow_released {
+        crate::jsapi::memory::untrack_wxshadow_addr(addr);
+    }
     let hook_removed = hook_ffi::hook_remove(addr as *mut std::ffi::c_void) == HOOK_OK;
 
     if !slot_cleared && !wxshadow_released && !hook_removed {

@@ -10,6 +10,8 @@ use crate::context::JSContext;
 use crate::jsapi::util::add_cfunction_to_object;
 
 pub(crate) use alloc::cleanup_owned_allocs;
+pub use write::cleanup_wxshadow_patches;
+pub(crate) use write::untrack_wxshadow_addr;
 use alloc::{memory_alloc, memory_alloc_utf8_string, memory_flush_code_cache, memory_protect};
 use read::*;
 use write::*;
