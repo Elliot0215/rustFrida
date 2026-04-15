@@ -90,6 +90,86 @@ pub(super) unsafe extern "C" fn memory_alloc(
 ///
 /// ARM64 需要: DC CVAU + DSB ISH + IC IVAU + DSB ISH + ISB
 /// 直接调 __builtin___clear_cache 让 libclang_rt 实现这个序列。
+/// `Memory.protect(addr, size, protection)` — 页级 mprotect.
+/// protection: "rwx" 风格 3 字符, '-' = 空缺位. 例 "r-x" "rw-" "---".
+/// addr 自动 round-down 到页首; size 自动 round-up 到页尾.
+/// 返回 true = 成功; 失败抛 RangeError 带 errno 信息.
+///
+/// 只挂在 Memory 命名空间, 不挂 NativePointer prototype — protect 是页级
+/// 语义, 挂在单个指针上容易误导 (改的不是这个指针本身, 是所在页整页).
+pub(super) unsafe extern "C" fn memory_protect(
+    ctx: *mut ffi::JSContext,
+    _this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue {
+    use crate::jsapi::callback_util::extract_pointer_address;
+
+    if argc < 3 {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Memory.protect(addr, size, protection) requires 3 arguments\0".as_ptr() as *const _,
+        );
+    }
+    let addr = match extract_pointer_address(ctx, JSValue(*argv), "Memory.protect") {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let size = match JSValue(*argv.add(1)).to_i64(ctx) {
+        Some(n) if n > 0 => n as usize,
+        _ => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"Memory.protect: size must be positive integer\0".as_ptr() as *const _,
+            );
+        }
+    };
+    let prot_str = match JSValue(*argv.add(2)).to_string(ctx) {
+        Some(s) => s,
+        None => {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"Memory.protect: protection must be string (e.g. \"rwx\")\0".as_ptr() as *const _,
+            );
+        }
+    };
+
+    let mut prot: i32 = 0;
+    let b = prot_str.as_bytes();
+    if b.len() >= 3 {
+        if b[0] == b'r' {
+            prot |= libc::PROT_READ;
+        }
+        if b[1] == b'w' {
+            prot |= libc::PROT_WRITE;
+        }
+        if b[2] == b'x' {
+            prot |= libc::PROT_EXEC;
+        }
+    } else {
+        return ffi::JS_ThrowTypeError(
+            ctx,
+            b"Memory.protect: protection must be 3-char string like \"rwx\"\0".as_ptr() as *const _,
+        );
+    }
+
+    // mprotect 要求 addr 页对齐; 自动 round down. size 自动 round up 到跨页尾.
+    const PAGE_SIZE: usize = 0x1000;
+    let page_start = (addr as usize) & !(PAGE_SIZE - 1);
+    let page_end = ((addr as usize + size) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let page_len = page_end - page_start;
+
+    if libc::mprotect(page_start as *mut libc::c_void, page_len, prot) != 0 {
+        let err = std::io::Error::last_os_error();
+        let msg = format!(
+            "Memory.protect({:#x}, {}, \"{}\"): {}\0",
+            addr, size, prot_str, err
+        );
+        return ffi::JS_ThrowRangeError(ctx, msg.as_ptr() as *const _);
+    }
+    JSValue::bool(true).raw()
+}
+
 pub(super) unsafe extern "C" fn memory_flush_code_cache(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,

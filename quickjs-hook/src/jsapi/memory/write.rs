@@ -40,7 +40,7 @@ macro_rules! define_memory_write {
             }) {
                 return ffi::JS_ThrowRangeError(
                     $ctx_id,
-                    concat!($js_name, "(): cannot make page writable (mprotect failed)\0").as_ptr() as *const _,
+                    concat!($js_name, "(): target page is not writable; call Memory.protect(addr, size, \"rwx\") first\0").as_ptr() as *const _,
                 );
             }
             JSValue::undefined().raw()
@@ -127,7 +127,7 @@ pub(super) unsafe extern "C" fn memory_write_bytes(
             }) {
                 return ffi::JS_ThrowRangeError(
                     ctx,
-                    b"writeBytes: mprotect failed\0".as_ptr() as *const _,
+                    b"writeBytes: target page is not writable; call Memory.protect(addr, size, \"rwx\") first, or use writeBytes(bytes, 1)/writest() for stealth code patch\0".as_ptr() as *const _,
                 );
             }
             ffi::hook::hook_flush_cache(addr as *mut _, len);

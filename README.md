@@ -605,7 +605,22 @@ Memory.flushCodeCache(code, 16);
 - 无效地址抛 `RangeError`，不会崩进程；`readCString` 超过 4096B 也抛
 - `Memory.alloc` 是 RWX 堆内存，JS 上下文销毁时自动释放；勿 `munmap`
 - 写入可执行代码后**必须**调 `Memory.flushCodeCache` 刷 ARM64 I-cache（DC CVAU + IC IVAU + ISB），否则 CPU 可能执行到 stale 指令
-- `writeXxx` 自动 mprotect 目标页为 RW，写完还原；只读段也能写
+- **`writeXxx` 不再自动 mprotect**：只读段写入会抛 "target page is not writable"；需先调 `Memory.protect(addr, size, "rwx")` 显式开写权限，避免跨页 mprotect / 权限恢复失败等隐性问题
+
+**Memory.protect**
+
+| API | 参数 | 返回 |
+| --- | --- | --- |
+| `Memory.protect(addr, size, prot)` | `AddressLike, number, "rwx" 风格` | `true`（失败抛 RangeError + errno） |
+
+```js
+// 给只读段开写权限然后 patch, 改完可恢复
+Memory.protect(addr, 8, "rwx");
+addr.writeU64(0xdeadbeefn);
+Memory.protect(addr, 8, "r-x");
+```
+
+`protection` 三字符 `r`/`w`/`x`/`-`，例 `"rwx"` `"r-x"` `"rw-"` `"---"`。addr 自动 round-down 到页首、size 自动 round-up 到页尾。**只在 `Memory` 命名空间，不挂 `NativePointer.prototype`** — protect 是页级语义，挂指针上容易误导。
 
 **writeBytes / writest — 三种写入场景**
 

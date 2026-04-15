@@ -10,7 +10,7 @@ use crate::context::JSContext;
 use crate::jsapi::util::add_cfunction_to_object;
 
 pub(crate) use alloc::cleanup_owned_allocs;
-use alloc::{memory_alloc, memory_alloc_utf8_string, memory_flush_code_cache};
+use alloc::{memory_alloc, memory_alloc_utf8_string, memory_flush_code_cache, memory_protect};
 use read::*;
 use write::*;
 use writest::memory_writest;
@@ -63,6 +63,7 @@ pub fn register_memory_api(ctx: &JSContext) {
         add_cfunction_to_object(ctx_ptr, obj, "writePointer", memory_write_pointer, 2);
         add_cfunction_to_object(ctx_ptr, obj, "writeBytes", memory_write_bytes, 3);
         add_cfunction_to_object(ctx_ptr, obj, "writest", memory_writest, 2);
+        add_cfunction_to_object(ctx_ptr, obj, "protect", memory_protect, 3);
     }
 
     // Set Memory on global object
