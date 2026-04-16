@@ -874,17 +874,44 @@ pub fn cleanup_java_hooks() {
     } // guard dropped
 
     // ============================================================
-    // Phase 2 - Drain: 等待 in-flight callback 全部退出
+    // Phase 2 - Drain: 循环 500ms 粒度等待 in-flight callback 全部退出
     //
     // Phase 1 已切断新 caller 入口, in-flight counter 只减不增, 必然归 0.
-    // 5s 超时覆盖 JS callback 执行 (毫秒级) + 调度抖动 + hunter 类应用的
-    // 高频场景. 此时 OAT bypass + router 表仍完好, 保护 in-flight 线程栈.
+    // 每 500ms 检查一次 — counter 归 0 立即推进, 否则继续等.
+    // 总上限 30s 兜底, 超过说明某个回调卡在 JS I/O 或 Java 锁里, 放弃等待.
     // ============================================================
-    if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(5000)) {
-        output_verbose(&format!(
-            "[java cleanup] drain 超时 (5s), remaining={} (继续但可能崩)",
-            in_flight_java_hook_callbacks()
-        ));
+    {
+        let total_limit = std::time::Duration::from_secs(30);
+        let start = std::time::Instant::now();
+        let mut rounds = 0u32;
+        loop {
+            if wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(500)) {
+                // counter 归 0, 正常退出
+                if rounds > 0 {
+                    output_verbose(&format!("[java cleanup] drain 完成 ({} 轮 500ms)", rounds + 1));
+                }
+                break;
+            }
+            rounds += 1;
+            let remaining = in_flight_java_hook_callbacks();
+            if start.elapsed() >= total_limit {
+                output_verbose(&format!(
+                    "[java cleanup] drain 总超时 {}s, remaining={} (继续但可能崩)",
+                    total_limit.as_secs(),
+                    remaining
+                ));
+                break;
+            }
+            // 每 10 轮 (5s) 输出一次诊断, 避免日志爆炸
+            if rounds % 10 == 0 {
+                output_verbose(&format!(
+                    "[java cleanup] drain 进行中 ({} 轮, {}ms 已过), remaining={}",
+                    rounds,
+                    start.elapsed().as_millis(),
+                    remaining
+                ));
+            }
+        }
     }
 
     // ============================================================
