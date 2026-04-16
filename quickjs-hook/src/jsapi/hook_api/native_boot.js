@@ -41,6 +41,39 @@
 //   - Max 256 stack-spilled args (2KB stack region)
 //   - Struct-by-value not supported
 
+// hook(addr, fn, stealth?) — Frida 风格回调包装
+//   fn(arg0, arg1, ..., arg7) { this.x0, this.orig(), ... }
+//     arguments[0..7] = x0..x7 (ARM64 ABI 前 8 个整型参数)
+//     this = register context，含 x0-x30 / sp / pc / orig() / trampoline
+//   recompHook 同样处理。
+(function() {
+    "use strict";
+    if (typeof hook !== 'function') return;
+    var _hook = hook;
+    var _recompHook = (typeof recompHook === 'function') ? recompHook : null;
+    function _wrapNativeCallback(userFn) {
+        return function(ctx) {
+            return userFn.apply(ctx, [
+                ctx.x0, ctx.x1, ctx.x2, ctx.x3,
+                ctx.x4, ctx.x5, ctx.x6, ctx.x7
+            ]);
+        };
+    }
+    globalThis.hook = function(addr, fn, stealth) {
+        if (typeof fn !== 'function') {
+            return (arguments.length >= 3) ? _hook(addr, fn, stealth) : _hook(addr, fn);
+        }
+        var wrapped = _wrapNativeCallback(fn);
+        return (arguments.length >= 3) ? _hook(addr, wrapped, stealth) : _hook(addr, wrapped);
+    };
+    if (_recompHook) {
+        globalThis.recompHook = function(addr, fn) {
+            if (typeof fn !== 'function') return _recompHook(addr, fn);
+            return _recompHook(addr, _wrapNativeCallback(fn));
+        };
+    }
+})();
+
 (function() {
     "use strict";
 

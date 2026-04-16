@@ -211,22 +211,39 @@ type ModuleInfo = {
   name: string; base: NativePointer; size: number; path: string
 }
 
-type NativeHookContext = {
-  x0 ~ x30: number | bigint    // ARM64 通用寄存器
-  sp: number | bigint
-  pc: number | bigint
-  trampoline: number | bigint
-  orig(): number | bigint       // 调用原函数，返回值写入 x0
+// Native / Java hook 回调都是 Frida 风格：arguments = 参数，this = 上下文载体
+
+type NativeHookThis = {
+  x0 ~ x30: bigint             // ARM64 通用寄存器（读/写）
+  sp: bigint
+  pc: bigint
+  trampoline: bigint
+  orig(...args: any[]): bigint // 调原函数；不传参用当前寄存器，传参按顺序覆盖 x0-xN
 }
 
-type JavaHookContext = {
-  thisObj?: JavaObjectProxy     // 实例方法的 this（静态方法无）
-                                // 字段: thisObj.field.value 读/写
-                                // 方法: thisObj.method(args) 调用
-  args: any[]                   // 参数数组（Object 参数自动包装为 Proxy）
-  env: number | bigint          // JNIEnv*
-  orig(...args: any[]): any     // 调原方法，不传参用原始参数
+// native hook 写法：
+// hook(addr, function(a, b, c) {     // arguments[0..7] = x0..x7（BigInt）
+//   this.x0 = ptr("0x1234");          // 改寄存器
+//   return this.orig();               // 调原函数
+// });
+
+type JavaInstanceThis = JavaObjectProxy & {
+  // 继承 JavaObjectProxy: 字段 this.field.value / 方法 this.method(args) / this.$className / this.__jptr
+  $orig(...args: any[]): any    // 调原方法，不传参用原始参数
 }
+
+type JavaStaticThis = {
+  $orig(...args: any[]): any
+  $className: string
+  $static: true
+}
+
+// hook 写法：
+// Cls.method.impl = function(a, b, c) {   // arguments = Java 参数（对象自动 Proxy）
+//   this.$className           // 始终可读
+//   this.field.value          // 实例方法: 直接读字段
+//   return this.$orig(a, b, c) // 调原方法
+// }
 
 type JniEntry = { name: string; index: number; address: NativePointer }
 
@@ -240,35 +257,37 @@ type JNINativeMethodInfo = {
 
 ## Native Hook
 
+Frida 风格：**`arguments`** = x0..x7（前 8 个整型参数，BigInt），**`this`** = register 上下文（含 x0-x30 / sp / pc / orig）。
+
 ```js
 // 基本 hook — 透传
-hook(Module.findExportByName("libc.so", "open"), function(ctx) {
-    console.log("open:", Memory.readCString(ptr(ctx.x0)));
-    return ctx.orig();
+hook(Module.findExportByName("libc.so", "open"), function(path, flags) {
+    console.log("open:", Memory.readCString(ptr(path)), "flags=" + flags);
+    return this.orig();
 });
 
-// 修改返回值
-hook(Module.findExportByName("libc.so", "getpid"), function(ctx) {
-    ctx.orig();
+// 修改返回值（直接 return 覆盖）
+hook(Module.findExportByName("libc.so", "getpid"), function() {
+    this.orig();
     return 12345;              // 调用方拿到 12345
 });
 
-// 修改参数 — 通过 ctx 属性
-hook(target, function(ctx) {
-    ctx.x0 = ptr("0x1234");   // 改第一个参数
-    ctx.x1 = 100;             // 改第二个参数
-    return ctx.orig();         // 用修改后的参数调原函数
+// 修改参数 — 通过 this.xN
+hook(target, function(a, b) {
+    this.x0 = ptr("0x1234");   // 改第一个参数
+    this.x1 = 100;             // 改第二个参数
+    return this.orig();         // 用修改后的参数调原函数
 });
 
 // 修改参数 — 通过 orig() 传参（按顺序覆盖 x0-xN）
-hook(target, function(ctx) {
-    return ctx.orig(ptr("0x1234"), 100);
+hook(target, function() {
+    return this.orig(ptr("0x1234"), 100);
 });
 
-// 不 return 也行 — ctx.x0 赋值会同步回 C 层
-hook(Module.findExportByName("libc.so", "getuid"), function(ctx) {
-    ctx.orig();
-    ctx.x0 = 77777;           // 调用方拿到 77777
+// 不 return 也行 — this.x0 赋值会同步回 C 层
+hook(Module.findExportByName("libc.so", "getuid"), function() {
+    this.orig();
+    this.x0 = 77777;          // 调用方拿到 77777
 });
 
 // 移除 hook
@@ -335,32 +354,44 @@ hook(target, callback, true)            // true = WXSHADOW
 
 ## Java Hook
 
+Frida 风格：**`this`** = 实例（静态方法时为 class 载体），**`arguments`** = Java 参数。
+
 ```js
 Java.ready(function() {
     var Activity = Java.use("android.app.Activity");
 
-    // hook 实例方法（return 值就是方法返回值）
-    Activity.onResume.impl = function(ctx) {
-        console.log("onResume:", ctx.thisObj.$className);
-        return ctx.orig();
+    // hook 实例方法
+    Activity.onResume.impl = function() {
+        console.log("onResume:", this.$className);  // this = 实例 Proxy
+        return this.$orig();                         // 调原方法
     };
 
-    // hook 构造函数
+    // hook 构造函数（参数走 arguments）
     var MyClass = Java.use("com.example.MyClass");
-    MyClass.$init.impl = function(ctx) {
-        console.log("new MyClass, arg0 =", ctx.args[0]);
-        return ctx.orig();
+    MyClass.$init.impl = function(a, b) {
+        console.log("new MyClass, arg0 =", a);
+        return this.$orig(a, b);
     };
 
-    // 修改参数
-    MyClass.test.impl = function(ctx) {
-        return ctx.orig("patched_arg");
+    // 修改参数传给原方法
+    MyClass.test.impl = function(arg) {
+        return this.$orig("patched_arg");
     };
 
     // 指定 overload（Java 类型名或 JNI 签名都行）
-    MyClass.foo.overload("int", "java.lang.String").impl = function(ctx) {
-        return ctx.orig();
+    MyClass.foo.overload("int", "java.lang.String").impl = function(i, s) {
+        return this.$orig(i, s);
     };
+
+    // 静态方法：this 没有实例 Proxy，但 $orig / $className / $static 可用
+    Java.use("android.util.Log").i
+        .overload("java.lang.String", "java.lang.String").impl = function(tag, msg) {
+            console.log("[static]", this.$className, this.$static, tag, msg);
+            return this.$orig(tag, msg);
+        };
+
+    // 直接返回值覆盖（不调 $orig）
+    MyClass.getCount.impl = function() { return 42; };
 
     // 移除 hook
     Activity.onResume.impl = null;
@@ -397,10 +428,10 @@ p.x.value = 100;                         // 写: JVM 同步更新
 console.log(p.toString());               // "Point(100, 20)"
 
 // hook 中访问 this 字段
-Activity.onResume.impl = function(ctx) {
-    var name = ctx.thisObj.mComponent.value;  // 读实例字段
+Activity.onResume.impl = function() {
+    var name = this.mComponent.value;   // 读实例字段
     console.log("resuming:", name);
-    return ctx.orig();
+    return this.$orig();
 };
 ```
 
@@ -477,7 +508,7 @@ Java.deoptimizeMethod("com.example.Test", "foo", "(I)V");  // 单方法降级
 | --- | --- | --- |
 | `Java.use(className)` | `string` | `JavaClassWrapper` |
 | `Class.$new(...args)` | 任意 | `JavaObjectProxy` |
-| `Class.method.impl = fn` | `(ctx: JavaHookContext) => any` | setter |
+| `Class.method.impl = fn` | `function(...args) { this.$orig(...) }`（this = 实例/static 载体） | setter |
 | `Class.method.impl = null` | — | setter |
 | `Class.method.overload(...types)` | `string...` | `MethodWrapper` |
 | `Java.ready(fn)` | `() => void` | `void` |
@@ -507,22 +538,22 @@ Jni.table                         // 整张 JNI 函数表
 Jni.addr(envPtr, "FindClass")     // 指定 JNIEnv
 ```
 
-### Jni.helper
+### Jni.env / Jni.structs
 
 ```js
-Jni.helper.env.ptr                         // 当前线程 JNIEnv*
-Jni.helper.env.getClassName(jclass)        // → "android.app.Activity"
-Jni.helper.env.getObjectClassName(jobject)  // → 对象的类名
-Jni.helper.env.readJString(jstring)        // → JS string
-Jni.helper.env.getObjectClass(obj)         // → jclass
-Jni.helper.env.getSuperclass(clazz)        // → jclass
-Jni.helper.env.isSameObject(a, b)          // → boolean
-Jni.helper.env.isInstanceOf(obj, clazz)    // → boolean
-Jni.helper.env.exceptionCheck()            // → boolean
-Jni.helper.env.exceptionClear()
+Jni.env.ptr                         // 当前线程 JNIEnv*
+Jni.env.getClassName(jclass)        // → "android.app.Activity"
+Jni.env.getObjectClassName(jobject) // → 对象的类名
+Jni.env.readJString(jstring)        // → JS string
+Jni.env.getObjectClass(obj)         // → jclass
+Jni.env.getSuperclass(clazz)        // → jclass
+Jni.env.isSameObject(a, b)          // → boolean
+Jni.env.isInstanceOf(obj, clazz)    // → boolean
+Jni.env.exceptionCheck()            // → boolean
+Jni.env.exceptionClear()
 
-Jni.helper.structs.JNINativeMethod.readArray(addr, count)  // → JNINativeMethodInfo[]
-Jni.helper.structs.jvalue.readArray(addr, typesOrSig)      // → any[]
+Jni.structs.JNINativeMethod.readArray(addr, count)  // → JNINativeMethodInfo[]
+Jni.structs.jvalue.readArray(addr, typesOrSig)      // → any[]
 ```
 
 ### API 速查
@@ -534,25 +565,25 @@ Jni.helper.structs.jvalue.readArray(addr, typesOrSig)      // → any[]
 | `Jni.find(name)` | `string` | `JniEntry` |
 | `Jni.entries()` | — | `JniEntry[]` |
 | `Jni.table` | — | `Record<string, JniEntry>` |
-| `Jni.helper.env.getClassName(clazz)` | `AddressLike` | `string \| null` |
-| `Jni.helper.env.readJString(jstr)` | `AddressLike` | `string \| null` |
-| `Jni.helper.structs.JNINativeMethod.readArray(addr, count)` | `AddressLike, number` | `JNINativeMethodInfo[]` |
+| `Jni.env.getClassName(clazz)` | `AddressLike` | `string \| null` |
+| `Jni.env.readJString(jstr)` | `AddressLike` | `string \| null` |
+| `Jni.structs.JNINativeMethod.readArray(addr, count)` | `AddressLike, number` | `JNINativeMethodInfo[]` |
 
 ### 实战：监控 RegisterNatives
 
 ```js
-hook(Jni.addr("RegisterNatives"), function(ctx) {
-    var cls = Jni.helper.env.getClassName(ctx.x1);
-    var count = Number(ctx.x3);
-    console.log(cls + " (" + count + " methods)");
+hook(Jni.addr("RegisterNatives"), function(env, clazz, methods_ptr, count) {
+    var cls = Jni.env.getClassName(clazz);
+    var n = Number(count);
+    console.log(cls + " (" + n + " methods)");
 
-    var methods = Jni.helper.structs.JNINativeMethod.readArray(ptr(ctx.x2), count);
+    var methods = Jni.structs.JNINativeMethod.readArray(ptr(methods_ptr), n);
     for (var i = 0; i < methods.length; i++) {
         var m = methods[i];
         var mod = Module.findByAddress(m.fnPtr);
         console.log("  " + m.name + " " + m.sig + " → " + mod.name + "+" + m.fnPtr.sub(mod.base));
     }
-    return ctx.orig();
+    return this.orig();
 }, 1);
 ```
 
@@ -566,7 +597,7 @@ hook(Jni.addr("RegisterNatives"), function(ctx) {
 // Memory.* 风格
 var pid = Memory.readU32(ptr("0x7f1234"));
 Memory.writeU64(dst, 0xdeadbeefn);
-var cls = Memory.readCString(ptr(ctx.x1));
+var cls = Memory.readCString(ptr(this.x1));
 
 // ptr.* 风格（推荐，支持链式）
 var p = ptr("0x7f1234");
@@ -739,9 +770,8 @@ Trace 文件默认输出到 `/data/data/<package>/trace_bundle.pb`，配合 qbdi
 
 ## 注意事项
 
-- **两种 hook 都建议 `return ctx.orig()`** 透传返回值
-- **Native hook 改参数/返回值：** `ctx.x0 = value` 或 `ctx.orig(newArg0, newArg1)`，`return value` 覆盖返回值
-- **Java hook 改参数/返回值：** `return ctx.orig(newArgs)` 改参数，`return value` 改返回值
+- **Native hook 回调签名：** `function(a, b, c) { ... }`，`arguments[0..7]` = x0..x7 (BigInt)、`this` = register 上下文（`this.x0..x30` / `this.sp` / `this.pc` / `this.orig()`）；改参数 `this.x0 = v` 或 `this.orig(newArg0, newArg1)`；`return value` 覆盖返回值
+- **Java hook 回调签名：** `function(a, b, c) { ... }`，`this` = 实例（静态方法为 class 载体）、`arguments` = Java 参数、`this.$orig(...)` = 原方法；`return value` 改返回值
 - **Java 字段访问必须用 `.value`：** `obj.field` 返回 FieldWrapper，`obj.field.value` 才是真实值
 - **`Java.choose` 的 wrapper 仅在 `onMatch` 内有效**，跨回调保留需要自己提取字段值
 - Spawn 模式下 Java hook 必须放在 `Java.ready(fn)` 里（`Java.classLoaders()` / `Java.choose` 同理）

@@ -477,6 +477,8 @@
                 if (prop === "__jclass") return target.__jclass;
                 // Rust 内部属性穿透（__origJobject 用于 hook 返回值 round-trip）
                 if (prop === "__origJobject") return target.__origJobject;
+                // Frida-compat hook invocation accessor（仅当 target 由 wrapCallback 注入时存在）
+                if (prop === "$orig") return target.__$orig;
                 if (prop === Symbol.toPrimitive) return function(hint) {
                     if (hint === "string" || hint === "default") {
                         try {
@@ -684,22 +686,23 @@
                 this._fn = null;
             } else {
                 var userFn = fn;
+                // wrapCallback 的 ctx 是 Rust 侧注入的内部 hook-ctx 对象，
+                // 保留用于 origCallOriginal.apply(ctx, ...) 让 js_call_original 读到
+                // __hookCtxPtr / __hookArtMethod，用户层不再可见。
                 var wrapCallback = function(ctx) {
-                    if (ctx.thisObj !== undefined) {
-                        ctx.thisObj = _wrapJavaObj(ctx.thisObj, cls);
+                    // Wrap args → JS Proxy for Java objects, 其它原样
+                    var rawArgs = ctx.args || [];
+                    var wrappedArgs = new Array(rawArgs.length);
+                    for (var i = 0; i < rawArgs.length; i++) {
+                        var a = rawArgs[i];
+                        wrappedArgs[i] = (a !== null && typeof a === "object"
+                            && a.__jptr !== undefined)
+                            ? _wrapJavaObj(a.__jptr, a.__jclass)
+                            : a;
                     }
-                    if (ctx.args) {
-                        for (var i = 0; i < ctx.args.length; i++) {
-                            var a = ctx.args[i];
-                            if (a !== null && typeof a === "object"
-                                && a.__jptr !== undefined) {
-                                ctx.args[i] = _wrapJavaObj(a.__jptr, a.__jclass);
-                            }
-                        }
-                    }
-                    // Wrap orig so returned objects auto-convert to JS Proxy
+                    // Wrap orig 使返回的 Java 对象自动转 Proxy
                     var origCallOriginal = ctx.orig;
-                    ctx.orig = function() {
+                    var origWrapped = function() {
                         var ret = origCallOriginal.apply(ctx, arguments);
                         if (ret !== null && typeof ret === "object"
                             && ret.__jptr !== undefined) {
@@ -707,7 +710,27 @@
                         }
                         return ret;
                     };
-                    return userFn(ctx);
+
+                    // Frida-style: this = thisObj (instance) 或 class wrapper (static)
+                    // arguments = Java 方法参数
+                    var thisObjRaw = ctx.thisObj;
+                    var fnThis;
+                    if (thisObjRaw !== undefined) {
+                        // 实例方法: 新建 Proxy target 携带 $orig
+                        fnThis = _wrapJavaObjOnTarget({
+                            __jptr: thisObjRaw,
+                            __jclass: cls,
+                            __$orig: origWrapped
+                        });
+                    } else {
+                        // 静态方法: 简单对象 + Frida-style 入口
+                        fnThis = {
+                            $orig: origWrapped,
+                            $className: cls,
+                            $static: true
+                        };
+                    }
+                    return userFn.apply(fnThis, wrappedArgs);
                 };
                 for (var i = 0; i < sigs.length; i++) {
                     _hook(cls, name, sigs[i], wrapCallback);
