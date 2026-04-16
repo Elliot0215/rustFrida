@@ -512,7 +512,12 @@ static void* alloc_from_pool(ExecPool* pool, size_t size) {
 
 /* 参数化版本: 搜索 target ±max_range 范围内的 maps 空隙，mmap RWX 内存。
  * target=NULL 时退化为普通 mmap(NULL)。
- * 返回 mmap 得到的指针，MAP_FAILED 表示失败。 */
+ * 返回 mmap 得到的指针，MAP_FAILED 表示失败。
+ *
+ * 设计要点：/proc/self/maps 可能被 KPM 隐藏部分 VMA（如 wwb_hook_pool）。
+ * 因此扫 gap 只是缩范围避开系统 VMA，真正判定空位交给 MAP_FIXED_NOREPLACE
+ * ——该 flag 走内核 VMA 树，绕过 /proc 层过滤。EEXIST → 在同 gap 内按
+ * alloc_size 步进跳过隐藏占用，而不是 fallback 到任意地址（会飞出 ±range）。 */
 void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
     if (!target) {
         return mmap(NULL, alloc_size,
@@ -520,8 +525,8 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
 
-    long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) page_size = 4096;
+    long page_size_l = sysconf(_SC_PAGESIZE);
+    size_t page_size = page_size_l > 0 ? (size_t)page_size_l : 4096u;
 
     uintptr_t target_addr = (uintptr_t)target;
 
@@ -530,7 +535,7 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
     if (target_addr > (uintptr_t)max_range)
         search_lo = (target_addr - (uintptr_t)max_range + page_size - 1) & ~(page_size - 1);
     else
-        search_lo = (uintptr_t)page_size;
+        search_lo = page_size;
     uintptr_t search_hi = target_addr + (uintptr_t)max_range;
     if (search_hi < target_addr) search_hi = UINTPTR_MAX;
 
@@ -540,9 +545,9 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
         return MAP_FAILED;
     }
 
-    #define MAX_CANDIDATES 32
-    struct { uintptr_t addr; int64_t dist; } candidates[MAX_CANDIDATES];
-    int num_candidates = 0;
+    #define MAX_GAPS 64
+    struct { uintptr_t start; uintptr_t end; int64_t dist; } gaps[MAX_GAPS];
+    int num_gaps = 0;
 
     char line[512];
     uintptr_t prev_end = 0;
@@ -552,69 +557,26 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
         if (sscanf(line, "%lx-%lx", &vma_start, &vma_end) < 2) continue;
 
         if (prev_end > 0 && vma_start > prev_end) {
-            uintptr_t gap_start = prev_end;
-            uintptr_t gap_end = vma_start;
+            uintptr_t gs = prev_end;
+            uintptr_t ge = vma_start;
 
-            if (gap_start < search_hi && gap_end > search_lo) {
-                if (gap_start < search_lo) gap_start = search_lo;
-                if (gap_end > search_hi) gap_end = search_hi;
-                gap_start = (gap_start + page_size - 1) & ~(page_size - 1);
+            if (gs < search_hi && ge > search_lo) {
+                if (gs < search_lo) gs = search_lo;
+                if (ge > search_hi) ge = search_hi;
+                gs = (gs + page_size - 1) & ~(page_size - 1);
+                ge = ge & ~(page_size - 1);
 
-                if (gap_end > gap_start && (gap_end - gap_start) >= alloc_size) {
-                    uintptr_t gap_last = (gap_end - alloc_size) & ~(page_size - 1);
-                    uintptr_t center;
-                    uintptr_t trials[8];
-                    int num_trials = 0;
+                if (ge > gs && (ge - gs) >= alloc_size) {
+                    int64_t d;
+                    if (target_addr >= gs && target_addr < ge) d = 0;
+                    else if (target_addr < gs) d = (int64_t)(gs - target_addr);
+                    else d = (int64_t)(target_addr - ge);
 
-                    if (target_addr >= gap_start && target_addr < gap_end) {
-                        center = target_addr & ~(page_size - 1);
-                        if (center < gap_start) center = gap_start;
-                        if (center > gap_last) center = gap_last;
-                    } else if (target_addr < gap_start) {
-                        center = gap_start;
-                    } else {
-                        center = gap_last;
-                    }
-
-                    /* 同一 gap 内多点尝试：
-                     * - 起点 / 终点
-                     * - target 对齐点
-                     * - target 左右一个 alloc_size
-                     * - target 左右 16KB
-                     * 这样能避免“gap 足够大，但单个候选点刚好被占用”的情况。 */
-                    trials[num_trials++] = center;
-                    trials[num_trials++] = gap_start;
-                    trials[num_trials++] = gap_last;
-
-                    if (center >= gap_start + alloc_size)
-                        trials[num_trials++] = center - alloc_size;
-                    if (center + alloc_size <= gap_last)
-                        trials[num_trials++] = center + alloc_size;
-                    if (center >= gap_start + (uintptr_t)(page_size * 4))
-                        trials[num_trials++] = center - (uintptr_t)(page_size * 4);
-                    if (center + (uintptr_t)(page_size * 4) <= gap_last)
-                        trials[num_trials++] = center + (uintptr_t)(page_size * 4);
-
-                    for (int t = 0; t < num_trials && num_candidates < MAX_CANDIDATES; t++) {
-                        uintptr_t candidate = trials[t] & ~(page_size - 1);
-                        if (candidate < gap_start || candidate > gap_last)
-                            continue;
-
-                        int duplicate = 0;
-                        for (int k = 0; k < num_candidates; k++) {
-                            if (candidates[k].addr == candidate) {
-                                duplicate = 1;
-                                break;
-                            }
-                        }
-                        if (duplicate)
-                            continue;
-
-                        int64_t d = (int64_t)(candidate - target_addr);
-                        if (d < 0) d = -d;
-                        candidates[num_candidates].addr = candidate;
-                        candidates[num_candidates].dist = d;
-                        num_candidates++;
+                    if (num_gaps < MAX_GAPS) {
+                        gaps[num_gaps].start = gs;
+                        gaps[num_gaps].end = ge;
+                        gaps[num_gaps].dist = d;
+                        num_gaps++;
                     }
                 }
             }
@@ -623,57 +585,108 @@ void* hook_mmap_near_range(void* target, size_t alloc_size, int64_t max_range) {
     }
     fclose(f);
 
-    /* 按距离排序 */
-    for (int i = 1; i < num_candidates; i++) {
-        __typeof__(candidates[0]) tmp = candidates[i];
+    /* 按离 target 的距离排序，近的 gap 先扫 */
+    for (int i = 1; i < num_gaps; i++) {
+        __typeof__(gaps[0]) tmp = gaps[i];
         int j = i - 1;
-        while (j >= 0 && candidates[j].dist > tmp.dist) {
-            candidates[j + 1] = candidates[j];
+        while (j >= 0 && gaps[j].dist > tmp.dist) {
+            gaps[j + 1] = gaps[j];
             j--;
         }
-        candidates[j + 1] = tmp;
+        gaps[j + 1] = tmp;
     }
-
-    int max_tries = num_candidates < MAX_CANDIDATES ? num_candidates : MAX_CANDIDATES;
 
     #ifndef MAP_FIXED_NOREPLACE
     #define MAP_FIXED_NOREPLACE 0x100000
     #endif
 
-    for (int i = 0; i < max_tries; i++) {
-        void* cand = (void*)candidates[i].addr;
+    /* 单 gap 探测上限：每次步进 alloc_size，64 步 × 64KB = 4MB 覆盖，足够跨过
+     * 隐藏的老 pool。更大的 gap 也会被系统 VMA 切断，不用担心单 gap 过大。 */
+    const int MAX_STEPS_PER_GAP = 64;
 
-        void* ptr = mmap(cand, alloc_size,
-                         PROT_READ | PROT_WRITE | PROT_EXEC,
-                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    for (int i = 0; i < num_gaps; i++) {
+        uintptr_t gs = gaps[i].start;
+        uintptr_t ge = gaps[i].end;
+        uintptr_t gap_last = (ge - alloc_size) & ~(page_size - 1);
+        if (gap_last < gs) continue;
 
-        /* MAP_FIXED_NOREPLACE 要求候选地址完全可用；若该点被占用（EEXIST），
-         * 仍可退回普通 hint mmap，让内核在同一 gap 内挑一个附近可用地址。
-         * 之后再用距离校验保证结果仍在允许范围内。 */
-        if (ptr == MAP_FAILED && (errno == ENOSYS || errno == EINVAL || errno == EEXIST)) {
-            ptr = mmap(cand, alloc_size,
-                       PROT_READ | PROT_WRITE | PROT_EXEC,
-                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (ptr != MAP_FAILED) {
-                int64_t d = (int64_t)((uint8_t*)ptr - (uint8_t*)target);
-                if (d < -max_range || d >= max_range) {
-                    munmap(ptr, alloc_size);
-                    ptr = MAP_FAILED;
-                }
+        /* 起点：gap 内离 target 最近的对齐页 */
+        uintptr_t origin;
+        if (target_addr >= gs && target_addr <= gap_last)
+            origin = target_addr & ~(page_size - 1);
+        else if (target_addr < gs)
+            origin = gs;
+        else
+            origin = gap_last;
+
+        int had_unsupported = 0;
+        int steps = 0;
+        /* 以 origin 为中心，按 alloc_size 步长交替向 +/- 方向扫 */
+        for (int step = 0; step < MAX_STEPS_PER_GAP * 2; step++) {
+            int64_t off_steps;
+            if (step == 0) off_steps = 0;
+            else if (step & 1) off_steps = (step + 1) / 2;
+            else off_steps = -(step / 2);
+
+            uintptr_t cand;
+            if (off_steps >= 0) {
+                uintptr_t absoff = (uintptr_t)off_steps * (uintptr_t)alloc_size;
+                if (origin > gap_last || absoff > gap_last - origin) continue;
+                cand = origin + absoff;
+            } else {
+                uintptr_t absoff = (uintptr_t)(-off_steps) * (uintptr_t)alloc_size;
+                if (origin < gs || absoff > origin - gs) continue;
+                cand = origin - absoff;
             }
+            cand &= ~(page_size - 1);
+            if (cand < gs || cand > gap_last) continue;
+
+            if (++steps > MAX_STEPS_PER_GAP) break;
+
+            errno = 0;
+            void* ptr = mmap((void*)cand, alloc_size,
+                             PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (ptr != MAP_FAILED) {
+                /* 内核不认 MAP_FIXED_NOREPLACE 时会忽略该 flag，返回别的地址 */
+                if (ptr != (void*)cand) {
+                    munmap(ptr, alloc_size);
+                    had_unsupported = 1;
+                    break;
+                }
+                hook_log("hook_mmap_near_range: OK at %p for target %p (range=±%lld, gap#%d step=%d)",
+                         ptr, target, (long long)max_range, i, steps);
+                return ptr;
+            }
+            if (errno == EEXIST) continue;  /* 隐藏 VMA 或已占用，步进跳过 */
+            if (errno == ENOSYS || errno == EINVAL) {
+                had_unsupported = 1;
+                break;
+            }
+            break;  /* ENOMEM 等其他错误，换下一个 gap */
         }
 
-        if (ptr != MAP_FAILED) {
-            hook_log("hook_mmap_near_range: OK at %p for target %p (range=±%lld)",
-                     ptr, target, (long long)max_range);
-            return ptr;
+        /* 老内核 fallback：hint mmap + 距离校验（保留原行为） */
+        if (had_unsupported) {
+            void* ptr = mmap((void*)origin, alloc_size,
+                             PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (ptr != MAP_FAILED) {
+                int64_t d = (int64_t)((uint8_t*)ptr - (uint8_t*)target);
+                if (d >= -max_range && d < max_range) {
+                    hook_log("hook_mmap_near_range: OK (hint) at %p for target %p (range=±%lld)",
+                             ptr, target, (long long)max_range);
+                    return ptr;
+                }
+                munmap(ptr, alloc_size);
+            }
         }
     }
 
-    hook_log("hook_mmap_near_range: all %d candidates failed for target %p (range=±%lld)",
-             max_tries, target, (long long)max_range);
+    hook_log("hook_mmap_near_range: all %d gaps exhausted for target %p (range=±%lld)",
+             num_gaps, target, (long long)max_range);
     return MAP_FAILED;
-    #undef MAX_CANDIDATES
+    #undef MAX_GAPS
 }
 
 /* 公共函数: 默认 ±4GB (ADRP range) 的 wrapper，保持 ABI 兼容 */
