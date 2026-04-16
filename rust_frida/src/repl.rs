@@ -291,8 +291,8 @@ pub(crate) fn print_help() {
     println!("{DIM}    loadjs hook(ptr(0x1234), function(ctx){{console.log('hit')}}){RESET}");
     println!("{DIM}    loadjs var A=Java.use(\"android.app.Activity\"); A.onResume.impl=function(ctx){{console.log('hit')}}{RESET}");
     println!("{DIM}    loadjs hook(Jni.addr(\"FindClass\"), function(ctx){{console.log(Memory.readCString(ptr(ctx.x1))); return ctx.orig()}}){RESET}");
-    println!("{DIM}    loadjs hook(Jni.addr(\"RegisterNatives\"), function(ctx){{console.log(JSON.stringify(Jni.helper.structs.JNINativeMethod.readArray(ptr(ctx.x2), Number(ctx.x3)))); return ctx.orig()}}){RESET}");
-    println!("{DIM}    loadjs hook(Jni.addr(\"GetMethodID\"), function(ctx){{console.log(Jni.helper.env.getClassName(ctx.x1), Memory.readCString(ptr(ctx.x2)), Memory.readCString(ptr(ctx.x3))); return ctx.orig()}}){RESET}");
+    println!("{DIM}    loadjs hook(Jni.addr(\"RegisterNatives\"), function(ctx){{console.log(JSON.stringify(Jni.structs.JNINativeMethod.readArray(ptr(ctx.x2), Number(ctx.x3)))); return ctx.orig()}}){RESET}");
+    println!("{DIM}    loadjs hook(Jni.addr(\"GetMethodID\"), function(ctx){{console.log(Jni.env.getClassName(ctx.x1), Memory.readCString(ptr(ctx.x2)), Memory.readCString(ptr(ctx.x3))); return ctx.orig()}}){RESET}");
     println!("{DIM}    loadjs var P=Java.use(\"android.os.Process\"); console.log(P.myPid()){RESET}");
     println!(
         "{DIM}    loadjs var S=Java.use(\"java.lang.String\"); var s=S.$new(\"hello\"); console.log(s.length()){RESET}"

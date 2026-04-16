@@ -474,22 +474,15 @@
         };
     }
 
-    var _sharedEnvHelper = _makeEnvHelper();
-
-    var _helpers = {
-        pointerSize: _POINTER_SIZE,
-        env: _sharedEnvHelper
-    };
-
-    _helpers.sizeof = {
+    var _sizeof = {
         pointer: _POINTER_SIZE,
         jvalue: 8,
         JNINativeMethod: _POINTER_SIZE * 3
     };
 
-    _helpers.structs = {
+    var _structs = {
         JNINativeMethod: {
-            size: _helpers.sizeof.JNINativeMethod,
+            size: _sizeof.JNINativeMethod,
             read: function(address) {
                 return _readJNINativeMethod(address);
             },
@@ -498,7 +491,7 @@
             }
         },
         jvalue: {
-            size: _helpers.sizeof.jvalue,
+            size: _sizeof.jvalue,
             read: function(address, jniType) {
                 return _readJvalue(address, jniType);
             },
@@ -518,7 +511,10 @@
     _api.addr = function(envOrName, maybeName) {
         return _getAddress.apply(null, arguments);
     };
-    _api.helper = _helpers;
+    _api.pointerSize = _POINTER_SIZE;
+    _api.env = _makeEnvHelper();
+    _api.sizeof = _sizeof;
+    _api.structs = _structs;
 
     Object.defineProperty(_api, "table", {
         configurable: true,
