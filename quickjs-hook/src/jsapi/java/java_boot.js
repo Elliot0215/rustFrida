@@ -903,6 +903,42 @@
         }
     });
 
+    Object.defineProperty(MethodWrapper.prototype, "luaImpl", {
+        get: function() { return this._luaCode || null; },
+        set: function(code) {
+            var name = this._m === "$init" ? "<init>" : this._m;
+            var cls = this._c;
+
+            var sigs;
+            if (this._s === null) {
+                var ms = _getMethods(this);
+                var match = [];
+                for (var i = 0; i < ms.length; i++) {
+                    if (ms[i].name === name) match.push(ms[i]);
+                }
+                if (match.length === 0)
+                    throw new Error("Method not found: " + cls + "." + this._m);
+                sigs = match.map(function(m) { return m.sig; });
+            } else if (Array.isArray(this._s)) {
+                sigs = this._s;
+            } else {
+                sigs = [this._s];
+            }
+
+            if (code === null || code === undefined) {
+                for (var i = 0; i < sigs.length; i++) {
+                    _unhook(cls, name, sigs[i]);
+                }
+                this._luaCode = null;
+            } else {
+                for (var i = 0; i < sigs.length; i++) {
+                    Java.luaHook(cls, name, sigs[i], code);
+                }
+                this._luaCode = code;
+            }
+        }
+    });
+
     function _invokeStaticWrapper(wrapper, argsLike) {
         var args = _argsFrom(argsLike);
         var sig;

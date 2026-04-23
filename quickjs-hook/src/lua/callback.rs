@@ -63,6 +63,9 @@ pub unsafe extern "C" fn lua_hook_callback(
     let env = (*ctx_ptr).x[0] as crate::jsapi::java::jni_core::JniEnv;
     let hook_ctx = &*ctx_ptr;
 
+    // 设置线程局部 env，供 jstr() / print() 自动 toString 使用
+    super::api::set_current_env(env as *const std::ffi::c_void);
+
     let tls = match super::get_thread_lua_state() {
         Some(t) => t,
         None => {
@@ -164,6 +167,7 @@ pub unsafe extern "C" fn lua_hook_callback(
             crate::jsapi::console::output_message(&format!("[lua] callback error: {}", err));
         }
         lua_ffi::lua_pop(L, 1);
+        super::api::clear_current_env();
         fallback_call_original(
             ctx_ptr, env, art_method_addr, class_global_ref,
             param_count, &param_types, return_type, is_static, quick_trampoline,
@@ -177,6 +181,7 @@ pub unsafe extern "C" fn lua_hook_callback(
         (*ctx_ptr).x[0] = ret_val;
     }
     lua_ffi::lua_pop(L, 1);
+    super::api::clear_current_env();
 }
 
 unsafe fn extract_lua_return(
