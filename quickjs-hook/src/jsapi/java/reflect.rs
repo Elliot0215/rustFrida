@@ -1429,7 +1429,7 @@ pub(crate) struct MethodInfo {
 }
 
 /// Convert Java type name (from Class.getName()) to JNI type descriptor.
-pub(super) fn java_type_to_jni(type_name: &str) -> String {
+pub(crate) fn java_type_to_jni(type_name: &str) -> String {
     match type_name {
         "void" => "V".to_string(),
         "boolean" => "Z".to_string(),

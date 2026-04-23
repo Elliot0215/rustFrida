@@ -226,81 +226,116 @@ pub(crate) unsafe extern "C" fn lua_jni_new(L: *mut ffi::lua_State) -> std::os::
 }
 
 /// Java._methods(className) → {{name=, sig=, isStatic=}, ...}
+/// 轻量级实现: 只用 getName + getModifiers + getParameterTypes + getReturnType
+/// 每个方法中间插入 ExceptionCheck 作为 ART suspend checkpoint
 pub(crate) unsafe extern "C" fn lua_jni_methods(L: *mut ffi::lua_State) -> std::os::raw::c_int {
-    let nargs = ffi::lua_gettop(L);
-    let tp = ffi::lua_type(L, 1);
-    crate::jsapi::console::output_message(&format!("[lua] _methods ENTRY nargs={} type1={}", nargs, tp));
     let cls_c = ffi::lua_tostring_ex(L, 1);
-    if cls_c.is_null() {
-        crate::jsapi::console::output_message("[lua] _methods: arg is null");
-        ffi::lua_pushnil(L); return 1;
-    }
+    if cls_c.is_null() { ffi::lua_pushnil(L); return 1; }
     let cls_name = std::ffi::CStr::from_ptr(cls_c).to_string_lossy();
 
     let env = get_env(L);
     if env.is_null() { ffi::lua_pushnil(L); return 1; }
 
-    // 测试: 只做 FindClass + getDeclaredMethods, 不走 enumerate_methods
     let cls = crate::jsapi::java::reflect::find_class_safe(env, &cls_name);
-    crate::jsapi::console::output_message(&format!("[lua] _methods: cls={:?}", cls));
     if cls.is_null() { ffi::lua_pushnil(L); return 1; }
 
-    // GetMethodID for getDeclaredMethods
-    let class_cls_name = c"java/lang/Class";
     let find_cls: unsafe extern "C" fn(JniEnv, *const i8) -> *mut std::ffi::c_void = jfn!(env, JNI_FIND_CLASS);
-    let class_cls = find_cls(env, class_cls_name.as_ptr() as *const i8);
-    crate::jsapi::console::output_message(&format!("[lua] _methods: class_cls={:?}", class_cls));
-    if class_cls.is_null() { exc_check_clear(env); ffi::lua_pushnil(L); return 1; }
-
     let get_mid: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const i8, *const i8) -> *mut std::ffi::c_void = jfn!(env, JNI_GET_METHOD_ID);
-    let mid = get_mid(env, class_cls, c"getDeclaredMethods".as_ptr() as *const i8, c"()[Ljava/lang/reflect/Method;".as_ptr() as *const i8);
-    crate::jsapi::console::output_message(&format!("[lua] _methods: getDeclaredMethods mid={:?}", mid));
-    if mid.is_null() { exc_check_clear(env); ffi::lua_pushnil(L); return 1; }
-
-    crate::jsapi::console::output_message("[lua] _methods: calling getDeclaredMethods...");
     let call_obj: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> *mut std::ffi::c_void = jfn!(env, 36);
-    let methods_arr = call_obj(env, cls, mid, std::ptr::null());
-    crate::jsapi::console::output_message(&format!("[lua] _methods: methods_arr={:?}", methods_arr));
-    if methods_arr.is_null() { exc_check_clear(env); ffi::lua_pushnil(L); return 1; }
+    let call_int: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> i32 = jfn!(env, 49);
+    let get_str: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *mut u8) -> *const std::os::raw::c_char = jfn!(env, 169);
+    let rel_str: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, *const std::os::raw::c_char) = jfn!(env, 170);
+    let get_arr_len: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32 = jfn!(env, 171);
+    let get_arr_elem: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void, i32) -> *mut std::ffi::c_void = jfn!(env, 173);
 
-    let get_len: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) -> i32 = jfn!(env, 171);
-    let len = get_len(env, methods_arr);
-    crate::jsapi::console::output_message(&format!("[lua] _methods: count={}", len));
+    let class_cls = find_cls(env, c"java/lang/Class".as_ptr() as *const i8);
+    let method_cls = find_cls(env, c"java/lang/reflect/Method".as_ptr() as *const i8);
+    if class_cls.is_null() || method_cls.is_null() { exc_check_clear(env); ffi::lua_pushnil(L); return 1; }
 
-    // 暂时返回空 table + 方法数
-    ffi::lua_createtable(L, 0, 0);
-    return 1;
-
-    // 测试: 只做 FindClass，不做反射
-    let test_cls = crate::jsapi::java::reflect::find_class_safe(env, &cls_name);
-    crate::jsapi::console::output_message(&format!("[lua] _methods: FindClass result={:?}", test_cls));
-    if !test_cls.is_null() {
-        let del: unsafe extern "C" fn(JniEnv, *mut std::ffi::c_void) = jfn!(env, JNI_DELETE_LOCAL_REF);
-        del(env, test_cls);
+    let get_declared = get_mid(env, class_cls, c"getDeclaredMethods".as_ptr() as *const i8, c"()[Ljava/lang/reflect/Method;".as_ptr() as *const i8);
+    let get_name = get_mid(env, method_cls, c"getName".as_ptr() as *const i8, c"()Ljava/lang/String;".as_ptr() as *const i8);
+    let get_mods = get_mid(env, method_cls, c"getModifiers".as_ptr() as *const i8, c"()I".as_ptr() as *const i8);
+    let get_params = get_mid(env, method_cls, c"getParameterTypes".as_ptr() as *const i8, c"()[Ljava/lang/Class;".as_ptr() as *const i8);
+    let get_ret = get_mid(env, method_cls, c"getReturnType".as_ptr() as *const i8, c"()Ljava/lang/Class;".as_ptr() as *const i8);
+    let cls_get_name = get_mid(env, class_cls, c"getName".as_ptr() as *const i8, c"()Ljava/lang/String;".as_ptr() as *const i8);
+    if get_declared.is_null() || get_name.is_null() || get_mods.is_null() || get_params.is_null() || get_ret.is_null() || cls_get_name.is_null() {
+        exc_check_clear(env);
+        ffi::lua_pushnil(L);
+        return 1;
     }
 
-    crate::jsapi::console::output_message("[lua] _methods: calling enumerate_methods_declared_only");
-    let methods = match crate::jsapi::java::reflect::enumerate_methods_declared_only(env, &cls_name) {
-        Ok(ms) => ms,
-        Err(e) => {
-            crate::jsapi::console::output_message(&format!("[lua] _methods({}) error: {}", cls_name, e));
-            ffi::lua_pushnil(L);
-            return 1;
-        }
-    };
+    let methods_arr = call_obj(env, cls, get_declared, std::ptr::null());
+    if methods_arr.is_null() { exc_check_clear(env); ffi::lua_pushnil(L); return 1; }
+    let len = get_arr_len(env, methods_arr);
 
-    ffi::lua_createtable(L, methods.len() as i32, 0);
-    for (i, m) in methods.iter().enumerate() {
+    ffi::lua_createtable(L, len, 0);
+    let mut idx = 1i64;
+
+    for i in 0..len {
+        // ART checkpoint: 每个方法间让 ART 有机会 suspend
+        exc_check_clear(env);
+
+        let method_obj = get_arr_elem(env, methods_arr, i);
+        if method_obj.is_null() { continue; }
+
+        // getName
+        let name_jstr = call_obj(env, method_obj, get_name, std::ptr::null());
+        if name_jstr.is_null() { continue; }
+        let name_c = get_str(env, name_jstr, std::ptr::null_mut());
+        if name_c.is_null() { continue; }
+        let name = std::ffi::CStr::from_ptr(name_c).to_string_lossy().into_owned();
+        rel_str(env, name_jstr, name_c);
+
+        // getModifiers
+        let modifiers = call_int(env, method_obj, get_mods, std::ptr::null());
+        let is_static = (modifiers & 0x0008) != 0;
+
+        // 构建 JNI 签名: getParameterTypes + getReturnType
+        let mut sig = String::from("(");
+        let param_arr = call_obj(env, method_obj, get_params, std::ptr::null());
+        if !param_arr.is_null() {
+            let plen = get_arr_len(env, param_arr);
+            for j in 0..plen {
+                let pcls = get_arr_elem(env, param_arr, j);
+                if pcls.is_null() { continue; }
+                let pn_jstr = call_obj(env, pcls, cls_get_name, std::ptr::null());
+                if !pn_jstr.is_null() {
+                    let pc = get_str(env, pn_jstr, std::ptr::null_mut());
+                    if !pc.is_null() {
+                        let pname = std::ffi::CStr::from_ptr(pc).to_string_lossy();
+                        sig.push_str(&crate::jsapi::java::reflect::java_type_to_jni(&pname));
+                        rel_str(env, pn_jstr, pc);
+                    }
+                }
+            }
+        }
+        sig.push(')');
+
+        let ret_cls = call_obj(env, method_obj, get_ret, std::ptr::null());
+        if !ret_cls.is_null() {
+            let rn_jstr = call_obj(env, ret_cls, cls_get_name, std::ptr::null());
+            if !rn_jstr.is_null() {
+                let rc = get_str(env, rn_jstr, std::ptr::null_mut());
+                if !rc.is_null() {
+                    let rname = std::ffi::CStr::from_ptr(rc).to_string_lossy();
+                    sig.push_str(&crate::jsapi::java::reflect::java_type_to_jni(&rname));
+                    rel_str(env, rn_jstr, rc);
+                }
+            }
+        }
+
+        // push {name=, sig=, isStatic=}
         ffi::lua_createtable(L, 0, 3);
-        let name_cs = std::ffi::CString::new(m.name.as_str()).unwrap_or_default();
+        let name_cs = std::ffi::CString::new(name.as_str()).unwrap_or_default();
         ffi::lua_pushstring(L, name_cs.as_ptr());
         ffi::lua_setfield(L, -2, c"name".as_ptr());
-        let sig_cs = std::ffi::CString::new(m.sig.as_str()).unwrap_or_default();
+        let sig_cs = std::ffi::CString::new(sig.as_str()).unwrap_or_default();
         ffi::lua_pushstring(L, sig_cs.as_ptr());
         ffi::lua_setfield(L, -2, c"sig".as_ptr());
-        ffi::lua_pushboolean(L, if m.is_static { 1 } else { 0 });
+        ffi::lua_pushboolean(L, if is_static { 1 } else { 0 });
         ffi::lua_setfield(L, -2, c"isStatic".as_ptr());
-        ffi::lua_rawseti(L, -2, (i + 1) as ffi::lua_Integer);
+        ffi::lua_rawseti(L, -2, idx);
+        idx += 1;
     }
     1
 }
