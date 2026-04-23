@@ -388,17 +388,18 @@ pub(super) unsafe fn invoke_original_jni(
     is_static: bool,
     jargs_ptr: *const std::ffi::c_void,
     quick_trampoline: u64,
+    use_blr: bool,
 ) -> u64 {
     jni_check_exc(env);
 
     let thread_id = crate::current_thread_id_u64();
 
-    // BLR fast $orig: 暂时关闭 (调试中)
-    // if quick_trampoline != 0 && hook_ffi::fast_orig_set(thread_id) == 0 {
+    // BLR fast $orig: 暂未启用 — do_orig 汇编路径需要 on-device dump 调试
+    // if use_blr && hook_ffi::fast_orig_set(thread_id) == 0 {
     //     return 0;
     // }
 
-    // Fallback: full JNI path (Layer 1/2 or fast_orig slots full)
+    // Fallback: full JNI path
     crate::jsapi::java::art_controller::set_call_original_bypass(art_method_addr);
 
     let bypass_set = if quick_trampoline != 0 {
@@ -595,6 +596,7 @@ unsafe extern "C" fn js_call_original(
         is_static,
         param_types,
         quick_trampoline,
+        use_blr,
     ) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
@@ -626,6 +628,7 @@ unsafe extern "C" fn js_call_original(
             data.is_static,
             data.param_types.clone(),
             data.quick_trampoline,
+            data.use_blr,
         )
     }; // lock released
 
@@ -666,6 +669,7 @@ unsafe extern "C" fn js_call_original(
         is_static,
         jargs_ptr,
         quick_trampoline,
+        use_blr,
     );
 
     match return_type {

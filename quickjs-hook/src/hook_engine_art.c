@@ -787,6 +787,9 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
     size_t body_size = arm64_writer_offset(&w);
     arm64_writer_clear(&w);
 
+    hook_log("[art_router] thunk body_size=%zu (alloc=%zu, use_blr=%d)",
+             body_size, thunk_alloc, use_blr);
+
     /* 回填伪 OAT header + CodeInfo (Contains(pc) 覆盖整个 thunk body) */
     backfill_fake_oat_header(thunk_mem, (uint32_t)body_size);
 
@@ -899,7 +902,7 @@ void* hook_install_art_router(void* target, uint32_t quickcode_offset,
 
     /* Allocate thunk (router code — larger than default).
      * hook_alloc_near 按 ±128MB → ±4GB → 任意 三层分配。 */
-    size_t art_thunk_alloc = 2048;
+    size_t art_thunk_alloc = 4096;
     if (!entry->thunk || entry->thunk_alloc < art_thunk_alloc) {
         entry->thunk = hook_alloc_near(art_thunk_alloc, target);
         entry->thunk_alloc = art_thunk_alloc;

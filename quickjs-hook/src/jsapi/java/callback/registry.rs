@@ -47,6 +47,9 @@ pub(super) struct JavaHookData {
     /// callback skip fallback 用它直接调原始方法，避免走 JNI re-entry 路径。
     /// 0 = 无 trampoline（非 compiled 方法，走 Layer 1/2 路由）。
     pub(super) quick_trampoline: u64,
+    /// true = thunk 用 BLR (post-callback dispatch), $orig 可设 fast_orig 标志。
+    /// false = thunk 用 BR, $orig 必须走 JNI 路径。
+    pub(super) use_blr: bool,
 }
 
 unsafe impl Send for JavaHookData {}

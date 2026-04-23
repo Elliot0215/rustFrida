@@ -196,8 +196,9 @@ pub(super) unsafe fn update_original_method_flags_for_hook(
     ));
 }
 
-/// 返回 (per_method_hook_target, quick_trampoline)
+/// 返回 (per_method_hook_target, quick_trampoline, use_blr)
 /// quick_trampoline: Layer 3 的 art_router trampoline 地址（用于 callback skip fallback）
+/// use_blr: true = thunk 用 BLR，$orig 可走 fast path（不调 JNI）
 pub(super) unsafe fn install_per_method_router_hook(
     has_independent_code: bool,
     original_entry_point: u64,
@@ -206,7 +207,7 @@ pub(super) unsafe fn install_per_method_router_hook(
     env: JniEnv,
     art_method: u64,
     _force_interpreter_route: bool,
-) -> Result<(Option<u64>, u64), String> {
+) -> Result<(Option<u64>, u64, bool), String> {
     if has_independent_code {
         // Layer 3: inline hook quickCode 作为快速路径 (直接调用场景)
         let mut hooked_target: *mut std::ffi::c_void = std::ptr::null_mut();
@@ -221,7 +222,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             &mut hooked_target,
             1, // skip_resolve
             0, // no hint — replacement is kAccNative, ART handles it
-            0, // use_blr=0: Layer 3 BLR 暂时关闭 (调试中)
+            0, // use_blr=0: BLR do_orig 路径需调试，暂用 BR
         );
 
         if trampoline.is_null() {
@@ -249,7 +250,7 @@ pub(super) unsafe fn install_per_method_router_hook(
             hooked_bytes[0], hooked_bytes[1], hooked_bytes[2], hooked_bytes[3]
         ));
 
-        Ok((Some(actual_hook_target), trampoline as u64))
+        Ok((Some(actual_hook_target), trampoline as u64, true))
     } else {
         // 非 compiled 方法: entry_point 是共享 stub (nterp/interpreter_bridge/resolution)
         // 如果 entry_point 不是 Layer 1 已 hook 的 interpreter_bridge/resolution_trampoline,
@@ -279,6 +280,6 @@ pub(super) unsafe fn install_per_method_router_hook(
                 original_entry_point
             ));
         }
-        Ok((None, 0))
+        Ok((None, 0, false))
     }
 }

@@ -111,6 +111,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         param_types,
         class_global_ref,
         quick_trampoline,
+        use_blr,
     ) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
@@ -119,7 +120,6 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         let registry = match guard.as_ref() {
             Some(r) => r,
             None => {
-                // Registry taken during cleanup — zero x0 to prevent returning JNIEnv* as object
                 (*ctx_ptr).x[0] = 0;
                 return;
             }
@@ -127,7 +127,6 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         let hook_data = match registry.get(&art_method_addr) {
             Some(d) => d,
             None => {
-                // Hook data removed during cleanup — zero x0
                 (*ctx_ptr).x[0] = 0;
                 return;
             }
@@ -142,6 +141,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             hook_data.param_types.clone(),
             hook_data.class_global_ref,
             hook_data.quick_trampoline,
+            hook_data.use_blr,
         )
     }; // lock released
 
@@ -292,7 +292,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             };
             let ret = invoke_original_jni(
                 env, art_method_addr, class_global_ref,
-                hook_ctx.x[1], return_type, is_static, jargs_ptr, quick_trampoline,
+                hook_ctx.x[1], return_type, is_static, jargs_ptr, quick_trampoline, false,
             );
             if return_type != b'V' {
                 (*ctx_ptr).x[0] = ret;
@@ -565,6 +565,7 @@ pub unsafe extern "C" fn java_hook_dispatch_from_quick(
                 true, // 强制 is_static
                 jargs_ptr,
                 quick_trampoline,
+                false, // dispatch_from_quick 路径不用 BLR fast orig
             );
             if return_type != b'V' {
                 (*ctx_ptr).x[0] = ret_raw;

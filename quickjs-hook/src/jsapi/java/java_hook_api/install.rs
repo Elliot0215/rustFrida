@@ -224,7 +224,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     }
 
     // B5: Layer 3 per-method router hook (对标 Frida ArtQuickCodeInterceptor)
-    let (per_method_hook_target, quick_trampoline) = match install_per_method_router_hook(
+    let (per_method_hook_target, quick_trampoline, use_blr) = match install_per_method_router_hook(
         has_independent_code,
         original_entry_point,
         &bridge,
@@ -263,6 +263,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                 param_types: parse_jni_param_types(&actual_sig),
                 class_name: class_name.clone(),
                 quick_trampoline,
+                use_blr,
             },
         );
     });
