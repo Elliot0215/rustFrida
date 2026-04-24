@@ -4,6 +4,7 @@ use crate::jsapi::java::callback::{
     build_jargs_from_registers, extract_jni_arg, is_floating_point_type,
     invoke_original_jni, InFlightJavaHookGuard, JavaHookCallbackScope,
 };
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
@@ -250,11 +251,34 @@ impl ArtTransitionBridge {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CurrentQuickTransition {
+    thread: *mut std::ffi::c_void,
+    bridge: ArtTransitionBridge,
+    diag_slot: usize,
+}
+
+std::thread_local! {
+    static CURRENT_QUICK_TRANSITION: RefCell<Option<CurrentQuickTransition>> = const { RefCell::new(None) };
+}
+
+pub(crate) unsafe fn with_current_quick_runnable<R>(
+    f: impl FnOnce(*mut std::ffi::c_void) -> R,
+) -> Option<R> {
+    let current = CURRENT_QUICK_TRANSITION.with(|c| *c.borrow());
+    let current = current?;
+    current.bridge.end(current.thread, current.diag_slot);
+    let result = f(current.thread);
+    current.bridge.start(current.thread);
+    Some(result)
+}
+
 struct ArtNativeTransition {
     thread: *mut std::ffi::c_void,
     bridge: ArtTransitionBridge,
     diag_slot: usize,
     managed_stack_top: Option<ManagedStackTopGuard>,
+    previous_transition: Option<CurrentQuickTransition>,
 }
 
 impl ArtNativeTransition {
@@ -293,7 +317,9 @@ impl ArtNativeTransition {
 
         bridge.start(thread);
         super::record_native_transition_enter();
-        Some(Self { thread, bridge, diag_slot, managed_stack_top })
+        let current = CurrentQuickTransition { thread, bridge, diag_slot };
+        let previous_transition = CURRENT_QUICK_TRANSITION.with(|c| c.replace(Some(current)));
+        Some(Self { thread, bridge, diag_slot, managed_stack_top, previous_transition })
     }
 }
 
@@ -301,6 +327,9 @@ impl Drop for ArtNativeTransition {
     fn drop(&mut self) {
         quick_diag_stage(self.diag_slot, QUICK_STAGE_DROP_BEGIN);
         QUICK_DROP_BEGIN.fetch_add(1, Ordering::Relaxed);
+        CURRENT_QUICK_TRANSITION.with(|c| {
+            c.replace(self.previous_transition);
+        });
         unsafe {
             self.bridge.end(self.thread, self.diag_slot);
         }
@@ -737,7 +766,11 @@ pub unsafe extern "C" fn lua_hook_dispatch_from_quick(
         local_refs: &mut local_refs,
     };
 
-    let _art_native = ArtNativeTransition::enter_from_quick(ctx_ptr, quick_diag.slot);
+    let art_native = ArtNativeTransition::enter_from_quick(ctx_ptr, quick_diag.slot);
+    if art_native.is_some() {
+        let env = crate::jsapi::java::jni_core::get_thread_env().unwrap_or(std::ptr::null_mut());
+        super::api::set_current_raw_mirror_env(env as *const std::ffi::c_void);
+    }
     quick_diag.stage(QUICK_STAGE_NATIVE_READY);
 
     let L = tls.state.as_ptr();

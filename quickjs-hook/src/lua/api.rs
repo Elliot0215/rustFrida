@@ -1,24 +1,44 @@
 use super::ffi;
 use super::state::LuaState;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-/// 当前 callback 线程的 JNIEnv (TLS-like, 用于 jstr 等 API)
+const REF_KIND_NONE: u8 = 0;
+const REF_KIND_JNI_LOCAL: u8 = 1;
+const REF_KIND_RAW_MIRROR: u8 = 2;
+static CALLBACK_LOG_MARK: AtomicU64 = AtomicU64::new(0);
+
+// 当前 callback 线程的 JNIEnv 和引用形态 (JNI local ref / quick raw mirror)。
 std::thread_local! {
     static CURRENT_ENV: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CURRENT_REF_KIND: std::cell::Cell<u8> = const { std::cell::Cell::new(REF_KIND_NONE) };
     static FAST_ORIG_REQUESTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static QUICK_ORIG_RESULT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn set_current_env(env: *const std::ffi::c_void) {
     CURRENT_ENV.with(|c| c.set(env as usize));
+    CURRENT_REF_KIND.with(|c| c.set(if env.is_null() { REF_KIND_NONE } else { REF_KIND_JNI_LOCAL }));
+}
+
+pub(crate) fn set_current_raw_mirror_env(env: *const std::ffi::c_void) {
+    CURRENT_ENV.with(|c| c.set(env as usize));
+    CURRENT_REF_KIND.with(|c| c.set(if env.is_null() { REF_KIND_NONE } else { REF_KIND_RAW_MIRROR }));
 }
 
 pub(crate) fn clear_current_env() {
     CURRENT_ENV.with(|c| c.set(0));
+    CURRENT_REF_KIND.with(|c| c.set(REF_KIND_NONE));
 }
 
 pub(crate) fn get_current_env() -> *const std::ffi::c_void {
     CURRENT_ENV.with(|c| c.get() as *const std::ffi::c_void)
+}
+
+fn get_current_ref_context() -> (*const std::ffi::c_void, u8) {
+    let env = CURRENT_ENV.with(|c| c.get() as *const std::ffi::c_void);
+    let kind = CURRENT_REF_KIND.with(|c| c.get());
+    (env, kind)
 }
 
 pub(crate) fn clear_fast_orig_requested() {
@@ -55,7 +75,14 @@ pub(crate) fn take_quick_orig_result() -> Option<u64> {
 
 pub(crate) unsafe fn register_lua_apis(state: &LuaState) {
     state.register_fn("print", Some(lua_print));
+    state.register_fn("jcall", Some(lua_jcall));
     state.register_fn("jstr", Some(lua_jstr));
+    state.register_fn("callback_count", Some(lua_callback_count));
+    state.register_fn("callback_log_mark", Some(lua_callback_log_mark));
+}
+
+pub(crate) fn reset_callback_log_mark() {
+    CALLBACK_LOG_MARK.store(0, Ordering::Release);
 }
 
 #[inline]
@@ -134,12 +161,22 @@ unsafe extern "C" fn lua_jstr(L: *mut ffi::lua_State) -> std::os::raw::c_int {
         ffi::lua_pushstring(L, cs.as_ptr());
         return 1;
     }
-    let env = get_current_env();
-    if env.is_null() {
+    let (env, ref_kind) = get_current_ref_context();
+    if env.is_null() || ref_kind == REF_KIND_NONE {
         ffi::lua_pushnil(L);
         return 1;
     }
-    match jni_tostring(ptr, env) {
+    let result = match local_ref_from_lua_obj(env, ptr, ref_kind) {
+        Some((local, delete_local)) => {
+            let result = jni_tostring(local as u64, env);
+            if delete_local {
+                delete_local_ref(env, local);
+            }
+            result
+        }
+        None => None,
+    };
+    match result {
         Some(s) => {
             let cs = std::ffi::CString::new(s).unwrap_or_default();
             ffi::lua_pushstring(L, cs.as_ptr());
@@ -147,6 +184,190 @@ unsafe extern "C" fn lua_jstr(L: *mut ffi::lua_State) -> std::os::raw::c_int {
         None => ffi::lua_pushnil(L),
     }
     1
+}
+
+/// jcall(handle, receiver, ...) — direct ART quick-code call from a quick Lua callback.
+///
+/// Handles are created on the JS cold path with Java.luaFastMethod().
+unsafe extern "C" fn lua_jcall(L: *mut ffi::lua_State) -> std::os::raw::c_int {
+    if ffi::lua_gettop(L) < 1 || ffi::lua_type(L, 1) != ffi::LUA_TNUMBER as i32 {
+        ffi::lua_pushnil(L);
+        return 1;
+    }
+    let handle = ffi::lua_tointeger_ex(L, 1) as u64;
+    let Some(method) = crate::jsapi::java::java_lua_fast_api::get_lua_fast_method(handle) else {
+        ffi::lua_pushnil(L);
+        return 1;
+    };
+
+    let mut receiver = 0u64;
+    let mut first_arg = 2i32;
+    if !method.is_static {
+        if ffi::lua_gettop(L) < 2 || ffi::lua_type(L, 2) != ffi::LUA_TLIGHTUSERDATA as i32 {
+            ffi::lua_pushnil(L);
+            return 1;
+        }
+        receiver = ffi::lua_touserdata(L, 2) as u64;
+        first_arg = 3;
+    }
+
+    if ffi::lua_gettop(L) < first_arg + method.param_types.len() as i32 - 1 {
+        ffi::lua_pushnil(L);
+        return 1;
+    }
+    let mut args = Vec::with_capacity(method.param_types.len());
+    for (i, sig) in method.param_types.iter().enumerate() {
+        args.push(lua_to_jvalue(
+            L,
+            first_arg + i as i32,
+            Some(sig.as_str()),
+            std::ptr::null_mut(),
+        ));
+    }
+
+    match crate::jsapi::java::java_lua_fast_api::invoke_lua_fast_method(&method, receiver, &args) {
+        Ok(raw) => push_return_value(L, raw, method.return_type, std::ptr::null_mut()),
+        Err(_) => ffi::lua_pushnil(L),
+    }
+    1
+}
+
+unsafe extern "C" fn lua_callback_count(L: *mut ffi::lua_State) -> std::os::raw::c_int {
+    let (total, _, _, _, _, _, _, _) = super::callback_stats();
+    ffi::lua_pushinteger(L, total as ffi::lua_Integer);
+    1
+}
+
+unsafe extern "C" fn lua_callback_log_mark(L: *mut ffi::lua_State) -> std::os::raw::c_int {
+    let step = if ffi::lua_gettop(L) >= 1 && ffi::lua_type(L, 1) == ffi::LUA_TNUMBER as i32 {
+        ffi::lua_tointeger_ex(L, 1).max(1) as u64
+    } else {
+        10000
+    };
+    let (total, _, _, _, _, _, _, _) = super::callback_stats();
+    let mark = (total / step) * step;
+    if mark == 0 {
+        ffi::lua_pushnil(L);
+        return 1;
+    }
+    let mut prev = CALLBACK_LOG_MARK.load(Ordering::Acquire);
+    while mark > prev {
+        match CALLBACK_LOG_MARK.compare_exchange(prev, mark, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                ffi::lua_pushinteger(L, mark as ffi::lua_Integer);
+                return 1;
+            }
+            Err(v) => prev = v,
+        }
+    }
+    ffi::lua_pushnil(L);
+    1
+}
+
+unsafe fn local_ref_from_lua_obj(
+    env: *const std::ffi::c_void,
+    obj: u64,
+    ref_kind: u8,
+) -> Option<(*mut std::ffi::c_void, bool)> {
+    if obj == 0 || env.is_null() {
+        return None;
+    }
+    match ref_kind {
+        REF_KIND_JNI_LOCAL => {
+            let local = new_jni_local_ref(env, obj as *mut std::ffi::c_void);
+            if local.is_null() {
+                None
+            } else {
+                Some((local, true))
+            }
+        }
+        REF_KIND_RAW_MIRROR => {
+            let local = raw_mirror_to_local_ref(env, obj as *mut std::ffi::c_void);
+            if local.is_null() {
+                None
+            } else {
+                Some((local, true))
+            }
+        }
+        _ => None,
+    }
+}
+
+unsafe fn new_jni_local_ref(
+    env: *const std::ffi::c_void,
+    obj: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    if env.is_null() || obj.is_null() {
+        return std::ptr::null_mut();
+    }
+    let vtable = *(env as *const *const usize);
+    type NewLocalRefFn =
+        unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    let new_local_ref: NewLocalRefFn = std::mem::transmute(*vtable.add(25));
+    let local = new_local_ref(env, obj);
+    if jni_exception_check_and_clear(env) {
+        return std::ptr::null_mut();
+    }
+    local
+}
+
+unsafe fn raw_mirror_to_local_ref(
+    env: *const std::ffi::c_void,
+    raw: *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void {
+    if env.is_null() || raw.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    type ArtNewLocalRefFn =
+        unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    static ART_NEW_LOCAL_REF: OnceLock<Option<ArtNewLocalRefFn>> = OnceLock::new();
+
+    let local = if let Some(add_ref) = *ART_NEW_LOCAL_REF.get_or_init(|| {
+        let sym = crate::jsapi::module::libart_dlsym(
+            "_ZN3art9JNIEnvExt11NewLocalRefEPNS_6mirror6ObjectE",
+        );
+        if sym.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute(sym))
+        }
+    }) {
+        add_ref(env as *mut std::ffi::c_void, raw)
+    } else {
+        std::ptr::null_mut()
+    };
+    if jni_exception_check_and_clear(env) {
+        return std::ptr::null_mut();
+    }
+    local
+}
+
+unsafe fn delete_local_ref(env: *const std::ffi::c_void, obj: *mut std::ffi::c_void) {
+    if env.is_null() || obj.is_null() {
+        return;
+    }
+    let vtable = *(env as *const *const usize);
+    type DeleteLocalRefFn = unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void);
+    let del_local: DeleteLocalRefFn = std::mem::transmute(*vtable.add(23));
+    del_local(env, obj);
+}
+
+unsafe fn jni_exception_check_and_clear(env: *const std::ffi::c_void) -> bool {
+    if env.is_null() {
+        return false;
+    }
+    let vtable = *(env as *const *const usize);
+    type ExceptionCheckFn = unsafe extern "C" fn(*const std::ffi::c_void) -> u8;
+    type ExceptionClearFn = unsafe extern "C" fn(*const std::ffi::c_void);
+    let exc_check: ExceptionCheckFn = std::mem::transmute(*vtable.add(228));
+    let exc_clear: ExceptionClearFn = std::mem::transmute(*vtable.add(17));
+    if exc_check(env) != 0 {
+        exc_clear(env);
+        true
+    } else {
+        false
+    }
 }
 
 /// 通过 JNI 调用 Object.toString()
@@ -160,10 +381,6 @@ unsafe fn jni_tostring(obj: u64, env: *const std::ffi::c_void) -> Option<String>
     type IsInstanceOfFn = unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> u8;
     // FindClass (vtable index 6)
     type FindClassFn = unsafe extern "C" fn(*const std::ffi::c_void, *const std::os::raw::c_char) -> *mut std::ffi::c_void;
-    // GetMethodID (vtable index 33)
-    type GetMethodIdFn = unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void, *const std::os::raw::c_char, *const std::os::raw::c_char) -> *mut std::ffi::c_void;
-    // CallObjectMethodA (vtable index 36)
-    type CallObjectMethodAFn = unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void) -> *mut std::ffi::c_void;
     // GetStringUTFChars (vtable index 169)
     type GetStringUtfCharsFn = unsafe extern "C" fn(*const std::ffi::c_void, *mut std::ffi::c_void, *mut u8) -> *const std::os::raw::c_char;
     // ReleaseStringUTFChars (vtable index 170)

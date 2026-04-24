@@ -109,6 +109,7 @@ pub(crate) fn reset_callback_stats() {
     LUA_NATIVE_TRANSITION_ENTER.store(0, Ordering::Release);
     LUA_NATIVE_TRANSITION_LEAVE.store(0, Ordering::Release);
     LUA_NATIVE_TRANSITION_FAIL.store(0, Ordering::Release);
+    api::reset_callback_log_mark();
     callback::reset_quick_diag();
 }
 

@@ -571,6 +571,187 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
     output_verbose("[jit cache] JIT 缓存清空跳过: 无法定位 JitCodeCache 指针");
 }
 
+/// Best-effort Runtime -> Jit* discovery.
+///
+/// ART does not export Runtime::GetJit() on all builds. We locate Runtime from
+/// JavaVMExt, then scan plausible Runtime fields for a Jit* by validating it
+/// with Jit::GetCodeCache().
+pub(super) unsafe fn find_jit_instance() -> Option<u64> {
+    let (runtime, java_vm_off) = match find_runtime_java_vm() {
+        Some(v) => v,
+        None => {
+            output_verbose("[jit] unable to locate Runtime/java_vm_");
+            return None;
+        }
+    };
+    let instance_ptr = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime9instance_E");
+
+    let runtime_addr = if !instance_ptr.is_null() {
+        let rt = *(instance_ptr as *const u64);
+        let rt_stripped = rt & PAC_STRIP_MASK;
+        if rt_stripped != 0 { rt_stripped } else { runtime }
+    } else {
+        runtime
+    };
+
+    let get_code_cache_ptr = crate::jsapi::module::libart_dlsym("_ZNK3art3jit3Jit12GetCodeCacheEv");
+    type GetCodeCacheFn = unsafe extern "C" fn(this: u64) -> u64;
+    let get_code_cache: Option<GetCodeCacheFn> = if get_code_cache_ptr.is_null() {
+        output_verbose("[jit] Jit::GetCodeCache symbol not found, falling back to Jit.code_cache_ field");
+        None
+    } else {
+        Some(std::mem::transmute(get_code_cache_ptr))
+    };
+
+    refresh_mem_regions();
+
+    // AOSP Runtime layout around these fields:
+    //   std::unique_ptr<JavaVMExt> java_vm_;
+    //   std::unique_ptr<jit::Jit> jit_;
+    //   std::unique_ptr<jit::JitCodeCache> jit_code_cache_;
+    //   std::unique_ptr<jit::JitOptions> jit_options_;
+    //
+    // art::jit::Jit has no virtual table; its first field is code_cache_.
+    // Therefore validating candidates as if the first word were a vtable
+    // rejects the real Jit*. Use the java_vm_ anchor first and cross-check
+    // against Runtime::jit_code_cache_.
+    let direct_jit_off = java_vm_off + 8;
+    let direct_code_cache_off = java_vm_off + 16;
+    let direct_jit = safe_read_u64(runtime_addr + direct_jit_off as u64) & PAC_STRIP_MASK;
+    let runtime_code_cache =
+        safe_read_u64(runtime_addr + direct_code_cache_off as u64) & PAC_STRIP_MASK;
+    if direct_jit != 0 && direct_jit > 0x7000_0000 {
+        let code_cache = read_jit_code_cache_candidate(direct_jit, runtime_code_cache, get_code_cache);
+        if code_cache != 0 && code_cache == runtime_code_cache {
+            output_verbose(&format!(
+                "[jit] found Jit*={:#x}, JitCodeCache={:#x} (Runtime+{:#x}, direct)",
+                direct_jit, code_cache, direct_jit_off
+            ));
+            return Some(direct_jit);
+        }
+        output_verbose(&format!(
+            "[jit] direct candidate rejected: Jit*={:#x}, GetCodeCache={:#x}, Runtime.jit_code_cache={:#x}",
+            direct_jit, code_cache, runtime_code_cache
+        ));
+    }
+
+    for offset in (384usize..4096usize).step_by(8) {
+        let candidate = safe_read_u64(runtime_addr + offset as u64) & PAC_STRIP_MASK;
+        if candidate == 0 || candidate < 0x7000_0000 {
+            continue;
+        }
+        let code_cache = read_jit_code_cache_candidate(candidate, runtime_code_cache, get_code_cache);
+        if code_cache != 0 && code_cache == runtime_code_cache {
+            output_verbose(&format!(
+                "[jit] found Jit*={:#x}, JitCodeCache={:#x} (Runtime+{:#x})",
+                candidate, code_cache, offset
+            ));
+            return Some(candidate);
+        }
+    }
+
+    output_verbose("[jit] Jit* not found by Runtime scan");
+    None
+}
+
+unsafe fn read_jit_code_cache_candidate(
+    jit: u64,
+    expected_code_cache: u64,
+    get_code_cache: Option<unsafe extern "C" fn(this: u64) -> u64>,
+) -> u64 {
+    if jit == 0 {
+        return 0;
+    }
+    if let Some(f) = get_code_cache {
+        let code_cache = f(jit) & PAC_STRIP_MASK;
+        if code_cache != 0 {
+            return code_cache;
+        }
+    }
+
+    // Device builds may give art::jit::Jit a vtable/object header even though
+    // AOSP exposes GetCodeCache() as an inline field accessor. Use
+    // Runtime.jit_code_cache_ as the exact anchor and find the field inside
+    // the Jit object.
+    for off in (0usize..128usize).step_by(8) {
+        let val = safe_read_u64(jit + off as u64) & PAC_STRIP_MASK;
+        if val != 0 && val == expected_code_cache {
+            return val;
+        }
+    }
+    safe_read_u64(jit) & PAC_STRIP_MASK
+}
+
+pub(super) struct JitRuntimeInfo {
+    pub(super) runtime: u64,
+    pub(super) java_vm_offset: usize,
+    pub(super) jit_offset: usize,
+    pub(super) jit_code_cache_offset: usize,
+    pub(super) direct_jit: u64,
+    pub(super) runtime_jit_code_cache: u64,
+    pub(super) direct_get_code_cache: u64,
+    pub(super) found_jit: u64,
+    pub(super) message: String,
+}
+
+pub(super) unsafe fn probe_jit_runtime_info() -> Option<JitRuntimeInfo> {
+    let (runtime, java_vm_off) = find_runtime_java_vm()?;
+    let instance_ptr = crate::jsapi::module::libart_dlsym("_ZN3art7Runtime9instance_E");
+    let runtime_addr = if !instance_ptr.is_null() {
+        let rt = *(instance_ptr as *const u64);
+        let rt_stripped = rt & PAC_STRIP_MASK;
+        if rt_stripped != 0 { rt_stripped } else { runtime }
+    } else {
+        runtime
+    };
+
+    refresh_mem_regions();
+    let jit_off = java_vm_off + 8;
+    let jit_code_cache_off = java_vm_off + 16;
+    let direct_jit = safe_read_u64(runtime_addr + jit_off as u64) & PAC_STRIP_MASK;
+    let runtime_jit_code_cache =
+        safe_read_u64(runtime_addr + jit_code_cache_off as u64) & PAC_STRIP_MASK;
+
+    let get_code_cache_ptr = crate::jsapi::module::libart_dlsym("_ZNK3art3jit3Jit12GetCodeCacheEv");
+    let mut direct_get_code_cache = 0;
+    if direct_jit != 0 && direct_jit > 0x7000_0000 {
+        type GetCodeCacheFn = unsafe extern "C" fn(this: u64) -> u64;
+        let get_code_cache: Option<GetCodeCacheFn> = if get_code_cache_ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute(get_code_cache_ptr))
+        };
+        direct_get_code_cache =
+            read_jit_code_cache_candidate(direct_jit, runtime_jit_code_cache, get_code_cache);
+    }
+
+    let found_jit = find_jit_instance().unwrap_or(0);
+    let message = if direct_jit == 0 {
+        "Runtime.jit_ is null".to_string()
+    } else if direct_get_code_cache != runtime_jit_code_cache {
+        format!(
+            "direct Jit* rejected: GetCodeCache={:#x}, Runtime.jit_code_cache_={:#x}",
+            direct_get_code_cache, runtime_jit_code_cache
+        )
+    } else if found_jit != 0 {
+        "Jit* found".to_string()
+    } else {
+        "Jit* not found".to_string()
+    };
+
+    Some(JitRuntimeInfo {
+        runtime: runtime_addr,
+        java_vm_offset: java_vm_off,
+        jit_offset: jit_off,
+        jit_code_cache_offset: jit_code_cache_off,
+        direct_jit,
+        runtime_jit_code_cache,
+        direct_get_code_cache,
+        found_jit,
+        message,
+    })
+}
+
 /// 查找 GC ConcurrentCopying::CopyingPhase 或 MarkingPhase 符号
 ///
 /// API > 28: CopyingPhase

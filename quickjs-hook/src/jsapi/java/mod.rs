@@ -40,6 +40,7 @@ mod java_choose_api;
 mod java_field_api;
 pub(crate) mod java_hook_api;
 mod java_inspect_api;
+pub(crate) mod java_lua_fast_api;
 mod java_method_list_api;
 pub(crate) mod jni_core;
 pub(crate) mod reflect;
@@ -73,6 +74,7 @@ use java_choose_api::*;
 use java_field_api::*;
 use java_hook_api::*;
 use java_inspect_api::*;
+use java_lua_fast_api::*;
 use java_method_list_api::*;
 use jni_core::*;
 use reflect::*;
@@ -935,6 +937,9 @@ pub fn register_java_api(ctx: &JSContext) {
 
         // 检测面测试 API
         add_cfunction_to_object(ctx_ptr, java_obj, "_inspectArtMethod", js_java_inspect_art_method, 3);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_jitInfo", js_java_jit_info, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "compileMethod", js_java_compile_method, 4);
+        add_cfunction_to_object(ctx_ptr, java_obj, "luaFastMethod", js_java_lua_fast_method, 3);
         add_cfunction_to_object(
             ctx_ptr,
             java_obj,
