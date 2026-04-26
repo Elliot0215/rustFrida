@@ -188,10 +188,6 @@ impl DexIrBuilder {
         self.instrs.push(IrInstr::MoveFrom16 { dst, src, kind });
     }
 
-    pub(super) fn if_ge(&mut self, left: u8, right: u8, target: DexLabel) {
-        self.instrs.push(IrInstr::IfGe { left, right, target });
-    }
-
     pub(super) fn if_cmp(&mut self, op: IfCmpOp, left: u8, right: u8, target: DexLabel) {
         self.instrs.push(IrInstr::IfCmp {
             op,
@@ -400,7 +396,6 @@ enum IrInstr {
     Const16 { dst: u8, literal: i16 },
     ConstString { dst: u8, value: String },
     MoveFrom16 { dst: u8, src: u16, kind: ValueKind },
-    IfGe { left: u8, right: u8, target: DexLabel },
     IfCmp {
         op: IfCmpOp,
         left: u8,
@@ -492,7 +487,7 @@ impl IrInstr {
             IrInstr::Const16 { .. } => 2,
             IrInstr::ConstString { .. } => 2,
             IrInstr::MoveFrom16 { .. } => 2,
-            IrInstr::IfGe { .. } | IrInstr::IfCmp { .. } => 2,
+            IrInstr::IfCmp { .. } => 2,
             IrInstr::IfEqz { .. } | IrInstr::IfNez { .. } => 2,
             IrInstr::Goto16 { .. } => 2,
             IrInstr::NewInstance { .. } => 2,
@@ -553,12 +548,6 @@ impl IrInstr {
                 };
                 code.raw(opcode | ((dst as u16) << 8));
                 code.raw(src);
-            }
-            IrInstr::IfGe { left, right, target } => {
-                require_nibble(left, "if-ge left")?;
-                require_nibble(right, "if-ge right")?;
-                code.raw(0x0035 | ((left as u16) << 8) | ((right as u16) << 12));
-                code.raw(branch_offset(offset, target, labels, "if-ge")? as u16);
             }
             IrInstr::IfCmp {
                 op,
@@ -1645,29 +1634,6 @@ fn emit_new_object(
     Ok(ctor)
 }
 
-fn emit_new_loop(
-    ir: &mut DexIrBuilder,
-    class_name: &str,
-    iterations: u16,
-    sink: &FieldRef,
-) -> Result<MethodRef, String> {
-    let new_type = java_class_to_descriptor(class_name)?;
-    let ctor = MethodRef::new(new_type.clone(), "<init>", "V", Vec::new());
-    let loop_label = ir.new_label();
-    let done_label = ir.new_label();
-    ir.const4(REG_RESULT, 0);
-    ir.const16(REG_LOOP_LIMIT, iterations as i16);
-    ir.bind(loop_label)?;
-    ir.if_ge(REG_RESULT, REG_LOOP_LIMIT, done_label);
-    ir.new_instance(REG_LAST_OBJECT, new_type);
-    ir.invoke_direct(vec![REG_LAST_OBJECT], ctor.clone());
-    ir.sput_object(REG_LAST_OBJECT, sink.clone());
-    ir.add_int_lit8(REG_RESULT, REG_RESULT, 1);
-    ir.goto16(loop_label);
-    ir.bind(done_label)?;
-    Ok(ctor)
-}
-
 fn emit_discard_result(ir: &mut DexIrBuilder, return_type: &str) -> Result<(), String> {
     match return_type {
         "V" => {}
@@ -2507,8 +2473,7 @@ fn statements_max_invoke_words(stmts: &[DslStmt]) -> Result<u16, String> {
             DslStmt::FieldWrite { stmt, .. } => {
                 stmt.value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0)
             }
-            DslStmt::NewLoop { .. }
-            | DslStmt::ReturnOrig => 0,
+            DslStmt::ReturnOrig => 0,
             DslStmt::ReturnValue { value } => value.as_ref().map(value_max_invoke_words).transpose()?.unwrap_or(0),
         };
         max_words = max_words.max(words);
@@ -2729,13 +2694,6 @@ fn emit_statement(
             )?;
             Ok(false)
         }
-        DslStmt::NewLoop {
-            class_name,
-            iterations,
-        } => {
-            emit_new_loop(ir, class_name, *iterations, emit_ctx.sink)?;
-            Ok(false)
-        }
         DslStmt::Call(stmt) => {
             emit_call(ir, stmt, emit_ctx.layout, emit_ctx.dsl_ctx)?;
             Ok(false)
@@ -2940,7 +2898,6 @@ enum DslStmt {
         array_type_name: String,
         size: DslValue,
     },
-    NewLoop { class_name: String, iterations: u16 },
     Call(DslCallStmt),
     Cast {
         value: DslValue,
@@ -3056,6 +3013,20 @@ impl DslValue {
                 stmt: *stmt,
                 is_static,
             }),
+            DslValue::Cast { value, class_name } => Some(DslStmt::Cast {
+                value: *value,
+                class_name,
+            }),
+            DslValue::ArrayLength(array) => Some(DslStmt::ArrayLength { array: *array }),
+            DslValue::ArrayGet {
+                array,
+                index,
+                type_name,
+            } => Some(DslStmt::ArrayGet {
+                array: *array,
+                index: *index,
+                type_name,
+            }),
             _ => None,
         }
     }
@@ -3143,8 +3114,8 @@ impl<'a> DslParser<'a> {
             self.expect_char(';')?;
             return Ok(stmt);
         }
-        if self.peek() == Some('.') {
-            let value = self.parse_js_member_value(name)?;
+        if self.peek() == Some('.') || self.peek() == Some('[') || self.peek_ident("as") {
+            let value = self.parse_value_from_ident(name)?;
             self.skip_ws();
             if self.peek() == Some('=') {
                 self.expect_char('=')?;
@@ -3157,7 +3128,17 @@ impl<'a> DslParser<'a> {
                         stmt.value = Some(rhs);
                         Ok(DslStmt::FieldWrite { stmt, is_static })
                     }
-                    _ => Err(self.err("only fields can be assigned")),
+                    DslValue::ArrayGet {
+                        array,
+                        index,
+                        type_name,
+                    } => Ok(DslStmt::ArrayPut {
+                        array: *array,
+                        index: *index,
+                        type_name,
+                        value: rhs,
+                    }),
+                    _ => Err(self.err("only fields and array elements can be assigned")),
                 };
             }
             self.expect_char(';')?;
@@ -3165,78 +3146,7 @@ impl<'a> DslParser<'a> {
                 self.err("only method calls and field reads can be used as expression statements")
             });
         }
-        self.expect_char('(')?;
-        let stmt = match name.as_str() {
-            "newArray" => {
-                let array_type_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let size = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                DslStmt::NewArray {
-                    array_type_name,
-                    size,
-                }
-            }
-            "newLoop" => {
-                self.skip_ws();
-                let class_name = self.parse_string()?;
-                self.skip_ws();
-                self.expect_char(',')?;
-                self.skip_ws();
-                let iterations = self.parse_u16()?;
-                self.skip_ws();
-                self.expect_char(')')?;
-                DslStmt::NewLoop {
-                    class_name,
-                    iterations,
-                }
-            }
-            "cast" => {
-                let value = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                DslStmt::Cast { value, class_name }
-            }
-            "arrayLength" => {
-                let array = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                DslStmt::ArrayLength { array }
-            }
-            "aget" => {
-                let array = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let index = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                DslStmt::ArrayGet {
-                    array,
-                    index,
-                    type_name,
-                }
-            }
-            "aput" => {
-                let array = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let index = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(',')?;
-                let value = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                DslStmt::ArrayPut {
-                    array,
-                    index,
-                    type_name,
-                    value,
-                }
-            }
-            other => return Err(self.err(&format!("unknown managed DSL statement '{}'", other))),
-        };
-        self.skip_ws();
-        self.expect_char(';')?;
-        Ok(stmt)
+        Err(self.err(&format!("unknown managed DSL statement '{}'", name)))
     }
 
     fn parse_js_let_statement(&mut self) -> Result<DslStmt, String> {
@@ -3263,6 +3173,15 @@ impl<'a> DslParser<'a> {
         self.skip_ws();
         self.expect_char('(')?;
         self.skip_ws();
+        if class_name.ends_with("[]") {
+            let size = self.parse_value_arg()?;
+            self.skip_ws();
+            self.expect_char(')')?;
+            return Ok(DslStmt::NewArray {
+                array_type_name: class_name,
+                size,
+            });
+        }
         let (ctor_sig, args) = if self.peek() == Some(')') {
             (None, Vec::new())
         } else {
@@ -3464,27 +3383,6 @@ impl<'a> DslParser<'a> {
         Ok(name)
     }
 
-    fn parse_u16(&mut self) -> Result<u16, String> {
-        let start = self.pos;
-        while let Some(ch) = self.peek() {
-            if ch.is_ascii_digit() {
-                self.pos += 1;
-            } else {
-                break;
-            }
-        }
-        if self.pos == start {
-            return Err(self.err("expected integer"));
-        }
-        let value: u32 = self.input[start..self.pos]
-            .parse()
-            .map_err(|_| self.err("invalid integer"))?;
-        if value == 0 || value > i16::MAX as u32 {
-            return Err(self.err("integer must be 1..32767"));
-        }
-        Ok(value as u16)
-    }
-
     fn parse_i16(&mut self) -> Result<i16, String> {
         self.skip_ws();
         let negative = if self.peek() == Some('-') {
@@ -3531,10 +3429,7 @@ impl<'a> DslParser<'a> {
             DslValue::Int(self.parse_i16()?)
         } else {
             let ident = self.parse_ident()?;
-            self.skip_ws();
-            if self.peek() == Some('.') {
-                self.parse_js_member_value(ident)?
-            } else if ident == "null" {
+            if ident == "null" {
                 DslValue::Null
             } else if ident == "add" || ident == "sub" {
                 self.skip_ws();
@@ -3548,45 +3443,51 @@ impl<'a> DslParser<'a> {
                 } else {
                     DslValue::SubLit(Box::new(base), literal)
                 }
-            } else if ident == "cast" {
-                self.skip_ws();
-                self.expect_char('(')?;
-                let value = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let class_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                DslValue::Cast {
-                    value: Box::new(value),
-                    class_name,
-                }
-            } else if ident == "arrayLength" {
-                self.skip_ws();
-                self.expect_char('(')?;
-                let array = self.parse_value_arg()?;
-                self.expect_char(')')?;
-                DslValue::ArrayLength(Box::new(array))
-            } else if ident == "aget" {
-                self.skip_ws();
-                self.expect_char('(')?;
-                let array = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let index = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let type_name = self.parse_string_arg()?;
-                self.expect_char(')')?;
-                DslValue::ArrayGet {
-                    array: Box::new(array),
-                    index: Box::new(index),
-                    type_name,
-                }
             } else {
-                let target = parse_target_name(&ident);
-                let target = target.unwrap_or_else(|| DslTarget::Local(ident));
-                DslValue::Target(target)
+                self.parse_value_from_ident(ident)?
             }
         };
         self.skip_ws();
-        Ok(value)
+        self.parse_value_postfix(value)
+    }
+
+    fn parse_value_from_ident(&mut self, ident: String) -> Result<DslValue, String> {
+        self.skip_ws();
+        let value = if self.peek() == Some('.') {
+            self.parse_js_member_value(ident)?
+        } else {
+            let target = parse_target_name(&ident);
+            let target = target.unwrap_or_else(|| DslTarget::Local(ident));
+            DslValue::Target(target)
+        };
+        self.parse_value_postfix(value)
+    }
+
+    fn parse_value_postfix(&mut self, mut value: DslValue) -> Result<DslValue, String> {
+        loop {
+            self.skip_ws();
+            if self.peek_ident("as") {
+                self.expect_ident("as")?;
+                let class_name = self.parse_type_name()?;
+                value = DslValue::Cast {
+                    value: Box::new(value),
+                    class_name,
+                };
+            } else if self.peek() == Some('[') {
+                self.expect_char('[')?;
+                let index = self.parse_value_arg()?;
+                self.expect_char(':')?;
+                let type_name = self.parse_type_name()?;
+                self.expect_char(']')?;
+                value = DslValue::ArrayGet {
+                    array: Box::new(value),
+                    index: Box::new(index),
+                    type_name,
+                };
+            } else {
+                return Ok(value);
+            }
+        }
     }
 
     fn parse_js_member_value(&mut self, first: String) -> Result<DslValue, String> {
@@ -3598,6 +3499,10 @@ impl<'a> DslParser<'a> {
         }
         if parts.len() < 2 {
             return Err(self.err("expected member access"));
+        }
+        if parts.len() == 2 && parts[1] == "length" && self.peek() != Some('(') {
+            let target = parse_target_name(&parts[0]).unwrap_or_else(|| DslTarget::Local(parts[0].clone()));
+            return Ok(DslValue::ArrayLength(Box::new(DslValue::Target(target))));
         }
         self.expect_char('(')?;
         self.skip_ws();
