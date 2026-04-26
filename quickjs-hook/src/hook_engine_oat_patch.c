@@ -49,6 +49,7 @@ void hook_set_stealth_mode(int mode) {
 typedef struct {
     int     method_reg;     /* X register holding ArtMethod* (0-30) */
     int     scratch_reg;    /* X register used as scratch (W? in LDR) */
+    int     pc_reg;         /* X register holding the quick frame PC */
     int     branch_is_eq;   /* 1 if B.EQ (true=runtime), 0 if B.NE (true=regular) */
     uint64_t target_when_true;      /* branch taken target */
     uint64_t target_when_regular;   /* path for regular method (OAT lookup) */
@@ -144,6 +145,28 @@ static inline int is_ldr_x_offset_0x18(uint32_t insn, int expected_base) {
     return (base == expected_base);
 }
 
+static inline int decode_ldr_x_dst(uint32_t insn) {
+    if ((insn & 0xFFC00000) != 0xF9400000) return -1;
+    return insn & 0x1F;
+}
+
+static inline int decode_and_x_clear_tag(uint32_t insn, int expected_src, int* dst_out) {
+    /* AND Xd, Xn, #0xfffffffffffffffe */
+    if ((insn & 0xFFFFFC00) != 0x927FF800) return 0;
+    int src = (insn >> 5) & 0x1F;
+    if (src != expected_src) return 0;
+    *dst_out = insn & 0x1F;
+    return 1;
+}
+
+static inline int decode_cmp_x_regs(uint32_t insn, int* lhs_out, int* rhs_out) {
+    /* CMP Xn, Xm = SUBS XZR, Xn, Xm */
+    if ((insn & 0xFFE0FC1F) != 0xEB00001F) return 0;
+    *lhs_out = (insn >> 5) & 0x1F;
+    *rhs_out = (insn >> 16) & 0x1F;
+    return 1;
+}
+
 /*
  * Validate a candidate match at addr (must be instruction-aligned).
  * addr points to the LDR W?, [Xn, #0x8] instruction.
@@ -195,20 +218,41 @@ static int validate_oat_inline_match(uint64_t addr, uint8_t* code_buf,
      * there should be LDR Xt, [Xmethod, #0x18].
      * Check that the target is within our known readable scan range. */
     int found_ldr_0x18 = 0;
+    int quick_entry_reg = -1;
     uint64_t scan_end = scan_base + scan_size;
     if (target_when_regular >= scan_base && target_when_regular + 12 <= scan_end) {
         const uint32_t* reg_code = (const uint32_t*)target_when_regular;
         for (int i = 0; i < 3; i++) {
             if (is_ldr_x_offset_0x18(reg_code[i], method_reg)) {
                 found_ldr_0x18 = 1;
+                quick_entry_reg = decode_ldr_x_dst(reg_code[i]);
                 break;
             }
         }
     }
     if (!found_ldr_0x18) return 0;
 
+    int pc_reg = -1;
+    if (quick_entry_reg >= 0 && target_when_regular >= scan_base && target_when_regular + 384 <= scan_end) {
+        const uint32_t* reg_code = (const uint32_t*)target_when_regular;
+        for (int i = 0; i + 1 < 96; i++) {
+            int untagged_reg = -1;
+            if (!decode_and_x_clear_tag(reg_code[i], quick_entry_reg, &untagged_reg)) {
+                continue;
+            }
+            int lhs = -1;
+            int rhs = -1;
+            if (decode_cmp_x_regs(reg_code[i + 1], &lhs, &rhs) && rhs == untagged_reg) {
+                pc_reg = lhs;
+                break;
+            }
+        }
+    }
+    if (pc_reg < 0) return 0;
+
     out->method_reg = method_reg;
     out->scratch_reg = scratch_reg;
+    out->pc_reg = pc_reg;
     out->branch_is_eq = branch_is_eq;
     out->target_when_true = target_when_true;
     out->target_when_regular = target_when_regular;
@@ -278,6 +322,37 @@ static int scan_for_oat_inline_patterns(
     return count;
 }
 
+#undef OAT_SAVE_FRAME_SIZE
+#define OAT_SAVE_FRAME_SIZE 208
+
+static void emit_oat_restore_regs(Arm64Writer* w) {
+    /* d0-d7 */
+    arm64_writer_put_fp_ldp_offset(w, 0, 1, ARM64_REG_SP, 144);
+    arm64_writer_put_fp_ldp_offset(w, 2, 3, ARM64_REG_SP, 160);
+    arm64_writer_put_fp_ldp_offset(w, 4, 5, ARM64_REG_SP, 176);
+    arm64_writer_put_fp_ldp_offset(w, 6, 7, ARM64_REG_SP, 192);
+    /* x0-x17 */
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_X1,
+        ARM64_REG_SP, 0, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X2, ARM64_REG_X3,
+        ARM64_REG_SP, 16, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X4, ARM64_REG_X5,
+        ARM64_REG_SP, 32, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X6, ARM64_REG_X7,
+        ARM64_REG_SP, 48, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X8, ARM64_REG_X9,
+        ARM64_REG_SP, 64, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X10, ARM64_REG_X11,
+        ARM64_REG_SP, 80, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X12, ARM64_REG_X13,
+        ARM64_REG_SP, 96, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X14, ARM64_REG_X15,
+        ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17,
+        ARM64_REG_SP, 128, ARM64_INDEX_SIGNED_OFFSET);
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, OAT_SAVE_FRAME_SIZE);
+}
+
 /* ============================================================================
  * Trampoline generation
  *
@@ -335,6 +410,7 @@ static void* generate_oat_inline_thunk(
     /* Labels */
     uint64_t lbl_runtime_or_replacement = arm64_writer_new_label_id(&w);
     uint64_t lbl_regular_method = arm64_writer_new_label_id(&w);
+    uint64_t lbl_restore_runtime = arm64_writer_new_label_id(&w);
 
     /* --- Step 1: Relocate instructions covered by the redirect ---
      * 前 3 条已知: LDR + CMN + B.EQ (12 bytes)。
@@ -380,8 +456,6 @@ static void* generate_oat_inline_thunk(
      * OAT inline patch 点在大函数内部，函数 prologue 已 STP X29,X30。
      * BLR 破坏 X30 后，函数 epilogue 从栈帧恢复。
      */
-    #undef OAT_SAVE_FRAME_SIZE
-    #define OAT_SAVE_FRAME_SIZE 208
     arm64_writer_put_sub_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, OAT_SAVE_FRAME_SIZE);
     /* x0-x17 */
     arm64_writer_put_stp_reg_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_X1,
@@ -408,48 +482,34 @@ static void* generate_oat_inline_thunk(
     arm64_writer_put_fp_stp_offset(&w, 4, 5, ARM64_REG_SP, 176);
     arm64_writer_put_fp_stp_offset(&w, 6, 7, ARM64_REG_SP, 192);
 
-    /* --- Step 4: Call is_replacement_in_table(method) --- */
+    /* --- Step 4: If the frame PC is in our hook pool, force runtime/native path. --- */
+    arm64_writer_put_mov_reg_reg(&w, ARM64_REG_X0,
+        (Arm64Reg)(ARM64_REG_X0 + match->pc_reg));
+    arm64_writer_put_call_address(&w, (uint64_t)hook_is_in_exec_pool);
+    arm64_writer_put_cbnz_reg_label(&w, ARM64_REG_X0, lbl_restore_runtime);
+
+    /* --- Step 5: Call is_replacement_in_table(method) --- */
     /* MOV X0, Xmethod */
     arm64_writer_put_mov_reg_reg(&w, ARM64_REG_X0,
         (Arm64Reg)(ARM64_REG_X0 + match->method_reg));
     /* LDR X16, =is_replacement_in_table; BLR X16 */
     arm64_writer_put_call_address(&w, (uint64_t)is_replacement_in_table);
 
-    /* --- Step 5: CMP X0, XZR --- */
+    /* --- Step 6: CMP X0, XZR --- */
     arm64_writer_put_cmp_reg_reg(&w, ARM64_REG_X0, ARM64_REG_XZR);
 
-    /* --- Step 6: Restore registers --- */
-    /* d0-d7 */
-    arm64_writer_put_fp_ldp_offset(&w, 0, 1, ARM64_REG_SP, 144);
-    arm64_writer_put_fp_ldp_offset(&w, 2, 3, ARM64_REG_SP, 160);
-    arm64_writer_put_fp_ldp_offset(&w, 4, 5, ARM64_REG_SP, 176);
-    arm64_writer_put_fp_ldp_offset(&w, 6, 7, ARM64_REG_SP, 192);
-    /* x0-x17 */
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X0, ARM64_REG_X1,
-        ARM64_REG_SP, 0, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X2, ARM64_REG_X3,
-        ARM64_REG_SP, 16, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X4, ARM64_REG_X5,
-        ARM64_REG_SP, 32, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X6, ARM64_REG_X7,
-        ARM64_REG_SP, 48, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X8, ARM64_REG_X9,
-        ARM64_REG_SP, 64, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X10, ARM64_REG_X11,
-        ARM64_REG_SP, 80, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X12, ARM64_REG_X13,
-        ARM64_REG_SP, 96, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X14, ARM64_REG_X15,
-        ARM64_REG_SP, 112, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_ldp_reg_reg_reg_offset(&w, ARM64_REG_X16, ARM64_REG_X17,
-        ARM64_REG_SP, 128, ARM64_INDEX_SIGNED_OFFSET);
-    arm64_writer_put_add_reg_reg_imm(&w, ARM64_REG_SP, ARM64_REG_SP, OAT_SAVE_FRAME_SIZE);
+    /* --- Step 7: Restore registers --- */
+    emit_oat_restore_regs(&w);
 
-    /* --- Step 7: B.NE → runtime_or_replacement (is_replacement returned 1) --- */
+    /* --- Step 8: B.NE → runtime_or_replacement (is_replacement returned 1) --- */
     arm64_writer_put_b_cond_label(&w, ARM64_COND_NE, lbl_runtime_or_replacement);
 
-    /* --- Step 8: Fall through to regular_method path --- */
+    /* --- Step 9: Fall through to regular_method path --- */
     arm64_writer_put_b_label(&w, lbl_regular_method);
+
+    arm64_writer_put_label(&w, lbl_restore_runtime);
+    emit_oat_restore_regs(&w);
+    arm64_writer_put_b_label(&w, lbl_runtime_or_replacement);
 
     /* --- Emit "regular_method" and "runtime_or_replacement" tails --- */
     /*
@@ -721,9 +781,10 @@ int hook_patch_inlined_oat_header_checks(void) {
         g_oat_patch_count++;
         patched++;
 
-        hook_log("[oat_patch] patched inlined GetOatQuickMethodHeader at %#lx (method_reg=x%d, %s)",
+        hook_log("[oat_patch] patched inlined GetOatQuickMethodHeader at %#lx (method_reg=x%d, pc_reg=x%d, %s)",
                  (unsigned long)match_addrs[i],
                  match_infos[i].method_reg,
+                 match_infos[i].pc_reg,
                  match_infos[i].branch_is_eq ? "B.EQ→runtime" : "B.NE→regular");
     }
 

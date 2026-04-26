@@ -2273,7 +2273,7 @@ fn emit_invoke_with_values(
 ) -> Result<(), String> {
     let has_wide = params.iter().any(|param| matches!(param.as_str(), "J" | "D"));
     if args.iter().any(value_contains_invoke) {
-        return Err("call expressions cannot be nested inside invoke arguments; assign the value with let(...) first".to_string());
+        return Err("call expressions cannot be nested inside invoke arguments; assign the value to a let binding first".to_string());
     }
     let mut regs = Vec::new();
     if let Some((receiver_reg, _)) = receiver {
@@ -3431,18 +3431,6 @@ impl<'a> DslParser<'a> {
             let ident = self.parse_ident()?;
             if ident == "null" {
                 DslValue::Null
-            } else if ident == "add" || ident == "sub" {
-                self.skip_ws();
-                self.expect_char('(')?;
-                let base = self.parse_value_arg()?;
-                self.expect_char(',')?;
-                let literal = self.parse_i8()?;
-                self.expect_char(')')?;
-                if ident == "add" {
-                    DslValue::AddLit(Box::new(base), literal)
-                } else {
-                    DslValue::SubLit(Box::new(base), literal)
-                }
             } else {
                 self.parse_value_from_ident(ident)?
             }
@@ -3484,6 +3472,14 @@ impl<'a> DslParser<'a> {
                     index: Box::new(index),
                     type_name,
                 };
+            } else if self.peek() == Some('+') {
+                self.expect_char('+')?;
+                let literal = self.parse_i8()?;
+                value = DslValue::AddLit(Box::new(value), literal);
+            } else if self.peek() == Some('-') {
+                self.expect_char('-')?;
+                let literal = self.parse_i8()?;
+                value = DslValue::SubLit(Box::new(value), literal);
             } else {
                 return Ok(value);
             }
