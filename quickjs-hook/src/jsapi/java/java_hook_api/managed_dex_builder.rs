@@ -2699,6 +2699,71 @@ fn stmt_uses_orig(stmt: &DslStmt) -> bool {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ReturnFlow {
+    falls_through: bool,
+    has_non_orig_return: bool,
+}
+
+fn analyze_return_flow(stmts: &[DslStmt]) -> ReturnFlow {
+    for stmt in stmts {
+        match stmt {
+            DslStmt::ReturnOrig => {
+                return ReturnFlow {
+                    falls_through: false,
+                    has_non_orig_return: false,
+                };
+            }
+            DslStmt::ReturnValue { .. } => {
+                return ReturnFlow {
+                    falls_through: false,
+                    has_non_orig_return: true,
+                };
+            }
+            DslStmt::IfNull {
+                then_stmts, else_stmts, ..
+            }
+            | DslStmt::IfCmp {
+                then_stmts, else_stmts, ..
+            }
+            | DslStmt::IfInstanceOf {
+                then_stmts, else_stmts, ..
+            } => {
+                let then_flow = analyze_return_flow(then_stmts);
+                let else_flow = analyze_return_flow(else_stmts);
+                if then_flow.has_non_orig_return || else_flow.has_non_orig_return {
+                    return ReturnFlow {
+                        falls_through: then_flow.falls_through || else_flow.falls_through,
+                        has_non_orig_return: true,
+                    };
+                }
+                if !then_flow.falls_through && !else_flow.falls_through {
+                    return ReturnFlow {
+                        falls_through: false,
+                        has_non_orig_return: false,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    ReturnFlow {
+        falls_through: true,
+        has_non_orig_return: false,
+    }
+}
+
+fn validate_orig_bypass_flow(program: &DslProgram) -> Result<(), String> {
+    let flow = analyze_return_flow(&program.stmts);
+    if flow.has_non_orig_return || flow.falls_through {
+        return Err(
+            "managed DSL uses orig(); every return path must end with return orig() for high-frequency direct bypass"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn collect_local_slots(program: &DslProgram, first_reg: u16) -> Result<(BTreeMap<String, LocalSlot>, u16), String> {
     let mut slots = BTreeMap::new();
     let mut next = first_reg;
@@ -2955,6 +3020,9 @@ pub(super) fn build_managed_dsl_dex(
 ) -> Result<GeneratedManagedDex, String> {
     let program = parse_managed_dsl(dsl)?;
     let uses_orig = program_uses_orig(&program);
+    if uses_orig {
+        validate_orig_bypass_flow(&program)?;
+    }
     let target_type = java_class_to_descriptor(target_class_name)?;
     let object_type = "Ljava/lang/Object;".to_string();
     let (target_params, return_type) = parse_method_signature(target_sig)?;
