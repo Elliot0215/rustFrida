@@ -3726,6 +3726,9 @@ impl<'a> DslParser<'a> {
         if self.peek_ident("if") {
             return self.parse_js_if_statement();
         }
+        if self.peek_ident("switch") {
+            return self.parse_js_switch_statement();
+        }
 
         let name = self.parse_ident()?;
         self.skip_ws();
@@ -3934,6 +3937,58 @@ impl<'a> DslParser<'a> {
             Vec::new()
         };
         Ok(condition.into_if_stmt(then_stmts, else_stmts))
+    }
+
+    fn parse_js_switch_statement(&mut self) -> Result<DslStmt, String> {
+        self.expect_ident("switch")?;
+        self.skip_ws();
+        self.expect_char('(')?;
+        let value = self.parse_value_arg()?;
+        self.expect_char(')')?;
+        self.skip_ws();
+        self.expect_char('{')?;
+
+        let mut cases = Vec::<(i16, Vec<DslStmt>)>::new();
+        let mut default_stmts = None::<Vec<DslStmt>>;
+        loop {
+            self.skip_ws();
+            if self.peek() == Some('}') {
+                self.expect_char('}')?;
+                break;
+            }
+            if self.peek_ident("case") {
+                self.expect_ident("case")?;
+                let literal = self.parse_i16()?;
+                self.expect_char(':')?;
+                let stmts = self.parse_block()?;
+                cases.push((literal, stmts));
+            } else if self.peek_ident("default") {
+                if default_stmts.is_some() {
+                    return Err(self.err("switch supports only one default block"));
+                }
+                self.expect_ident("default")?;
+                self.skip_ws();
+                self.expect_char(':')?;
+                default_stmts = Some(self.parse_block()?);
+            } else {
+                return Err(self.err("expected switch case/default block"));
+            }
+        }
+        if cases.is_empty() {
+            return Err(self.err("switch requires at least one case"));
+        }
+
+        let mut else_stmts = default_stmts.unwrap_or_default();
+        for (literal, then_stmts) in cases.into_iter().rev() {
+            else_stmts = vec![DslStmt::IfCmp {
+                op: IfCmpOp::Eq,
+                left: value.clone(),
+                right: DslValue::Int(literal),
+                then_stmts,
+                else_stmts,
+            }];
+        }
+        Ok(else_stmts.remove(0))
     }
 }
 

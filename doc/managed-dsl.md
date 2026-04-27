@@ -210,6 +210,16 @@ Compound conditions support JS-like `&&`, `||`, `!`, and parentheses:
 "}"
 ```
 
+Integer `switch` is supported with explicit blocks and automatic break:
+
+```js
+"switch (code) {" +
+"  case 0: { return orig(); }" +
+"  case 1: { return null; }" +
+"  default: { return orig(); }" +
+"}"
+```
+
 ### Returns
 
 High-frequency orig path:
@@ -243,7 +253,8 @@ Direct value returns are supported only for DSL programs that do not use
   fall-through return paths.
 - `let x = orig()` must be the first top-level statement and cannot be nested.
 - Local variable type inference is not supported; use `let name: Type = value`.
-- `switch` statements are not part of the JS-like managed DSL.
+- `switch` supports integer case constants only. Case bodies must use `{ ... }`,
+  and fallthrough/break are not part of the DSL.
 - Loops are not part of the JS-like managed DSL.
 - Try/catch, throw, monitor enter/exit, and synchronized blocks are not part of
   the DSL.
