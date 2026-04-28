@@ -15,6 +15,14 @@ impl<'a> DslTokenStream<'a> {
         self.pos
     }
 
+    pub(super) fn mark(&self) -> usize {
+        self.pos
+    }
+
+    pub(super) fn restore(&mut self, pos: usize) {
+        self.pos = pos;
+    }
+
     pub(super) fn current_kind(&self) -> Option<&DslTokenKind> {
         self.tokens.get(self.pos).map(|token| &token.kind)
     }

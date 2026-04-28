@@ -136,9 +136,11 @@ fn parse_v2_primary_expr(
                 Ok(DslValue::Target(DslTarget::Local("orig".to_string())))
             }
         }
-        Some(DslTokenKind::Ident(value)) => {
-            let value = value.clone();
-            stream.advance();
+        Some(DslTokenKind::Ident(_)) => {
+            if let Some(value) = try_parse_v2_static_member_primary(stream, local_scopes)? {
+                return Ok(value);
+            }
+            let value = stream.parse_ident()?;
             Ok(DslValue::Target(
                 scoped_target_name_v2(local_scopes, &value).unwrap_or(DslTarget::Local(value)),
             ))
@@ -159,6 +161,61 @@ fn parse_v2_primary_expr(
         Some(DslTokenKind::Symbol('[')) => parse_v2_array_literal(stream, local_scopes),
         _ => Err(stream.err("not a constant expression")),
     }
+}
+
+fn try_parse_v2_static_member_primary(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<Option<DslValue>, String> {
+    let mark = stream.mark();
+    let mut parts = vec![stream.parse_ident()?];
+    if !stream.consume_char('.') {
+        stream.restore(mark);
+        return Ok(None);
+    }
+    loop {
+        parts.push(stream.parse_ident()?);
+        if !stream.consume_char('.') {
+            break;
+        }
+    }
+    if parts.len() < 2
+        || !parts[..parts.len() - 1]
+            .iter()
+            .any(|part| looks_like_static_class_name(part))
+    {
+        stream.restore(mark);
+        return Ok(None);
+    }
+    let member_name = parts.pop().unwrap();
+    let class_name = parts.join(".");
+    if stream.consume_char('(') {
+        let args = parse_v2_direct_call_args(stream, local_scopes)?;
+        if !stream.consume_char(')') {
+            return Err(stream.err("expected ')'"));
+        }
+        return Ok(Some(DslValue::Call(DslCallStmt {
+            kind: DslCallKind::Static,
+            target: None,
+            receiver: None,
+            null_safe: false,
+            class_name: Some(class_name),
+            method_name: member_name,
+            sig: String::new(),
+            args,
+        })));
+    }
+    Ok(Some(DslValue::FieldGet {
+        stmt: Box::new(DslFieldStmt {
+            target: None,
+            receiver: None,
+            class_name: Some(class_name),
+            field_name: member_name,
+            type_name: String::new(),
+            value: None,
+        }),
+        is_static: true,
+    }))
 }
 
 fn parse_orig_args_v2(
