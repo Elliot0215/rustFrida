@@ -1,4 +1,4 @@
-use super::{DslCallStmt, DslFieldStmt, DslIntBinOp, DslValue, IfCmpOp};
+use super::{DslCallStmt, DslCondition, DslFieldStmt, DslIntBinOp, DslValue, IfCmpOp};
 
 pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) struct DslProgram {
     pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) stmts: Vec<DslStmt>,
@@ -144,28 +144,4 @@ pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) struct DslCatch {
 pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslOrigArgs {
     Original,
     Values(Vec<DslValue>),
-}
-
-#[derive(Clone)]
-pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslCondition {
-    Null {
-        value: DslValue,
-        invert: bool,
-    },
-    Cmp {
-        op: IfCmpOp,
-        left: DslValue,
-        right: DslValue,
-    },
-    InstanceOf {
-        value: DslValue,
-        class_name: String,
-    },
-    Bool {
-        value: DslValue,
-    },
-    Const(bool),
-    And(Box<DslCondition>, Box<DslCondition>),
-    Or(Box<DslCondition>, Box<DslCondition>),
-    Not(Box<DslCondition>),
 }

@@ -1,5 +1,29 @@
 use super::*;
 
+#[derive(Clone)]
+pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum DslCondition {
+    Null {
+        value: DslValue,
+        invert: bool,
+    },
+    Cmp {
+        op: IfCmpOp,
+        left: DslValue,
+        right: DslValue,
+    },
+    InstanceOf {
+        value: DslValue,
+        class_name: String,
+    },
+    Bool {
+        value: DslValue,
+    },
+    Const(bool),
+    And(Box<DslCondition>, Box<DslCondition>),
+    Or(Box<DslCondition>, Box<DslCondition>),
+    Not(Box<DslCondition>),
+}
+
 impl DslCondition {
     pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) fn into_if_stmt(
         self,
