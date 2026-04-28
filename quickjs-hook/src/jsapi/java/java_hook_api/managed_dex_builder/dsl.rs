@@ -3,6 +3,7 @@ use super::{build_method_sig, build_params_sig, java_class_to_descriptor_or_prim
 mod assignment;
 mod ast;
 mod condition;
+mod control_flow;
 pub(super) use ast::*;
 mod cursor;
 mod lexer;
