@@ -6,8 +6,8 @@ use super::dsl::{
 };
 use super::{
     array_component_descriptor, common_value_descriptor_with_env, java_class_to_descriptor,
-    java_class_to_descriptor_or_primitive, object_assignability_score, parse_method_signature,
-    resolve_call_proto_with_arg_types, resolve_field_with_env, return_is_object,
+    java_class_to_descriptor_or_primitive, object_assignability_score, resolve_call_proto_with_arg_types,
+    resolve_constructor_proto_with_arg_types, resolve_field_with_env, return_is_object,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -529,25 +529,21 @@ impl DslSemanticContext {
                 args,
             } => {
                 java_class_to_descriptor(class_name)?;
-                let params = if let Some(sig) = ctor_sig {
-                    let (params, return_type) = parse_method_signature(sig)?;
-                    if return_type != "V" {
-                        return Err(format!("constructor signature must return void, got '{}'", return_type));
-                    }
-                    params
-                } else {
-                    if args.is_empty() {
-                        Vec::new()
-                    } else {
-                        return Err(
-                            "constructor arguments must include a full JNI signature or parameter type list"
-                                .to_string(),
-                        );
-                    }
-                };
+                let arg_types = args
+                    .iter()
+                    .map(|arg| self.infer_value_descriptor(arg))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let (params, full_sig) = resolve_constructor_proto_with_arg_types(
+                    self.env,
+                    class_name,
+                    ctor_sig.as_deref(),
+                    &arg_types,
+                )?;
                 if params.len() != args.len() {
                     return Err(format!(
-                        "constructor expects {} explicit args, got {}",
+                        "{}.<init>{} expects {} explicit args, got {}",
+                        class_name,
+                        full_sig,
                         params.len(),
                         args.len()
                     ));

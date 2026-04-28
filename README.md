@@ -509,6 +509,256 @@ map.size.value;    // 读取 size 字段
 
 Spawn 模式下 app ClassLoader 未就绪，用 `Java.ready` 延迟执行。PID 注入模式下立即执行。
 
+### Managed DSL 高频 Hook
+
+DSL 是给高频 Java hook 用的。普通 `Java.use().impl = function (...) { ... }` 每次命中都会进入 JS runtime；DSL 会生成 dex callback，热路径在 ART/Java 侧执行，适合 `HashMap.get/put`、`String.equals`、`StringBuilder.append`、`ArrayList.add` 这类自然高频点。
+
+#### 什么时候用 DSL
+
+| 场景 | 建议 |
+| --- | --- |
+| 低频、调试、需要 JS 对象/闭包/console | 用 `impl` |
+| 高频、只做判断/改参数/改返回/计数 | 用 DSL |
+| 高频里需要少量数据回 JS | DSL 里 `send()`，JS 侧 `dslDrain()` |
+| 逻辑还不稳定 | 先用 JS callback 探路，稳定后搬到 DSL |
+
+DSL 语法接近 JS/Java，但不是完整 JS runtime。它不能访问 JS 变量、闭包、`console.log`、`setInterval`、Promise。把它理解成“写在 JS 字符串里的 Java 热路径代码”更准确。
+
+#### 最推荐写法
+
+```js
+Java.ready(function () {
+    var HashMap = Java.use("java.util.HashMap");
+
+    HashMap.put
+        .overload("java.lang.Object", "java.lang.Object")
+        .dsl({ buff: 4096 })       // 可选。默认 4096，必须是 2 的幂，最大 1048576
+        .dslImpl = `
+            count("put");
+
+            let n: int = this.size();
+            let has: boolean = this.containsKey(arg0);
+            let selected: java.lang.Object = (arg0 != null ? arg0 : arg1);
+
+            if ((n & 1023) == 0) {
+                send("size", n);
+            }
+
+            if (has && selected != null) {
+                java.lang.String.valueOf(selected);
+            }
+
+            return orig(arg0, arg1);
+        `;
+
+    // JS 侧低频拉取 DSL 发出的消息。不要在 DSL 里 print。
+    var drained = HashMap.put.dslRead(64);
+    for (var i = 0; i < drained.length; i++) {
+        var m = drained[i];        // { name: "size", value: 123, code: 1 }
+        console.log(m.name, m.value);
+    }
+});
+```
+
+#### 不指定 overload
+
+```js
+HashMap.put.dslImpl = `
+    count("put");
+    return orig();
+`;
+```
+
+不指定 overload 时，会把同一段 DSL 批量安装到该方法名的全部 overload。适合 DSL 只用 `orig()`、`count()` 这类不依赖具体参数签名的场景。
+
+如果 DSL 里使用了固定参数数量、固定返回类型、某个特定字段/方法调用，建议显式 `.overload(...)`，错误信息也会更直接。
+
+#### DSL 内置名字
+
+| 名称 | 含义 |
+| --- | --- |
+| `this` | 实例方法的当前对象；静态方法中没有普通实例 |
+| `arg0`, `arg1`, ... | Java 方法参数 |
+| `orig()` / `orig(a, b, ...)` | 调原方法；可放在任意位置 |
+| `last` | 上一条对象表达式语句的结果 |
+| `result` | 部分调用/字段访问结果的临时目标；通常优先用局部变量接住 |
+
+常见返回方式：
+
+```js
+return orig();             // 原参数调用原方法
+return orig(arg0, arg1);   // 改参数后调用原方法
+return null;               // 对象返回值可返回 null
+return 0;                  // int/boolean 等按目标返回类型校验
+return;                    // void 方法
+```
+
+#### 变量和类型
+
+类型能推断时可以省略，但高频 hook 里建议复杂对象写清类型，方便 overload 推断和 dex 校验。
+
+```js
+let n: int = this.size();
+let selected: java.lang.Object = (arg0 != null ? arg0 : arg1);
+let text: java.lang.String = java.lang.String.valueOf(selected);
+
+let obj: java.lang.Object;    // 无初始化时必须写类型，默认 null/0/false
+let asObj: java.lang.Object = text as java.lang.Object;
+```
+
+`let` / `var` 当前都按块作用域处理。
+
+#### 方法调用
+
+```js
+let n: int = this.size();                         // 实例方法
+let s: java.lang.String = java.lang.String.valueOf(arg0); // 静态方法
+```
+
+overload 能唯一推断时直接写 `obj.method(arg)`。报歧义时显式指定：
+
+```js
+this.get.overload("java.lang.Object")(arg0);
+java.lang.String.valueOf.overload("java.lang.Object")(arg0);
+```
+
+接口接收者通常会自动走 interface 调用。推断不出来时显式写：
+
+```js
+it.hasNext.interface.overload("java.util.Iterator", "()Z")();
+```
+
+#### 字段访问
+
+字段用 Java 原生风格写：无括号是字段，有括号是方法。
+
+```js
+let v: int = this.someField;
+this.someField = 123;
+this.someField += 1;
+this.someField++;
+
+let name: java.lang.String = com.example.Config.name;
+com.example.Config.name = "patched";
+```
+
+字段按 Java 访问逻辑解析：从接收者静态类型开始查找，子类字段隐藏父类同名字段时优先子类；如果局部变量声明成父类类型，就访问父类字段。
+
+#### 创建对象和数组
+
+构造函数按普通 Java/JS 直觉写，参数类型会自动推断并选择唯一匹配的 constructor overload：
+
+```js
+let sb: java.lang.StringBuilder = new java.lang.StringBuilder("hi");
+let copy: java.lang.StringBuilder = java.lang.StringBuilder.$new(sb);
+let list: java.util.ArrayList = new java.util.ArrayList();
+```
+
+如果构造 overload 歧义，才把完整 JNI 构造签名放在第一个参数：
+
+```js
+let sb: java.lang.StringBuilder = new java.lang.StringBuilder("(Ljava/lang/String;)V", "hi");
+```
+
+数组：
+
+```js
+let arr: int[] = new int[4];
+arr[0] = 7;
+arr[0]++;
+
+let objs: java.lang.Object[] = [arg0, arg1, null];
+let first: java.lang.Object = objs[0];
+let len: int = objs.length;
+```
+
+#### 条件和控制流
+
+条件、三元、循环按 JS/Java 直觉写即可。几个差异点：
+
+- 可能为 null 的对象必须先保护：`obj != null && obj.method()`。
+- `switch case` 需要用 `{ ... }` 包住语句块。
+- `try` 支持 `catch`，暂不支持 `finally`。
+- 整数字面量当前按 int16 解析；较大常量建议通过 Java 字段/方法或计算得到。
+
+```js
+if (arg0 != null && this.containsKey(arg0)) {
+    count("hit");
+}
+
+let selected: java.lang.Object = (arg0 != null ? arg0 : arg1);
+
+if ((this.size() & 1023) == 0) {
+    send("size", this.size());
+}
+
+switch (this.size()) {
+    case 0: { return orig(arg0, arg1); }
+    default: { count("nonzero"); }
+}
+
+try {
+    java.lang.String.valueOf(arg0);
+} catch (java.lang.Throwable e) {
+    return orig(arg0, arg1);
+}
+```
+
+#### send 和 count
+
+`count("name")` 是热路径计数器，适合确认 DSL 是否命中。
+
+`send("channel", value)` 把少量数据写入固定环形缓冲区，JS 侧用 `dslRead()` 拉取：
+
+```js
+// DSL
+send("size", this.size());
+send("text", java.lang.String.valueOf(arg0));
+
+// JS
+var items = HashMap.put.dslRead(128);
+items.forEach(function (m) {
+    if (m.name === "size") console.log("size =", m.value);
+    if (m.name === "text") console.log("text =", m.value);
+});
+
+// 只取某个通道，直接拿 value 数组
+var sizes = HashMap.put.dslTake("size", 128);
+```
+
+限制：
+
+- `send()` 的值只能是 `int` 或 `java.lang.String`。
+- 缓冲区满时会丢旧/新消息并增加 dropped 计数，热路径不会阻塞。
+- 高频方法里不要每次都 `send()`，除非你明确能接受缓冲区覆盖。需要完整流量时应把逻辑放在 DSL 内完成，只低频上报结果。
+
+#### 调试和排错
+
+确认 DSL 是否安装成功：
+
+```js
+console.log(JSON.stringify(HashMap.put.dslInfo));
+```
+
+常见错误：
+
+| 错误/现象 | 处理 |
+| --- | --- |
+| `receiver ... may be null` | 加 `obj != null && obj.method()` |
+| overload 歧义 | 写 `.overload(...)`，或给局部变量补类型 |
+| 字段解析失败 | 确认接收者静态类型、字段名和 static/instance 用法 |
+| `send() value must be int or java.lang.String` | 先 `String.valueOf(obj)` 或只发 int |
+| 不指定 overload 后某个签名安装失败 | 改成显式 `.overload(...)` 分签名安装 |
+| 想在 DSL 里 `console.log` | 不支持；用 `count()` / `send()` |
+
+#### 高频写法
+
+- 尽量让 DSL 内部完成判断、计数、返回值修改，只把摘要通过 `send()` 发给 JS。
+- 不要把每次命中的完整数据都发回 JS；这会把问题重新变成跨 runtime 压力。
+- 不要在 DSL 中做无界循环、阻塞等待、频繁分配大对象。
+- 复杂对象、复杂返回值优先写清类型。
+- 需要 hook 复杂业务对象时，先用 JS callback 探路，稳定后把热路径搬到 DSL。
+
 ### Java.choose 枚举存活实例（Frida 兼容）
 
 扫描 ART 堆，把目标类的所有存活实例交给 `onMatch`：

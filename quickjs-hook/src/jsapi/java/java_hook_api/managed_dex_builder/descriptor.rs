@@ -424,7 +424,7 @@ unsafe fn resolve_field_with_reflection(
     pop_frame(env, std::ptr::null_mut());
     delete_local_ref(env, cls);
     Err(format!(
-        "field {}.{} not found; use explicit typed field syntax if reflection cannot resolve it",
+        "field {}.{} not found; check receiver static type and static/instance usage",
         class_name, field_name
     ))
 }

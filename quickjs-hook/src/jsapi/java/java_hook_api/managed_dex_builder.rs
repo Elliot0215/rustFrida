@@ -381,6 +381,38 @@ fn resolve_call_proto_with_arg_types(
     }
 }
 
+fn resolve_constructor_proto_with_arg_types(
+    env: JniEnv,
+    class_name: &str,
+    ctor_sig: Option<&str>,
+    arg_types: &[Option<String>],
+) -> Result<(Vec<String>, String), String> {
+    if let Some(sig) = ctor_sig {
+        let (params, return_type) = parse_method_signature(sig)?;
+        if return_type != "V" {
+            return Err(format!("constructor signature must return void, got '{}'", return_type));
+        }
+        return Ok((params, sig.to_string()));
+    }
+
+    let stmt = DslCallStmt {
+        kind: DslCallKind::Virtual,
+        target: None,
+        receiver: None,
+        null_safe: false,
+        class_name: Some(class_name.to_string()),
+        method_name: "<init>".to_string(),
+        sig: String::new(),
+        args: Vec::new(),
+    };
+    let (params, return_type, full_sig) =
+        resolve_direct_call_proto(env, &stmt, class_name, false, arg_types)?;
+    if return_type != "V" {
+        return Err(format!("constructor signature must return void, got '{}'", return_type));
+    }
+    Ok((params, full_sig))
+}
+
 fn resolve_direct_call_proto(
     env: JniEnv,
     stmt: &DslCallStmt,

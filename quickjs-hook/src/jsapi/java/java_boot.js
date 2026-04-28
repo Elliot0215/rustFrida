@@ -1030,6 +1030,60 @@
             : Java.managedDrainMessages(this._dslInfo, max);
     };
 
+    function _dslInfoList(info) {
+        if (!info) return [];
+        return Array.isArray(info) ? info : [info];
+    }
+
+    function _invertDslMessages(messages) {
+        var byCode = Object.create(null);
+        if (!messages) return byCode;
+        for (var name in messages) {
+            if (Object.prototype.hasOwnProperty.call(messages, name)) {
+                byCode[String(messages[name])] = name;
+            }
+        }
+        return byCode;
+    }
+
+    MethodWrapper.prototype.dslRead = function(nameOrMax, max) {
+        if (!this._dslInfo) {
+            return [];
+        }
+        var filterName = typeof nameOrMax === "string" ? nameOrMax : null;
+        var limit = filterName ? max : nameOrMax;
+        var infos = _dslInfoList(this._dslInfo);
+        var out = [];
+        for (var i = 0; i < infos.length; i++) {
+            var info = infos[i];
+            var byCode = _invertDslMessages(info.messages);
+            var items = limit === undefined
+                ? Java.managedDrainMessages(info)
+                : Java.managedDrainMessages(info, limit);
+            for (var j = 0; j < items.length; j++) {
+                var item = items[j];
+                var channel = byCode[String(item.code)] || String(item.code);
+                if (filterName && channel !== filterName) {
+                    continue;
+                }
+                if (filterName) {
+                    out.push(item.value);
+                } else {
+                    item.name = channel;
+                    out.push(item);
+                }
+            }
+        }
+        return out;
+    };
+
+    MethodWrapper.prototype.dslTake = function(name, max) {
+        if (typeof name !== "string") {
+            throw new Error("dslTake(name[, max]) requires a channel name");
+        }
+        return this.dslRead(name, max);
+    };
+
     function _invokeStaticWrapper(wrapper, argsLike) {
         var args = _argsFrom(argsLike);
         var sig;
@@ -1133,6 +1187,14 @@
 
         callable.dslDrain = function(max) {
             return wrapper.dslDrain(max);
+        };
+
+        callable.dslRead = function(nameOrMax, max) {
+            return wrapper.dslRead(nameOrMax, max);
+        };
+
+        callable.dslTake = function(name, max) {
+            return wrapper.dslTake(name, max);
         };
 
         return callable;

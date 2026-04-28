@@ -8,9 +8,10 @@ use super::dsl::{
 use super::{
     array_component_descriptor, common_value_descriptor_with_env, descriptor_is_interface, descriptor_list_word_count,
     descriptor_word_count, emit_return_from_orig, java_class_to_descriptor, java_class_to_descriptor_or_primitive,
-    parse_call_params, parse_method_signature, resolve_call_proto_with_arg_types, resolve_field_with_env,
-    return_is_object, value_kind_from_descriptor, DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, FieldRef,
-    GeneratedCounter, GeneratedMessageChannel, GeneratedStringLiteral, IfCmpOp, IrCatchHandler, MethodRef, ValueKind,
+    parse_call_params, parse_method_signature, resolve_call_proto_with_arg_types,
+    resolve_constructor_proto_with_arg_types, resolve_field_with_env, return_is_object, value_kind_from_descriptor,
+    DexIntBinOp, DexIntLit16Op, DexIntLit8Op, DexIrBuilder, FieldRef, GeneratedCounter, GeneratedMessageChannel,
+    GeneratedStringLiteral, IfCmpOp, IrCatchHandler, MethodRef, ValueKind,
 };
 use crate::jsapi::java::jni_core::JniEnv;
 
@@ -632,19 +633,14 @@ fn emit_new_object(
     dsl_ctx: &mut DslBuildContext,
 ) -> Result<MethodRef, String> {
     let new_type = java_class_to_descriptor(class_name)?;
-    let (params, return_type) = if let Some(sig) = ctor_sig {
-        parse_method_signature(sig)?
-    } else {
-        (Vec::new(), "V".to_string())
-    };
-    if return_type != "V" {
-        return Err(format!("constructor signature must return void, got '{}'", return_type));
-    }
+    let arg_types = infer_value_descriptors(args, layout, dsl_ctx)?;
+    let (params, full_sig) =
+        resolve_constructor_proto_with_arg_types(dsl_ctx.env, class_name, ctor_sig, &arg_types)?;
     if params.len() != args.len() {
         return Err(format!(
             "{}.<init>{} expects {} explicit args, got {}",
             class_name,
-            ctor_sig.unwrap_or("()V"),
+            full_sig,
             params.len(),
             args.len()
         ));
@@ -682,19 +678,14 @@ fn emit_new_object_value(
             new_type, expected_type
         ));
     }
-    let (params, return_type) = if let Some(sig) = ctor_sig {
-        parse_method_signature(sig)?
-    } else {
-        (Vec::new(), "V".to_string())
-    };
-    if return_type != "V" {
-        return Err(format!("constructor signature must return void, got '{}'", return_type));
-    }
+    let arg_types = infer_value_descriptors(args, layout, dsl_ctx)?;
+    let (params, full_sig) =
+        resolve_constructor_proto_with_arg_types(dsl_ctx.env, class_name, ctor_sig, &arg_types)?;
     if params.len() != args.len() {
         return Err(format!(
             "{}.<init>{} expects {} explicit args, got {}",
             class_name,
-            ctor_sig.unwrap_or("()V"),
+            full_sig,
             params.len(),
             args.len()
         ));
@@ -2769,9 +2760,17 @@ fn infer_call_arg_descriptors(
     layout: &HelperParamLayout,
     dsl_ctx: &DslBuildContext,
 ) -> Result<Vec<Option<String>>, String> {
-    stmt.args
+    infer_value_descriptors(&stmt.args, layout, dsl_ctx)
+}
+
+fn infer_value_descriptors(
+    values: &[DslValue],
+    layout: &HelperParamLayout,
+    dsl_ctx: &DslBuildContext,
+) -> Result<Vec<Option<String>>, String> {
+    values
         .iter()
-        .map(|arg| infer_value_descriptor(arg, layout, dsl_ctx))
+        .map(|value| infer_value_descriptor(value, layout, dsl_ctx))
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -3538,16 +3537,7 @@ fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_s
             DslStmt::Let { value, .. } | DslStmt::Assign { value, .. } => value_max_invoke_words(value)?,
             DslStmt::LetOrig { args, .. } => orig_args_max_invoke_words(args, target_params, is_static)?,
             DslStmt::New { ctor_sig, args, .. } => {
-                let params = if let Some(sig) = ctor_sig {
-                    let (params, return_type) = parse_method_signature(sig)?;
-                    if return_type != "V" {
-                        return Err(format!("constructor signature must return void, got '{}'", return_type));
-                    }
-                    params
-                } else {
-                    Vec::new()
-                };
-                let mut words = invoke_arg_words(true, &params)?;
+                let mut words = constructor_max_direct_words(ctor_sig.as_deref(), args)?;
                 for arg in args {
                     words = words.max(value_max_invoke_words(arg)?);
                 }
@@ -3684,19 +3674,21 @@ fn statements_max_invoke_words(stmts: &[DslStmt], target_params: &[String], is_s
     Ok(max_words)
 }
 
+fn constructor_max_direct_words(ctor_sig: Option<&str>, args: &[DslValue]) -> Result<u16, String> {
+    if let Some(sig) = ctor_sig {
+        let (params, return_type) = parse_method_signature(sig)?;
+        if return_type != "V" {
+            return Err(format!("constructor signature must return void, got '{}'", return_type));
+        }
+        return invoke_arg_words(true, &params);
+    }
+    Ok(1u16.saturating_add((args.len() as u16).saturating_mul(2)))
+}
+
 fn value_max_invoke_words(value: &DslValue) -> Result<u16, String> {
     match value {
         DslValue::NewObject { ctor_sig, args, .. } => {
-            let params = if let Some(sig) = ctor_sig {
-                let (params, return_type) = parse_method_signature(sig)?;
-                if return_type != "V" {
-                    return Err(format!("constructor signature must return void, got '{}'", return_type));
-                }
-                params
-            } else {
-                Vec::new()
-            };
-            let mut words = invoke_arg_words(true, &params)?;
+            let mut words = constructor_max_direct_words(ctor_sig.as_deref(), args)?;
             for arg in args {
                 words = words.max(value_max_invoke_words(arg)?);
             }
@@ -4283,15 +4275,24 @@ fn emit_send(
     if i16::try_from(code).is_err() {
         return Err(format!("too many DSL message channels: {}", code));
     }
-    ir.const16(REG_TMP0, code as i16);
     let value_desc = infer_value_descriptor(value, layout, dsl_ctx)?;
     if value_desc.as_deref() == Some("Ljava/lang/String;") {
         let value_reg = emit_load_value(ir, value, "Ljava/lang/String;", REG_TMP1, layout, dsl_ctx)?;
-        let value_reg = emit_copy_field_value_if_needed(ir, value_reg, REG_TMP1, ValueKind::Object);
+        let mut value_reg = emit_copy_field_value_if_needed(ir, value_reg, REG_TMP1, ValueKind::Object);
+        if value_reg == REG_TMP0 {
+            ir.move_from16(REG_TMP1, REG_TMP0 as u16, ValueKind::Object);
+            value_reg = REG_TMP1;
+        }
+        ir.const16(REG_TMP0, code as i16);
         ir.invoke_static(vec![REG_TMP0, value_reg], dsl_ctx.message_send_string_method());
     } else {
         let value_reg = emit_load_value(ir, value, "I", REG_TMP1, layout, dsl_ctx)?;
-        let value_reg = emit_copy_field_value_if_needed(ir, value_reg, REG_TMP1, ValueKind::Narrow);
+        let mut value_reg = emit_copy_field_value_if_needed(ir, value_reg, REG_TMP1, ValueKind::Narrow);
+        if value_reg == REG_TMP0 {
+            ir.move_from16(REG_TMP1, REG_TMP0 as u16, ValueKind::Narrow);
+            value_reg = REG_TMP1;
+        }
+        ir.const16(REG_TMP0, code as i16);
         ir.invoke_static(vec![REG_TMP0, value_reg], dsl_ctx.message_send_method());
     }
     Ok(())
