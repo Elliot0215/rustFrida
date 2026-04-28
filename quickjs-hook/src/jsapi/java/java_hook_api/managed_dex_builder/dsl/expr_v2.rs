@@ -146,7 +146,34 @@ fn parse_v2_primary_expr(
             }
             Ok(value)
         }
+        Some(DslTokenKind::Symbol('[')) => parse_v2_array_literal(stream, local_scopes),
         _ => Err(stream.err("not a constant expression")),
+    }
+}
+
+fn parse_v2_array_literal(
+    stream: &mut DslTokenStream<'_>,
+    local_scopes: &[BTreeMap<String, String>],
+) -> Result<DslValue, String> {
+    if !stream.consume_char('[') {
+        return Err(stream.err("expected '['"));
+    }
+    let mut elements = Vec::new();
+    loop {
+        if stream.consume_char(']') {
+            return Ok(DslValue::ArrayLiteral { elements });
+        }
+        elements.push(parse_v2_int_binary_expr(stream, local_scopes, 0)?);
+        if stream.consume_char(',') {
+            if stream.consume_char(']') {
+                return Ok(DslValue::ArrayLiteral { elements });
+            }
+            continue;
+        }
+        if stream.consume_char(']') {
+            return Ok(DslValue::ArrayLiteral { elements });
+        }
+        return Err(stream.err("array literal expects ',' or ']'"));
     }
 }
 
