@@ -531,4 +531,6 @@ pub fn register_module_api(ctx: &JSContext) {
     }
 
     global.free(ctx.as_ptr());
+
+    register_process_api(ctx);
 }
