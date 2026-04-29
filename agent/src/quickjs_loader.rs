@@ -168,6 +168,7 @@ pub fn init() -> Result<(), String> {
         return Err("JS 引擎已初始化".to_string());
     }
 
+    quickjs_hook::recomp::set_cleanup_release_only(false);
     init_hook_runtime()?;
 
     if let Some(output_path) = crate::OUTPUT_PATH.get() {
@@ -254,6 +255,11 @@ pub fn cleanup() {
 
     stage("cleanup start", &mut t);
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
+    quickjs_hook::recomp::set_cleanup_release_only(true);
+    // Recomp full cleanup is release-only: first stop kernel redirection, then
+    // cut HookEntry/ArtMethod state without writing anonymous recomp mirrors.
+    crate::recompiler::release_all();
+    stage("phase1 release_all_recomp", &mut t);
 
     // ============================================================
     // Phase 1: 切断所有 "入口 / 路由" hook，阻止新 thunk 进入。
@@ -396,6 +402,7 @@ pub fn cleanup_soft() -> Result<(), String> {
     };
 
     stage("soft cleanup start", &mut t);
+    quickjs_hook::recomp::set_cleanup_release_only(false);
 
     // Phase 1: 切 JS 侧入口（保留 art_controller routing / walkstack guards）
     cut_java_hooks();

@@ -334,7 +334,8 @@ static void emit_atomic_dec64(Arm64Writer* w, volatile uint64_t* counter);
 /* Fast $orig bypass: checked BEFORE prologue (zero register save overhead).
  * Scans g_orig_bypass slots for matching thread+method, jumps to trampoline.
  * Only clobbers X16/X17 (scratch registers). */
-static void emit_art_router_fast_bypass(Arm64Writer* w, uint64_t lbl_normal) {
+static void emit_art_router_fast_bypass(Arm64Writer* w, uint64_t lbl_normal,
+                                        int dec_before_trampoline) {
     /* Fast exit: if no bypass active, skip scan */
     arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&g_orig_bypass_active);
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X17, ARM64_REG_X17, 0);
@@ -364,7 +365,9 @@ static void emit_art_router_fast_bypass(Arm64Writer* w, uint64_t lbl_normal) {
         emit_atomic_inc64(w, &g_orig_bypass_hit);
         arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X17, (uint64_t)&slot->thread);
         arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_X17, 16); /* trampoline */
-        emit_thunk_inflight_dec_regs(w, ARM64_REG_X14, ARM64_REG_X15);
+        if (dec_before_trampoline) {
+            emit_thunk_inflight_dec_regs(w, ARM64_REG_X14, ARM64_REG_X15);
+        }
         arm64_writer_put_br_reg(w, ARM64_REG_X16);
         arm64_writer_put_label(w, lbl_next);
     }
@@ -1553,7 +1556,7 @@ static size_t generate_art_router_thunk(void* thunk_mem, size_t thunk_alloc,
      * This handles the JNI-path $orig re-entry (orig_bypass_set from Rust). */
     uint64_t lbl_normal_path = arm64_writer_new_label_id(&w);
     emit_thunk_inflight_inc(&w);
-    emit_art_router_fast_bypass(&w, lbl_normal_path);
+    emit_art_router_fast_bypass(&w, lbl_normal_path, 1);
     arm64_writer_put_label(&w, lbl_normal_path);
 
     emit_art_router_prologue(&w);
@@ -1689,18 +1692,25 @@ static size_t generate_managed_direct_thunk(void* thunk_mem, size_t thunk_alloc,
                                             uint64_t helper_method,
                                             uint64_t helper_entry,
                                             uint64_t original_method,
-                                            int set_orig_bypass) {
+                                            int set_orig_bypass,
+                                            int bypass_dec_before_trampoline) {
     if (thunk_alloc < 2048) return 0;
 
     Arm64Writer w;
     arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, thunk_alloc);
 
     uint64_t lbl_normal_path = arm64_writer_new_label_id(&w);
-    emit_thunk_inflight_inc(&w);
-    emit_art_quick_test_suspend_poll_ex(&w, 0);
-    emit_art_router_fast_bypass(&w, lbl_normal_path);
+    /* The managed helper's orig() re-entry is an extremely hot path. Do not
+     * put the global cleanup counter on that bypass path; one extra atomic op
+     * per HashMap.put orig() is enough for JD's crash monitor to hit
+     * SuspendThreadByPeer timeouts under startup load. The short trampoline
+     * window is covered by the later all-thread PC/LR safepoint before munmap.
+     */
+    emit_art_router_fast_bypass(&w, lbl_normal_path, bypass_dec_before_trampoline);
     arm64_writer_put_label(&w, lbl_normal_path);
 
+    emit_thunk_inflight_inc(&w);
+    emit_art_quick_test_suspend_poll_ex(&w, 0);
     emit_atomic_inc64(&w, &g_managed_direct_hit_count);
 
     if (set_orig_bypass) {
@@ -1780,7 +1790,7 @@ void* hook_install_managed_direct_router(void* target,
     }
 
     size_t thunk_size = generate_managed_direct_thunk(
-        entry->thunk, thunk_alloc, entry->trampoline, helper_method, helper_entry, original_method, set_orig_bypass);
+        entry->thunk, thunk_alloc, entry->trampoline, helper_method, helper_entry, original_method, set_orig_bypass, 0);
     if (thunk_size == 0) {
         free_entry(entry);
         pthread_mutex_unlock(&g_engine.lock);
@@ -1827,7 +1837,7 @@ void* hook_install_managed_direct_entrypoint(void* target,
     }
 
     size_t thunk_size = generate_managed_direct_thunk(
-        thunk, thunk_alloc, target, helper_method, helper_entry, original_method, set_orig_bypass);
+        thunk, thunk_alloc, target, helper_method, helper_entry, original_method, set_orig_bypass, 0);
     if (thunk_size == 0) {
         pthread_mutex_unlock(&g_engine.lock);
         return NULL;
@@ -1988,7 +1998,7 @@ void* hook_create_art_router_stub(uint64_t fallback_target,
     /* Fast $orig bypass */
     uint64_t lbl_normal_path = arm64_writer_new_label_id(&w);
     emit_thunk_inflight_inc(&w);
-    emit_art_router_fast_bypass(&w, lbl_normal_path);
+    emit_art_router_fast_bypass(&w, lbl_normal_path, 1);
     arm64_writer_put_label(&w, lbl_normal_path);
 
     emit_art_router_prologue(&w);

@@ -239,7 +239,9 @@ void hook_engine_cleanup(void) {
 
     /* Restore each live hook individually.
      * stealth==1 (wxshadow): must use prctl release.
-     * stealth==2 (recomp): was installed via mprotect+write, restore same way.
+     * stealth==2 (recomp): release-only cleanup; PR_RECOMPILE_RELEASE has
+     * already stopped execution from reaching the anonymous mirror, so do not
+     * write target slots/mirrors here.
      * stealth==0 (normal): restore via mprotect+memcpy. */
     HookEntry* entry = g_engine.hooks;
     while (entry) {
@@ -248,8 +250,9 @@ void hook_engine_cleanup(void) {
             if (rc != 0) {
                 hook_log("hook_engine_cleanup: wxshadow_release failed for %p", entry->target);
             }
+        } else if (entry->stealth == 2) {
+            /* Recomp entries are discarded below with the pool. */
         } else {
-            /* stealth==0 (mprotect) and stealth==2 (recomp) both use mprotect+memcpy */
             uintptr_t page_start = (uintptr_t)entry->target & ~0xFFF;
             mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
             memcpy(entry->target, entry->original_bytes, entry->original_size);

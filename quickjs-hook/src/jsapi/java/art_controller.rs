@@ -45,7 +45,7 @@ unsafe extern "C" fn recomp_translate_for_c(orig_addr: usize) -> usize {
     match crate::recomp::ensure_and_translate(orig_addr) {
         Ok(addr) => {
             register_recomp_signal_range(orig_addr, addr);
-            if let Some(entry) = resolve_suspend_poll_entrypoint() {
+            if let Some(entry) = resolve_recomp_suspend_poll_entrypoint() {
                 let _ = crate::recomp::patch_suspend_polls(orig_addr, entry);
             }
             addr
@@ -262,7 +262,7 @@ unsafe fn prepare_hook_target_inner(
             let recomp_addr = crate::recomp::ensure_and_translate(real_addr as usize)
                 .map_err(|e| format!("recomp translate {:#x}: {}", real_addr, e))?;
             register_recomp_signal_range(real_addr as usize, recomp_addr);
-            if let Some(entry) = resolve_suspend_poll_entrypoint() {
+            if let Some(entry) = resolve_recomp_suspend_poll_entrypoint() {
                 crate::recomp::patch_suspend_polls(real_addr as usize, entry)
                     .map_err(|e| format!("recomp suspend patch {:#x}: {}", real_addr, e))?;
             }
@@ -1596,6 +1596,14 @@ fn resolve_suspend_poll_entrypoint() -> Option<usize> {
     }
 
     None
+}
+
+fn resolve_recomp_suspend_poll_entrypoint() -> Option<usize> {
+    let test_suspend = unsafe { super::java_fast_api::art_quick_test_suspend_entrypoint() as usize };
+    if test_suspend != 0 {
+        return Some(test_suspend);
+    }
+    resolve_suspend_poll_entrypoint()
 }
 
 fn arm64_self_ldr_reg(inst: u32) -> Option<usize> {

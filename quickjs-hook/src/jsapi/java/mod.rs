@@ -1168,8 +1168,8 @@ pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
             per_method_hook_target, ..
         } => {
             if let Some(target) = per_method_hook_target {
-                hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
                 let _ = crate::recomp::revert_slot_patch(data.original_entry_point as usize);
+                hook_ffi::hook_remove(*target as *mut std::ffi::c_void);
             }
         }
     }
@@ -1281,6 +1281,9 @@ pub fn drain_thunk_in_flight() -> bool {
                 rounds + 1
             ));
             return true;
+        }
+        if callbacks_done {
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
         rounds += 1;
         if rounds % 10 == 0 {

@@ -85,10 +85,10 @@ pub(crate) unsafe fn remove_single_hook(addr: u64, data: &registry::HookData) {
     } else {
         addr
     };
-    ffi::hook::hook_remove(remove_addr as *mut std::ffi::c_void);
     if data.mode == StealthMode::Recomp {
         let _ = crate::recomp::revert_slot_patch(addr as usize);
     }
+    ffi::hook::hook_remove(remove_addr as *mut std::ffi::c_void);
 }
 
 /// 释放单个 hook 的 JS callback 引用（on_enter/replace + attach 的 on_leave）。

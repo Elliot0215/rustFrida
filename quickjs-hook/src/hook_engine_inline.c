@@ -510,16 +510,10 @@ int hook_remove(void* target) {
                     }
                 }
             } else if (entry->stealth == 2) {
-                /* Stealth 2 (recomp): hook was installed via mprotect+write on recomp page.
-                 * Restore original bytes the same way as non-stealth hooks. */
-                uintptr_t page_start = (uintptr_t)target & ~0xFFF;
-                if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                    pthread_mutex_unlock(&g_engine.lock);
-                    return HOOK_ERROR_MPROTECT_FAILED;
-                }
-                memcpy(target, entry->original_bytes, entry->original_size);
-                restore_page_rx(page_start);
-                hook_flush_cache(target, entry->original_size);
+                /* Stealth 2 (recomp): target is an anonymous slot. The route is
+                 * restored by the recomp layer on live unhook, or fully disabled
+                 * by PR_RECOMPILE_RELEASE during cleanup. Do not write the slot
+                 * here; cleanup may have already made the mirror release-only. */
             } else {
                 /* Normal hook (stealth==0): 优先走 rw-sibling 直写（JIT cache 走这条唯一路径）。
                  * 对装 hook 时走 rw-sibling 的目标, mprotect 本来就 EACCES, 不切这条会导致 unhook 失败,

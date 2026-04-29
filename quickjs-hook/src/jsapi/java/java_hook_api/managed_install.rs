@@ -368,6 +368,37 @@ unsafe fn install_orig_backup_art_method(
     Ok(())
 }
 
+unsafe fn set_orig_backup_entrypoint(
+    backup_art_method: u64,
+    art_method_size: usize,
+    entry_point_offset: usize,
+    trampoline: u64,
+) -> Result<(), String> {
+    if backup_art_method == 0 || trampoline == 0 {
+        return Err("invalid managed orig backup trampoline state".to_string());
+    }
+    if entry_point_offset + std::mem::size_of::<u64>() > art_method_size {
+        return Err(format!(
+            "invalid managed orig backup entrypoint layout: ep_offset={} size={}",
+            entry_point_offset, art_method_size
+        ));
+    }
+
+    std::ptr::write_volatile(
+        (backup_art_method as usize + entry_point_offset) as *mut u64,
+        trampoline,
+    );
+    crate::ffi::hook::hook_flush_cache(
+        backup_art_method as *mut std::ffi::c_void,
+        art_method_size,
+    );
+    output_message(&format!(
+        "[managedHook] orig backup ArtMethod entrypoint -> trampoline {:#x}",
+        trampoline
+    ));
+    Ok(())
+}
+
 unsafe fn install_managed_method_helper(
     env: JniEnv,
     class_name: &str,
@@ -379,7 +410,7 @@ unsafe fn install_managed_method_helper(
     helper_method_sig_str: &str,
     orig_backup_name_sig: Option<(&str, &str)>,
     label: &str,
-    uses_orig: bool,
+    _uses_orig: bool,
 ) -> Result<(), String> {
     let art_method = if let Some(art_method) = resolved_art_method {
         art_method
@@ -485,11 +516,7 @@ unsafe fn install_managed_method_helper(
     if let Some(backup_art_method) = orig_backup_art_method {
         install_orig_backup_art_method(backup_art_method, art_method, spec.size, ep_offset, original_entry_point)?;
     }
-    let orig_bypass_art_method = if uses_orig {
-        orig_backup_art_method.unwrap_or(art_method)
-    } else {
-        art_method
-    };
+    let orig_bypass_art_method = art_method;
     let class_global_ref = create_class_global_ref(env, class_name)?;
     let mut install_guard = JavaHookInstallGuard::new(
         art_method,
@@ -518,13 +545,16 @@ unsafe fn install_managed_method_helper(
         helper_art_method,
         helper_entry_point,
         orig_bypass_art_method,
-        if uses_orig { 1 } else { 0 },
+        0,
     );
     if quick_trampoline.is_null() {
         delete_local_ref(env, helper_cls);
         return Err("hook_install_managed_direct_router failed".to_string());
     }
     super::super::art_controller::try_fixup_trampoline_pub(quick_trampoline, original_entry_point);
+    if let Some(backup_art_method) = orig_backup_art_method {
+        set_orig_backup_entrypoint(backup_art_method, spec.size, ep_offset, quick_trampoline as u64)?;
+    }
     let per_method_hook_target = if !hooked_target.is_null() {
         Some(hooked_target as u64)
     } else {

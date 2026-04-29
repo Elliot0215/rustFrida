@@ -1,5 +1,6 @@
 //! Recomp 页管理回调桥
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 type RecompHandler = fn(usize) -> Result<usize, String>;
@@ -23,6 +24,11 @@ static TRY_REVERT_HANDLER: Mutex<Option<RecompTryRevertHandler>> = Mutex::new(No
 static TRY_REVERT_SLOT_HANDLER: Mutex<Option<RecompTryRevertSlotHandler>> = Mutex::new(None);
 static REVERSE_TRANSLATE_HANDLER: Mutex<Option<RecompReverseTranslateHandler>> = Mutex::new(None);
 static PATCH_SUSPEND_POLLS_HANDLER: Mutex<Option<RecompPatchSuspendPollsHandler>> = Mutex::new(None);
+static CLEANUP_RELEASE_ONLY: AtomicBool = AtomicBool::new(false);
+
+pub fn set_cleanup_release_only(enabled: bool) {
+    CLEANUP_RELEASE_ONLY.store(enabled, Ordering::Release);
+}
 
 pub fn set_handler(handler: RecompHandler) {
     *HANDLER.lock().unwrap() = Some(handler);
@@ -97,6 +103,9 @@ pub fn install_patch(orig_addr: usize, bytes: &[u8]) -> Result<(), String> {
 /// 尝试清除 orig_addr 处的 slot (hook 或 writest), 恢复 recomp 页字节.
 /// 返回 true = 有 slot 被清; false = 该地址没 slot 记录.
 pub fn try_revert_slot_patch(orig_addr: usize) -> bool {
+    if CLEANUP_RELEASE_ONLY.load(Ordering::Acquire) {
+        return false;
+    }
     let guard = TRY_REVERT_HANDLER.lock().unwrap();
     match guard.as_ref() {
         Some(h) => h(orig_addr),
@@ -105,6 +114,9 @@ pub fn try_revert_slot_patch(orig_addr: usize) -> bool {
 }
 
 pub fn try_revert_slot_patch_by_slot(slot_addr: usize) -> bool {
+    if CLEANUP_RELEASE_ONLY.load(Ordering::Acquire) {
+        return false;
+    }
     let guard = TRY_REVERT_SLOT_HANDLER.lock().unwrap();
     match guard.as_ref() {
         Some(h) => h(slot_addr),
@@ -120,6 +132,9 @@ pub fn set_revert_handler(handler: RecompCommitHandler) {
 
 /// 恢复 recomp 代码页上被 B 覆盖的原始指令（unhook 时调用）
 pub fn revert_slot_patch(orig_addr: usize) -> Result<(), String> {
+    if CLEANUP_RELEASE_ONLY.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let guard = REVERT_HANDLER.lock().unwrap();
     let handler = match guard.as_ref() {
         Some(h) => h,

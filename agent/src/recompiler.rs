@@ -342,6 +342,26 @@ fn ensure_slot_in_range(page: &RecompiledPage, slot_addr: usize, slot_size: usiz
     Ok(())
 }
 
+fn ensure_recomp_region_writable(page: &RecompiledPage, context: &str) -> Result<()> {
+    let rc = unsafe {
+        mprotect(
+            page.recomp_ptr as *mut _,
+            page.recomp_total_size,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "{} mprotect(RWX) recomp region 0x{:x}-0x{:x}: {}",
+            context,
+            page.recomp_ptr as usize,
+            page.recomp_ptr as usize + page.recomp_total_size,
+            Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// 重编译指定地址所在的页
 ///
 /// - `addr`: 页内任意地址（自动对齐到页边界）
@@ -667,6 +687,7 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
     let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
     let tramp_cap = page.tramp_capacity;
     let mut patched = 0usize;
+    ensure_recomp_region_writable(page, "patch_suspend_polls")?;
 
     for offset in (0..PAGE_SIZE).step_by(4) {
         let orig_insn = unsafe { ptr::read_unaligned((orig_base + offset) as *const u32) };
@@ -681,7 +702,7 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
         }
 
         page.tramp_used = (page.tramp_used + 7) & !7;
-        let slot_size = 32usize;
+        let slot_size = 56usize;
         if page.tramp_used + slot_size > tramp_cap {
             return Err("recomp 跳板区已满，无法 patch suspend poll".into());
         }
@@ -690,6 +711,7 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
         let slot_addr = slot_ptr as usize;
         ensure_slot_in_range(page, slot_addr, slot_size, "suspend poll")?;
         let orig_next = (orig_base + offset + 4) as u64;
+        let recomp_next = (recomp_code_addr + 4) as u64;
 
         let b_offset = (slot_addr as i64) - (recomp_code_addr as i64);
         if b_offset < -(1 << 27) || b_offset >= (1 << 27) {
@@ -700,13 +722,22 @@ pub fn patch_suspend_polls(orig_addr: usize, implicit_suspend_entry: usize) -> R
 
         unsafe {
             let w = slot_ptr as *mut u32;
-            // ldr x30, #16; ldr x16, #20; br x16; nop; .quad orig_next; .quad entry
-            ptr::write_unaligned(w.add(0), 0x5800_009e);
-            ptr::write_unaligned(w.add(1), 0x5800_00b0);
-            ptr::write_unaligned(w.add(2), 0xd61f_0200);
-            ptr::write_unaligned(w.add(3), 0xd503_201f);
-            ptr::write_unaligned(w.add(4) as *mut u64, orig_next);
-            ptr::write_unaligned(w.add(6) as *mut u64, implicit_suspend_entry as u64);
+            // Preserve ART's implicit suspend-check semantics:
+            //   if (x21 != 0) { ldr x21, [x21]; goto recomp_next; }
+            //   lr = orig_next; goto art_quick_test_suspend;
+            // The normal path must not call into ART; GC threads can execute
+            // suspend polls while holding runtime locks.
+            ptr::write_unaligned(w.add(0), 0xb500_0095); // cbnz x21, +16
+            ptr::write_unaligned(w.add(1), 0x5800_00fe); // ldr x30, #28 -> orig_next
+            ptr::write_unaligned(w.add(2), 0x5800_0110); // ldr x16, #32 -> entry
+            ptr::write_unaligned(w.add(3), 0xd61f_0200); // br x16
+            ptr::write_unaligned(w.add(4), 0xf940_02b5); // ldr x21, [x21]
+            ptr::write_unaligned(w.add(5), 0x5800_00f0); // ldr x16, #28 -> recomp_next
+            ptr::write_unaligned(w.add(6), 0xd61f_0200); // br x16
+            ptr::write_unaligned(w.add(7), 0xd503_201f); // nop / align literals
+            ptr::write_unaligned(w.add(8) as *mut u64, orig_next);
+            ptr::write_unaligned(w.add(10) as *mut u64, implicit_suspend_entry as u64);
+            ptr::write_unaligned(w.add(12) as *mut u64, recomp_next);
             ptr::write_volatile(recomp_code_addr as *mut u32, b_insn);
             hook_flush_cache(slot_ptr as *mut _, slot_size);
             hook_flush_cache(recomp_code_addr as *mut _, 4);
@@ -745,6 +776,7 @@ pub fn patch_insns(addr: usize, insns: &[u32]) -> Result<()> {
     if offset + patch_size > PAGE_SIZE {
         return Err("patch 超出页边界".into());
     }
+    ensure_recomp_region_writable(page, "patch_insns")?;
 
     unsafe {
         let dst = page.recomp_ptr.add(offset) as *mut u32;
@@ -778,6 +810,7 @@ pub fn patch_with_trampoline(orig_addr: usize, jump_dest: usize) -> Result<usize
     let page = pages
         .get_mut(&orig_base)
         .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
+    ensure_recomp_region_writable(page, "patch_with_trampoline")?;
 
     // 跳板区在 recomp 页之后 (recomp_ptr + PAGE_SIZE)
     let tramp_base = unsafe { page.recomp_ptr.add(PAGE_SIZE) };
@@ -922,6 +955,7 @@ pub fn install_patch(orig_addr: usize, user_bytes: &[u8]) -> Result<()> {
     let page = pages
         .get_mut(&orig_base)
         .ok_or_else(|| format!("页 0x{:x} 未重编译", orig_base))?;
+    ensure_recomp_region_writable(page, "install_patch")?;
 
     if page.slots.contains_key(&orig_addr) {
         return Err(format!("地址 0x{:x} 已被占用（hook 或 patch 已在位）", orig_addr));
@@ -1028,6 +1062,7 @@ pub fn commit_slot_patch(orig_addr: usize) -> Result<()> {
         Some(p) => p,
         None => return Ok(()),
     };
+    ensure_recomp_region_writable(page, "commit_slot_patch")?;
 
     let info = match page.slots.get(&orig_addr) {
         Some(i) => i,
@@ -1068,6 +1103,10 @@ pub fn try_revert_slot_patch(orig_addr: usize) -> bool {
         Some(p) => p,
         None => return false,
     };
+    if let Err(e) = ensure_recomp_region_writable(page, "try_revert_slot_patch") {
+        log_msg(format!("[recompiler] {}", e));
+        return false;
+    }
     let info = match page.slots.remove(&orig_addr) {
         Some(i) => i,
         None => return false,
@@ -1105,6 +1144,10 @@ pub fn try_revert_slot_patch_by_slot(slot_addr: usize) -> bool {
         let Some(orig_addr) = orig_addr else {
             continue;
         };
+        if let Err(e) = ensure_recomp_region_writable(page, "try_revert_slot_patch_by_slot") {
+            log_msg(format!("[recompiler] {}", e));
+            return false;
+        }
         let Some(info) = page.slots.remove(&orig_addr) else {
             return false;
         };
@@ -1134,6 +1177,7 @@ pub fn revert_slot_patch(orig_addr: usize) -> Result<()> {
         Some(p) => p,
         None => return Ok(()), // 非 recomp 模式
     };
+    ensure_recomp_region_writable(page, "revert_slot_patch")?;
 
     let info = match page.slots.remove(&orig_addr) {
         Some(i) => i,

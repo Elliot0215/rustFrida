@@ -899,20 +899,11 @@ int hook_restore_inlined_oat_header_patches(void) {
          * called after spawn artinit; using the current global mode here can
          * leave a normal libart patch active and later jump into unmapped pool. */
         if (entry->stealth_mode == 2) {
-            uintptr_t recomp_addr = entry->patched_addr;
-            if (recomp_addr == entry->original_addr && g_recomp_existing_translate) {
-                recomp_addr = g_recomp_existing_translate(entry->original_addr);
-            }
-            if (recomp_addr) {
-                uintptr_t rp = recomp_addr & ~(page_size - 1);
-                mprotect((void*)rp, page_size * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
-                memcpy((void*)recomp_addr, entry->original_bytes, entry->patch_size);
-                mprotect((void*)rp, page_size * 2, PROT_READ | PROT_EXEC);
-                hook_flush_cache((void*)recomp_addr, entry->patch_size);
-            } else {
-                hook_log("[oat_patch] restore skipped: no existing recomp mapping for %#lx",
-                         (unsigned long)entry->original_addr);
-            }
+            /* Recomp mode patches only the anonymous mirror page. Cleanup first
+             * releases the kernel redirection for the original page, then drops
+             * the entire recomp mapping after safepoint verification. There is
+             * no original text to restore and writing the RX mirror during
+             * cleanup can fault, so just discard the patch record. */
         } else if (entry->stealth_mode == 1) {
             if (wxshadow_release((void*)entry->original_addr) != 0) {
                 /* stealth1: wxshadow release 失败不降级 mprotect。
