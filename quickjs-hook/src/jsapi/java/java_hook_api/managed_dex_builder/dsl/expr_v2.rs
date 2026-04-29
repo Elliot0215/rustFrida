@@ -450,8 +450,22 @@ fn try_parse_v2_static_member_primary(
     }
     let member_name = parts.pop().unwrap();
     let class_name = parts.join(".");
+    if stream.consume_char(':') {
+        let type_name = parse_type_name_v2(stream)?;
+        return Ok(Some(DslValue::FieldGet {
+            stmt: Box::new(DslFieldStmt {
+                target: None,
+                receiver: None,
+                class_name: Some(class_name),
+                field_name: member_name,
+                type_name,
+                value: None,
+            }),
+            is_static: true,
+        }));
+    }
     if stream.consume_char('(') {
-        let parsed_args = parse_v2_member_call_args(stream, local_scopes, true, false)?;
+        let parsed_args = parse_v2_member_call_args(stream, local_scopes, false)?;
         return Ok(Some(build_v2_static_member_value(class_name, member_name, parsed_args)));
     }
     Ok(Some(DslValue::FieldGet {
@@ -621,19 +635,22 @@ fn parse_v2_member_postfix(
             args,
         );
     }
+    if stream.consume_char(':') {
+        let type_name = parse_type_name_v2(stream)?;
+        return build_v2_receiver_field(stream, receiver, member_name, call_kind, type_name);
+    }
     if !stream.peek_char('(') {
         return build_v2_receiver_field(stream, receiver, member_name, call_kind, String::new());
     }
     stream.consume_char('(');
     let allow_explicit_class = matches!(receiver, DslValue::Target(DslTarget::Last | DslTarget::Result));
-    let parsed_args = parse_v2_member_call_args(stream, local_scopes, true, allow_explicit_class)?;
+    let parsed_args = parse_v2_member_call_args(stream, local_scopes, allow_explicit_class)?;
     build_v2_receiver_call(stream, receiver, null_safe, member_name, call_kind, parsed_args)
 }
 
 fn parse_v2_member_call_args(
     stream: &mut DslTokenStream<'_>,
     local_scopes: &[BTreeMap<String, String>],
-    allow_field: bool,
     allow_explicit_class: bool,
 ) -> Result<ParsedCallArgs, String> {
     if stream.consume_char(')') {
@@ -672,11 +689,6 @@ fn parse_v2_member_call_args(
             }
             stream.restore(checkpoint);
         }
-        if allow_field && stream.peek_char(')') && looks_like_type_name(&first) {
-            stream.consume_char(')');
-            return Ok(ParsedCallArgs::Field { type_name: first });
-        }
-
         let mut args = vec![DslValue::String(first)];
         while stream.consume_char(',') {
             args.push(parse_v2_value_expr(stream, local_scopes)?);
@@ -775,7 +787,7 @@ fn build_v2_receiver_overload_call(
 }
 
 fn build_v2_receiver_call(
-    stream: &DslTokenStream<'_>,
+    _stream: &DslTokenStream<'_>,
     receiver: DslValue,
     null_safe: bool,
     method_name: String,
@@ -809,7 +821,6 @@ fn build_v2_receiver_call(
                 args,
             }))
         }
-        ParsedCallArgs::Field { type_name } => build_v2_receiver_field(stream, receiver, method_name, kind, type_name),
     }
 }
 
@@ -866,17 +877,6 @@ fn build_v2_static_member_value(class_name: String, member_name: String, parsed_
             sig,
             args,
         }),
-        ParsedCallArgs::Field { type_name } => DslValue::FieldGet {
-            stmt: Box::new(DslFieldStmt {
-                target: None,
-                receiver: None,
-                class_name: Some(class_name),
-                field_name: member_name,
-                type_name,
-                value: None,
-            }),
-            is_static: true,
-        },
     }
 }
 

@@ -32,9 +32,6 @@ pub(in crate::jsapi::java::java_hook_api::managed_dex_builder) enum ParsedCallAr
         sig: String,
         args: Vec<DslValue>,
     },
-    Field {
-        type_name: String,
-    },
 }
 
 #[derive(Clone)]
