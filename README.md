@@ -1453,7 +1453,7 @@ Memory.protect(dataAddr, 8, "r--");
 | `Module.enumerateImports(name)` | `string` | `{type, name, slot, address}[]` |
 | `Module.enumerateSymbols(name)` | `string` | `{type, name, address, isGlobal, isDefined}[]` |
 | `Module.enumerateRanges(name, prot?)` | `string, "rwx" 风格` | `{base, size, protection, file:{path}}[]` |
-| `Module.load(path, flags?)` | `string, int?` | `ModuleInfo` / 抛异常 |
+| `Module.load(path, flagsOrTagged?, tagged?)` | `string, int\|bool?, bool?` | `ModuleInfo` / 抛异常 |
 
 ```js
 // 导出：defined + global/weak 符号
@@ -1471,7 +1471,9 @@ Module.enumerateImports("libart.so").filter(i => i.type === "function");
 
 ### Module.load — 运行时加载 SO
 
-走 unrestricted linker (`__loader_dlopen`)，绕开 namespace 限制 + `hide_soinfo` 的 caller 解析问题。加载成功后从 `/proc/self/maps` 解析 `{name, base, size, path}` 返回；失败抛带 `dlerror` 原始消息的 `InternalError`。
+默认走 unrestricted linker (`__loader_dlopen`)，绕开 namespace 限制 + `hide_soinfo` 的 caller 解析问题。加载成功后从 `/proc/self/maps` 解析 `{name, base, size, path}` 返回；失败抛带 `dlerror` 原始消息的 `InternalError`。
+
+第三个参数或第二个布尔参数为 `true` 时，先把 SO 读入 `memfd_create("wwb_<basename>")`，再用 `android_dlopen_ext` 的 `library_fd` 加载。这样 `/proc/<pid>/maps` 中会出现 `wwb_` 标记；默认或显式 `false` 保持普通路径加载。
 
 ```js
 // 短名：走 linker 搜索路径
@@ -1483,6 +1485,13 @@ Module.load("/system/lib64/libsqlite.so");
 
 // 自定义 flags（默认 RTLD_NOW = 2；RTLD_LAZY = 1）
 Module.load("/data/local/tmp/mylib.so", 1);
+
+// 显式普通加载：maps 中保留真实文件路径
+Module.load("/data/local/tmp/mylib.so", false);
+
+// tagged 加载：maps 中显示 /memfd:wwb_mylib.so (deleted)
+Module.load("/data/local/tmp/mylib.so", true);
+Module.load("/data/local/tmp/mylib.so", 2, true);
 
 // 错误处理
 try {
@@ -1498,7 +1507,8 @@ var addr = Module.findExportByName(m.name, "my_func");
 ```
 
 **注意**：
-- 若模块被 `hide_soinfo` 隐藏或通过 memfd 加载，`/proc/self/maps` 可能查不到，此时返回 `{name, path, base: <dlopen handle>, size: 0}` 作 fallback。
+- tagged/memfd 加载会改变模块在 maps 和 `dladdr()` 等路径视角下的名字，适合需要 `wwb_` 标记的场景；依赖真实文件路径自检的 SO 建议用默认加载。
+- 若模块被 `hide_soinfo` 隐藏或 maps 聚合失败，返回 `{name, path, base: <dlopen handle>, size: 0}` 作 fallback。
 - `Module.load` 不会重复加载同一个 SO — linker 对已加载模块返回现有 handle。
 
 ## ptr / NativePointer

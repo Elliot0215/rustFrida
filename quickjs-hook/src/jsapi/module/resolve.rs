@@ -168,6 +168,49 @@ pub(crate) unsafe fn module_dlopen_load(
     std::ptr::null_mut()
 }
 
+/// Load a shared object from disk through a tagged memfd.
+///
+/// This keeps the default `Module.load(path)` behavior unchanged, while allowing
+/// callers to opt into a `/memfd:wwb_*` maps marker when requested.
+pub(crate) unsafe fn module_dlopen_load_memfd(
+    path: &str,
+    flags: i32,
+    memfd_name: &str,
+) -> Result<*mut std::ffi::c_void, String> {
+    let blob = std::fs::read(path).map_err(|e| format!("read '{}' failed: {}", path, e))?;
+    let c_name = CString::new(memfd_name).map_err(|_| "memfd name contains NUL byte".to_string())?;
+    let fd = libc::syscall(libc::SYS_memfd_create as libc::c_long, c_name.as_ptr(), 0) as i32;
+    if fd < 0 {
+        return Err(format!("memfd_create('{}') failed: {}", memfd_name, std::io::Error::last_os_error()));
+    }
+
+    let mut written = 0usize;
+    while written < blob.len() {
+        let n = libc::write(
+            fd,
+            blob[written..].as_ptr() as *const std::ffi::c_void,
+            blob.len() - written,
+        );
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            libc::close(fd);
+            return Err(format!("write '{}' to memfd '{}' failed: {}", path, memfd_name, err));
+        }
+        if n == 0 {
+            libc::close(fd);
+            return Err(format!("write '{}' to memfd '{}' made no progress", path, memfd_name));
+        }
+        written += n as usize;
+    }
+
+    let handle = memfd_dlopen_with_flags(memfd_name, fd, flags);
+    libc::close(fd);
+    Ok(handle)
+}
+
 /// Load a shared object as if the call came from libart's linker namespace.
 /// ART plugins such as libopenjdkjvmti.so live in the ART APEX namespace and
 /// may reject the generic linker trusted-caller used for ordinary app modules.
@@ -195,6 +238,11 @@ pub(crate) unsafe fn module_dlopen_load_from_libart_namespace(
 
 /// Load a shared object from an existing memfd using the linker's trusted-caller API.
 pub(crate) unsafe fn memfd_dlopen(name: &str, fd: i32) -> *mut std::ffi::c_void {
+    memfd_dlopen_with_flags(name, fd, libc::RTLD_NOW)
+}
+
+/// Load a shared object from an existing memfd using caller-provided dlopen flags.
+pub(crate) unsafe fn memfd_dlopen_with_flags(name: &str, fd: i32, flags: i32) -> *mut std::ffi::c_void {
     let c_name = match CString::new(name) {
         Ok(value) => value,
         Err(_) => return std::ptr::null_mut(),
@@ -214,7 +262,7 @@ pub(crate) unsafe fn memfd_dlopen(name: &str, fd: i32) -> *mut std::ffi::c_void 
             };
             return android_dlopen_ext(
                 c_name.as_ptr() as *const i8,
-                libc::RTLD_NOW,
+                flags,
                 &extinfo as *const _ as *const std::ffi::c_void,
                 api.trusted_caller,
             );

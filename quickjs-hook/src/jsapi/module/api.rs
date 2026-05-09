@@ -393,10 +393,28 @@ unsafe extern "C" fn js_module_enumerate_ranges(
     arr
 }
 
-/// Module.load(path, flags?) → {name, base, size, path} | throws
+fn tagged_module_memfd_name(basename: &str) -> String {
+    let mut name = String::from("wwb_");
+    for ch in basename.chars() {
+        if name.len() >= 180 {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' {
+            name.push(ch);
+        } else {
+            name.push('_');
+        }
+    }
+    if name == "wwb_" {
+        name.push_str("module.so");
+    }
+    name
+}
+
+/// Module.load(path, flags?, tagged?) → {name, base, size, path} | throws
 ///
 /// Frida 兼容: 加载指定路径的 SO。成功返回 module info 对象; 失败抛异常。
-/// flags 可选, 默认 RTLD_NOW (2)。
+/// flags 可选, 默认 RTLD_NOW (2)。tagged=true 时通过 memfd 加载并使用 `wwb_` maps 标记。
 unsafe extern "C" fn js_module_load(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -406,20 +424,50 @@ unsafe extern "C" fn js_module_load(
     if argc < 1 {
         return ffi::JS_ThrowTypeError(
             ctx,
-            b"Module.load(path, flags?) requires at least 1 argument\0".as_ptr() as *const _,
+            b"Module.load(path, flags?, tagged?) requires at least 1 argument\0".as_ptr() as *const _,
         );
     }
     let path = match require_string_arg(ctx, JSValue(*argv), "path") {
         Ok(s) => s,
         Err(exc) => return exc,
     };
-    let flags = if argc >= 2 {
-        JSValue(*argv.add(1)).to_i64(ctx).unwrap_or(libc::RTLD_NOW as i64) as i32
-    } else {
-        libc::RTLD_NOW
-    };
+    let mut flags = libc::RTLD_NOW;
+    let mut tagged = false;
+    if argc >= 2 {
+        let arg = JSValue(*argv.add(1));
+        if let Some(value) = arg.to_bool() {
+            tagged = value;
+        } else {
+            flags = arg.to_i64(ctx).unwrap_or(libc::RTLD_NOW as i64) as i32;
+        }
+    }
+    if argc >= 3 {
+        let arg = JSValue(*argv.add(2));
+        if let Some(value) = arg.to_bool() {
+            tagged = value;
+        } else {
+            return ffi::JS_ThrowTypeError(
+                ctx,
+                b"Module.load(path, flags?, tagged?) tagged argument must be a boolean\0".as_ptr() as *const _,
+            );
+        }
+    }
 
-    let handle = module_dlopen_load(&path, flags);
+    let basename: String = path.rsplit('/').next().unwrap_or(&path).to_string();
+    let memfd_name = tagged.then(|| tagged_module_memfd_name(&basename));
+    let handle = if let Some(name) = memfd_name.as_deref() {
+        match module_dlopen_load_memfd(&path, flags, name) {
+            Ok(handle) => handle,
+            Err(e) => {
+                return crate::jsapi::callback_util::throw_internal_error(
+                    ctx,
+                    format!("Module.load: memfd load('{}', '{}') failed: {}", path, name, e),
+                );
+            }
+        }
+    } else {
+        module_dlopen_load(&path, flags)
+    };
     if handle.is_null() {
         let err_ptr = libc::dlerror();
         let err_msg = if err_ptr.is_null() {
@@ -431,12 +479,18 @@ unsafe extern "C" fn js_module_load(
         return crate::jsapi::callback_util::throw_internal_error(ctx, err_msg);
     }
 
-    // 从 /proc/self/maps 找刚加载的模块 (path 精确匹配优先, 再 basename)
-    let basename: String = path.rsplit('/').next().unwrap_or(&path).to_string();
+    // 从 /proc/self/maps 找刚加载的模块 (path 精确匹配优先, tagged memfd 再按 wwb_ 名称匹配)
     let modules = enumerate_modules_from_maps();
     for m in &modules {
         if m.path == path {
             return module_info_to_js(ctx, m);
+        }
+    }
+    if let Some(name) = memfd_name.as_deref() {
+        for m in &modules {
+            if m.path.contains(name) || m.name.contains(name) {
+                return module_info_to_js(ctx, m);
+            }
         }
     }
     for m in &modules {
