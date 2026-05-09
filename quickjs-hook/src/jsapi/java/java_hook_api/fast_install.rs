@@ -106,6 +106,9 @@ unsafe fn install_fast_hook_inner(class_name: &str, method_name: &str, sig: &str
                 class_name: class_name.to_string(),
                 quick_trampoline,
                 use_blr,
+                native_entry_hook_target: 0,
+                native_entry_trampoline: 0,
+                native_entry_critical: false,
             },
         );
     });

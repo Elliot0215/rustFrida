@@ -1399,6 +1399,13 @@ pub(super) unsafe fn remove_per_method_hook(data: &JavaHookData) {
     }
 }
 
+/// 移除 registered native fnPtr inline hook。
+pub(super) unsafe fn remove_native_entry_hook(data: &JavaHookData) {
+    if data.native_entry_hook_target != 0 {
+        hook_ffi::hook_remove(data.native_entry_hook_target as *mut std::ffi::c_void);
+    }
+}
+
 /// 移除 native trampoline (hook_remove_redirect)。
 pub(super) unsafe fn remove_native_trampoline(data: &JavaHookData) {
     hook_ffi::hook_remove_redirect(data.art_method);
@@ -1462,6 +1469,8 @@ pub fn cut_java_hooks() {
             unsafe {
                 // unpatch per-method hook 首字节 → 新 caller 立即走原方法
                 remove_per_method_hook(data);
+                // registered native 直接 fnPtr hook 也要先切断，避免新调用进 callback
+                remove_native_entry_hook(data);
                 // 恢复 ArtMethod 字段 (Layer 1/2 路由也切断)
                 restore_art_method_fields(data);
                 // router 表条目保留 → OAT bypass 对 in-flight 仍生效
@@ -1561,6 +1570,7 @@ pub fn free_java_hooks() {
     if let Some(registry) = guard.take() {
         for (_art_method, data) in registry {
             unsafe {
+                remove_native_entry_hook(&data);
                 remove_native_trampoline(&data);
                 free_java_hook_resources(&data, env_opt);
             }

@@ -30,12 +30,16 @@ pub(crate) unsafe fn extract_jni_arg(
     is_fp: bool,
     gp_index: &mut usize,
     fp_index: &mut usize,
+    stack_index: &mut usize,
 ) -> (u64, u64) {
     if is_fp {
         let fp_val = if *fp_index < 8 {
             hook_ctx.d[*fp_index]
         } else {
-            0u64
+            let sp = hook_ctx.sp as usize;
+            let value = *((sp + *stack_index * 8) as *const u64);
+            *stack_index += 1;
+            value
         };
         *fp_index += 1;
         (0u64, fp_val)
@@ -44,7 +48,9 @@ pub(crate) unsafe fn extract_jni_arg(
             hook_ctx.x[2 + *gp_index]
         } else {
             let sp = hook_ctx.sp as usize;
-            *((sp + (*gp_index - 6) * 8) as *const u64)
+            let value = *((sp + *stack_index * 8) as *const u64);
+            *stack_index += 1;
+            value
         };
         *gp_index += 1;
         (gp_val, 0u64)

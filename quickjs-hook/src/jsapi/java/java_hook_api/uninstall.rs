@@ -77,13 +77,16 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
     // Step 2: 移除 Layer 3 per-method hook + stealth2 revert
     super::super::remove_per_method_hook(&hook_data);
 
-    // Step 3: 恢复 ArtMethod 原始字段
+    // Step 3: 移除 registered native fnPtr hook
+    super::super::remove_native_entry_hook(&hook_data);
+
+    // Step 4: 恢复 ArtMethod 原始字段
     super::super::restore_art_method_fields(&hook_data);
 
-    // Step 4: 移除 native trampoline
+    // Step 5: 移除 native trampoline
     super::super::remove_native_trampoline(&hook_data);
 
-    // Step 5: 等待 in-flight callbacks 自然退出
+    // Step 6: 等待 in-flight callbacks 自然退出
     if !wait_for_in_flight_java_hook_callbacks(std::time::Duration::from_millis(200)) {
         output_verbose(&format!(
             "[java unhook] 等待 in-flight callbacks 超时，remaining={}",
@@ -91,7 +94,7 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_unhook(
         ));
     }
 
-    // Step 6: 释放资源
+    // Step 7: 释放资源
     let env_opt = get_thread_env().ok();
     super::super::free_java_hook_resources(&hook_data, env_opt);
 

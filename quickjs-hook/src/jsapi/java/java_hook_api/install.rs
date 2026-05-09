@@ -16,6 +16,53 @@ use super::install_support::{
     update_original_method_flags_for_hook, JavaHookInstallGuard,
 };
 
+fn is_registered_native_entry_candidate(addr: u64, bridge: &ArtBridgeFunctions) -> bool {
+    if addr < 0x10000 {
+        return false;
+    }
+    if addr == bridge.quick_generic_jni_trampoline
+        || addr == bridge.quick_to_interpreter_bridge
+        || addr == bridge.quick_resolution_trampoline
+        || addr == bridge.quick_imt_conflict_trampoline
+        || addr == bridge.nterp_entry_point
+        || (bridge.resolved_jni_entrypoint != 0 && addr == bridge.resolved_jni_entrypoint)
+        || (bridge.resolved_interpreter_bridge_entrypoint != 0 && addr == bridge.resolved_interpreter_bridge_entrypoint)
+        || (bridge.resolved_resolution_entrypoint != 0 && addr == bridge.resolved_resolution_entrypoint)
+    {
+        return false;
+    }
+    if !crate::jsapi::util::is_addr_accessible(addr, 4) {
+        return false;
+    }
+    let Some(maps) = crate::jsapi::util::read_proc_self_maps() else {
+        return false;
+    };
+    let Some(entry) = crate::jsapi::util::proc_maps_entries(&maps).find(|entry| entry.contains(addr)) else {
+        return false;
+    };
+    if entry.path.map(|path| path.contains("/libart.so")).unwrap_or(false) {
+        return false;
+    }
+    (entry.prot_flags() & libc::PROT_EXEC) != 0
+}
+
+unsafe fn free_callback_bytes(ctx: *mut ffi::JSContext, callback_bytes: [u8; 16]) {
+    let callback: ffi::JSValue = std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
+    ffi::qjs_free_value(ctx, callback);
+}
+
+fn is_critical_native_signature_supported(is_static: bool, return_type_sig: &str, param_types: &[String]) -> bool {
+    if !is_static {
+        return false;
+    }
+    if matches!(return_type_sig.as_bytes().first(), Some(b'L' | b'[')) {
+        return false;
+    }
+    param_types
+        .iter()
+        .all(|sig| !matches!(sig.as_bytes().first(), Some(b'L' | b'[')))
+}
+
 pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     ctx: *mut ffi::JSContext,
     _this: ffi::JSValue,
@@ -157,6 +204,19 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
     );
 
     let return_type = get_return_type_from_sig(&actual_sig);
+    let return_type_sig = get_return_type_sig(&actual_sig);
+    let param_count = count_jni_params(&actual_sig);
+    let param_types = parse_jni_param_types(&actual_sig);
+    let has_critical_native_flag = (original_access_flags & K_ACC_CRITICAL_NATIVE) != 0;
+    let critical_native_signature_supported =
+        is_critical_native_signature_supported(is_static, &return_type_sig, &param_types);
+    let is_critical_native = has_critical_native_flag && critical_native_signature_supported;
+    if has_critical_native_flag && !critical_native_signature_supported {
+        output_verbose(&format!(
+            "[java hook] critical-native flag ignored as ART noise: flags={:#x}, sig={}",
+            original_access_flags, actual_sig
+        ));
+    }
     let has_independent_code = !is_art_quick_entrypoint(original_entry_point, bridge);
     let is_constructor = method_name == "<init>";
     let enable_fast_orig = false;
@@ -257,19 +317,78 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook(
                 clone_addr: 0, // 2-ArtMethod 模型: 不再使用 clone
                 class_global_ref,
                 return_type,
-                return_type_sig: get_return_type_sig(&actual_sig),
+                return_type_sig: return_type_sig.clone(),
                 ctx: ctx as usize,
                 callback_bytes,
                 method_key: method_key(&class_name, &method_name, &actual_sig),
                 is_static,
-                param_count: count_jni_params(&actual_sig),
-                param_types: parse_jni_param_types(&actual_sig),
+                param_count,
+                param_types: param_types.clone(),
                 class_name: class_name.clone(),
                 quick_trampoline,
                 use_blr,
+                native_entry_hook_target: 0,
+                native_entry_trampoline: 0,
+                native_entry_critical: false,
             },
         );
     });
+
+    if (original_access_flags & K_ACC_NATIVE) != 0
+        && original_data != 0
+        && is_registered_native_entry_candidate(original_data, bridge)
+    {
+        let native_callback: hook_ffi::HookCallback = if is_critical_native {
+            Some(java_critical_native_hook_callback)
+        } else {
+            Some(java_hook_callback)
+        };
+        let install_native_entry = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+            let Some(hook_data) = registry.get_mut(&art_method) else {
+                return Err("registered native hook data disappeared".to_string());
+            };
+            let trampoline = hook_ffi::hook_replace(
+                original_data as *mut std::ffi::c_void,
+                native_callback,
+                art_method as *mut std::ffi::c_void,
+                0,
+            );
+            if trampoline.is_null() {
+                return Err(format!(
+                    "registered native entry hook failed: target={:#x}",
+                    original_data
+                ));
+            }
+            hook_data.native_entry_hook_target = original_data;
+            hook_data.native_entry_trampoline = trampoline as u64;
+            hook_data.native_entry_critical = is_critical_native;
+            Ok((original_data, trampoline as u64))
+        })
+        .unwrap_or_else(|| Err("java hook registry not initialized".to_string()));
+
+        match install_native_entry {
+            Ok((target, trampoline)) => {
+                install_guard.set_native_entry_hook_target(target);
+                output_verbose(&format!(
+                    "[java hook] registered native entry hooked: target={:#x}, trampoline={:#x}, critical={}",
+                    target, trampoline, is_critical_native
+                ));
+            }
+            Err(msg) => {
+                if let Some(removed) =
+                    with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| registry.remove(&art_method)).flatten()
+                {
+                    free_callback_bytes(ctx, removed.callback_bytes);
+                }
+                return throw_internal_error(ctx, &msg);
+            }
+        }
+    } else if (original_access_flags & K_ACC_NATIVE) != 0 {
+        output_verbose(&format!(
+            "[java hook] registered native entry skipped: data_={:#x}",
+            original_data
+        ));
+    }
 
     cache_fields_for_class(env, &class_name);
 
@@ -472,6 +591,9 @@ pub(in crate::jsapi::java) unsafe extern "C" fn js_java_hook_quick(
                 class_name: class_name.clone(),
                 quick_trampoline,
                 use_blr,
+                native_entry_hook_target: 0,
+                native_entry_trampoline: 0,
+                native_entry_critical: false,
             },
         );
     });

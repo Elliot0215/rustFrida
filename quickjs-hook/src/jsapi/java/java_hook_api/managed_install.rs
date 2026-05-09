@@ -331,17 +331,11 @@ unsafe fn initialize_generated_message_queue(
     Ok(())
 }
 
-unsafe fn direct_buffer_range(
-    env: JniEnv,
-    buffer: *mut c_void,
-    offset: i32,
-    length: i32,
-) -> Option<(*mut u8, usize)> {
+unsafe fn direct_buffer_range(env: JniEnv, buffer: *mut c_void, offset: i32, length: i32) -> Option<(*mut u8, usize)> {
     if buffer.is_null() || offset < 0 || length <= 0 {
         return None;
     }
-    let get_address: GetDirectBufferAddressFn =
-        jni_fn!(env, GetDirectBufferAddressFn, JNI_GET_DIRECT_BUFFER_ADDRESS);
+    let get_address: GetDirectBufferAddressFn = jni_fn!(env, GetDirectBufferAddressFn, JNI_GET_DIRECT_BUFFER_ADDRESS);
     let get_capacity: GetDirectBufferCapacityFn =
         jni_fn!(env, GetDirectBufferCapacityFn, JNI_GET_DIRECT_BUFFER_CAPACITY);
     let base = get_address(env, buffer) as *mut u8;
@@ -457,12 +451,7 @@ unsafe extern "C" fn managed_dbb_capacity(env: JniEnv, _cls: *mut c_void, buffer
     std::cmp::min(capacity, i32::MAX as i64) as i32
 }
 
-unsafe extern "C" fn managed_dbb_get_u8(
-    env: JniEnv,
-    _cls: *mut c_void,
-    buffer: *mut c_void,
-    offset: i32,
-) -> i32 {
+unsafe extern "C" fn managed_dbb_get_u8(env: JniEnv, _cls: *mut c_void, buffer: *mut c_void, offset: i32) -> i32 {
     let Some((src, _len)) = direct_buffer_range(env, buffer, offset, 1) else {
         return -1;
     };
@@ -791,6 +780,9 @@ unsafe fn install_managed_method_helper(
                 class_name: class_name.to_string(),
                 quick_trampoline,
                 use_blr,
+                native_entry_hook_target: 0,
+                native_entry_trampoline: 0,
+                native_entry_critical: false,
             },
         );
     });

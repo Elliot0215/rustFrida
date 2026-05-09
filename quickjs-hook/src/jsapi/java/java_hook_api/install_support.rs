@@ -30,6 +30,7 @@ pub(super) struct JavaHookInstallGuard {
     redirect_installed: bool,
     replacement_registered: bool,
     original_method_mutated: bool,
+    native_entry_hook_target: u64,
     committed: bool,
 }
 
@@ -57,6 +58,7 @@ impl JavaHookInstallGuard {
             redirect_installed: false,
             replacement_registered: false,
             original_method_mutated: false,
+            native_entry_hook_target: 0,
             committed: false,
         }
     }
@@ -75,6 +77,10 @@ impl JavaHookInstallGuard {
 
     pub(super) fn set_original_method_mutated(&mut self) {
         self.original_method_mutated = true;
+    }
+
+    pub(super) fn set_native_entry_hook_target(&mut self, target: u64) {
+        self.native_entry_hook_target = target;
     }
 
     pub(super) fn commit(mut self) {
@@ -111,6 +117,10 @@ impl Drop for JavaHookInstallGuard {
 
             if self.redirect_installed {
                 hook_ffi::hook_remove_redirect(self.art_method);
+            }
+
+            if self.native_entry_hook_target != 0 {
+                hook_ffi::hook_remove(self.native_entry_hook_target as *mut std::ffi::c_void);
             }
 
             if self.replacement_addr != 0 {

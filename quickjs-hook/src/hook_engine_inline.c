@@ -116,6 +116,10 @@ void emit_replace_epilogue(Arm64Writer* w) {
     /* Restore x0 (return value, possibly modified by callback or callOriginal) */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X0, ARM64_REG_SP, 0);
 
+    /* Restore d0 for float/double returns. d1 is caller-saved and may be
+     * restored as part of the pair load without changing observable ABI. */
+    arm64_writer_put_fp_ldp_offset(w, 0, 1, ARM64_REG_SP, 280);
+
     /* Restore x18 (platform register) before returning to the original caller. */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X18, ARM64_REG_SP, 144);
 
@@ -437,8 +441,15 @@ uint64_t hook_invoke_trampoline(HookContext* ctx, void* trampoline) {
         "mov    x29, sp\n"
         "stp    x19, x20, [sp, #-16]!\n"
 
-        /* X0 = ctx, X1 = trampoline — keep trampoline in x19 until x16 is free. */
+        /* X0 = ctx, X1 = trampoline. Keep both across the original call. */
         "mov    x19, x1\n"
+        "mov    x20, x0\n"
+
+        /* Restore FP argument registers before invoking the original. */
+        "ldp    d0,  d1,  [x0, #280]\n"
+        "ldp    d2,  d3,  [x0, #296]\n"
+        "ldp    d4,  d5,  [x0, #312]\n"
+        "ldp    d6,  d7,  [x0, #328]\n"
 
         /* Restore x2-x15 from ctx first (before we clobber x0/x1) */
         "ldp    x2,  x3,  [x0, #16]\n"
@@ -454,15 +465,21 @@ uint64_t hook_invoke_trampoline(HookContext* ctx, void* trampoline) {
         /* Restore x0-x1 from ctx (must be last since x0 = ctx pointer) */
         "ldp    x0,  x1,  [x0]\n"
 
-        /* Move trampoline into x16, then restore our scratch callee-saved regs. */
+        /* Move trampoline into x16. x19/x20 are restored after the original
+         * returns so x20 remains available for storing x0/d0 return values. */
         "mov    x16, x19\n"
-        "ldp    x19, x20, [sp], #16\n"
 
         /* Call the trampoline (original function) */
         "blr    x16\n"
 
-        /* x0 now contains the return value from the original function */
+        /* x0/d0 now contain the return value from the original function. Store
+         * both back into HookContext so callers can consume integer and FP
+         * returns through the same context object. */
+        "str    x0, [x20, #0]\n"
+        "str    d0, [x20, #280]\n"
+
         /* Restore frame and return */
+        "ldp    x19, x20, [sp], #16\n"
         "ldp    x29, x30, [sp], #16\n"
         "ret\n"
     );

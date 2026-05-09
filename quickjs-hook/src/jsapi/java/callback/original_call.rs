@@ -647,6 +647,7 @@ pub(crate) unsafe fn build_jargs_from_registers(
     let mut jargs: Vec<u64> = Vec::with_capacity(param_count);
     let mut gp_index: usize = 0;
     let mut fp_index: usize = 0;
+    let mut stack_index: usize = 0;
     for i in 0..param_count {
         let type_sig = param_types.get(i).map(|s| s.as_str());
         let (gp_val, fp_val) = extract_jni_arg(
@@ -654,6 +655,7 @@ pub(crate) unsafe fn build_jargs_from_registers(
             is_floating_point_type(type_sig),
             &mut gp_index,
             &mut fp_index,
+            &mut stack_index,
         );
         jargs.push(if is_floating_point_type(type_sig) {
             fp_val
@@ -662,6 +664,74 @@ pub(crate) unsafe fn build_jargs_from_registers(
         });
     }
     jargs
+}
+
+unsafe fn js_value_from_jni_return(
+    ctx: *mut ffi::JSContext,
+    env: JniEnv,
+    ret_raw: u64,
+    return_type: u8,
+    return_type_sig: &str,
+) -> ffi::JSValue {
+    match return_type {
+        b'V' => ffi::qjs_undefined(),
+        b'Z' => JSValue::bool(ret_raw != 0).raw(),
+        b'I' | b'B' | b'C' | b'S' => JSValue::int(ret_raw as i32).raw(),
+        b'J' => ffi::JS_NewBigUint64(ctx, ret_raw),
+        b'F' => JSValue::float(f32::from_bits(ret_raw as u32) as f64).raw(),
+        b'D' => JSValue::float(f64::from_bits(ret_raw)).raw(),
+        b'L' | b'[' => {
+            if ret_raw == 0 {
+                ffi::qjs_null()
+            } else {
+                let js_val = marshal_jni_arg_to_js(ctx, env, ret_raw, 0, Some(return_type_sig));
+                // 如果 marshal 返回了 {__jptr} wrapper（普通 Object），直接用
+                if JSValue(js_val).is_object() {
+                    let jptr = JSValue(js_val).get_property(ctx, "__jptr");
+                    let has_jptr = !jptr.is_undefined();
+                    jptr.free(ctx);
+                    if has_jptr {
+                        return js_val;
+                    }
+                }
+                // unboxed (String/Integer/Boolean/Array 等):
+                // 包装为 {value: 可读值, __origJobject: 原始 jobject}
+                // handle_result 优先读 __origJobject，确保所有类型安全 round-trip
+                let wrapper = ffi::JS_NewObject(ctx);
+                let w = JSValue(wrapper);
+                w.set_property(ctx, "value", JSValue(js_val));
+                let ptr_val = ffi::JS_NewBigUint64(ctx, ret_raw);
+                w.set_property(ctx, "__origJobject", JSValue(ptr_val));
+                // toString() 返回可读值，console.log 友好
+                let to_str_src = b"(function(){return String(this.value);})\0";
+                let to_str = ffi::JS_Eval(ctx, to_str_src.as_ptr() as *const _,
+                    (to_str_src.len() - 1) as _, b"<toString>\0".as_ptr() as *const _, 0);
+                if ffi::qjs_is_exception(to_str) == 0 {
+                    w.set_property(ctx, "toString", JSValue(to_str));
+                } else {
+                    ffi::qjs_free_value(ctx, to_str);
+                }
+                wrapper
+            }
+        }
+        _ => ffi::qjs_undefined(),
+    }
+}
+
+unsafe fn js_value_from_primitive_return(
+    ctx: *mut ffi::JSContext,
+    ret_raw: u64,
+    return_type: u8,
+) -> ffi::JSValue {
+    match return_type {
+        b'V' => ffi::qjs_undefined(),
+        b'Z' => JSValue::bool(ret_raw != 0).raw(),
+        b'I' | b'B' | b'C' | b'S' => JSValue::int(ret_raw as i32).raw(),
+        b'J' => ffi::JS_NewBigUint64(ctx, ret_raw),
+        b'F' => JSValue::float(f32::from_bits(ret_raw as u32) as f64).raw(),
+        b'D' => JSValue::float(f64::from_bits(ret_raw)).raw(),
+        _ => ffi::qjs_undefined(),
+    }
 }
 
 #[inline]
@@ -709,10 +779,12 @@ pub(crate) unsafe fn prepare_fast_orig_router_frame(
 
     let mut gp_index: usize = 0;
     let mut fp_index: usize = 0;
+    let mut stack_index: usize = 0;
     for i in 0..param_count {
         let type_sig = param_types.get(i).map(|s| s.as_str());
         let is_fp = is_floating_point_type(type_sig);
-        let (gp_val, _fp_val) = extract_jni_arg(hook_ctx, is_fp, &mut gp_index, &mut fp_index);
+        let (gp_val, _fp_val) =
+            extract_jni_arg(hook_ctx, is_fp, &mut gp_index, &mut fp_index, &mut stack_index);
         if !is_object_sig(type_sig) || gp_val == 0 {
             continue;
         }
@@ -772,6 +844,8 @@ unsafe extern "C" fn js_call_original(
         param_types,
         quick_trampoline,
         use_blr,
+        native_entry_trampoline,
+        native_entry_critical,
     ) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
@@ -804,12 +878,28 @@ unsafe extern "C" fn js_call_original(
             data.param_types.clone(),
             data.quick_trampoline,
             data.use_blr,
+            data.native_entry_trampoline,
+            data.native_entry_critical,
         )
     }; // lock released
 
     // art_method_addr 已在上方检查 (!=0), 此处无需再检查
 
     let hook_ctx = &*ctx_ptr;
+
+    if native_entry_trampoline != 0 && native_entry_critical {
+        let ret_x0 = hook_ffi::hook_invoke_trampoline(
+            ctx_ptr,
+            native_entry_trampoline as *mut std::ffi::c_void,
+        );
+        let ret_raw = if matches!(return_type, b'F' | b'D') {
+            (*ctx_ptr).d[0]
+        } else {
+            ret_x0
+        };
+        (*ctx_ptr).x[0] = ret_x0;
+        return js_value_from_primitive_return(ctx, ret_raw, return_type);
+    }
 
     // Unified JNI calling convention: x0=JNIEnv*, x1=this/class, x2+=args
     let env: JniEnv = {
@@ -822,6 +912,20 @@ unsafe extern "C" fn js_call_original(
         }
         e
     };
+
+    if native_entry_trampoline != 0 {
+        let ret_x0 = hook_ffi::hook_invoke_trampoline(
+            ctx_ptr,
+            native_entry_trampoline as *mut std::ffi::c_void,
+        );
+        let ret_raw = if matches!(return_type, b'F' | b'D') {
+            (*ctx_ptr).d[0]
+        } else {
+            ret_x0
+        };
+        (*ctx_ptr).x[0] = ret_x0;
+        return js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig);
+    }
 
     // 始终从 hook_ctx 寄存器读参数 (transition ref)。
     // transition ref 指向 GenericJNI 帧 vreg CompressedReference，GC 会实时更新该值。
@@ -865,47 +969,5 @@ unsafe extern "C" fn js_call_original(
         use_blr,
     );
 
-    match return_type {
-        b'V' => ffi::qjs_undefined(),
-        b'Z' => JSValue::bool(ret_raw != 0).raw(),
-        b'I' | b'B' | b'C' | b'S' => JSValue::int(ret_raw as i32).raw(),
-        b'J' => ffi::JS_NewBigUint64(ctx, ret_raw),
-        b'F' => JSValue::float(f32::from_bits(ret_raw as u32) as f64).raw(),
-        b'D' => JSValue::float(f64::from_bits(ret_raw)).raw(),
-        b'L' | b'[' => {
-            if ret_raw == 0 {
-                ffi::qjs_null()
-            } else {
-                let js_val = marshal_jni_arg_to_js(ctx, env, ret_raw, 0, Some(&return_type_sig));
-                // 如果 marshal 返回了 {__jptr} wrapper（普通 Object），直接用
-                if JSValue(js_val).is_object() {
-                    let jptr = JSValue(js_val).get_property(ctx, "__jptr");
-                    let has_jptr = !jptr.is_undefined();
-                    jptr.free(ctx);
-                    if has_jptr {
-                        return js_val;
-                    }
-                }
-                // unboxed (String/Integer/Boolean/Array 等):
-                // 包装为 {value: 可读值, __origJobject: 原始 jobject}
-                // handle_result 优先读 __origJobject，确保所有类型安全 round-trip
-                let wrapper = ffi::JS_NewObject(ctx);
-                let w = JSValue(wrapper);
-                w.set_property(ctx, "value", JSValue(js_val));
-                let ptr_val = ffi::JS_NewBigUint64(ctx, ret_raw);
-                w.set_property(ctx, "__origJobject", JSValue(ptr_val));
-                // toString() 返回可读值，console.log 友好
-                let to_str_src = b"(function(){return String(this.value);})\0";
-                let to_str = ffi::JS_Eval(ctx, to_str_src.as_ptr() as *const _,
-                    (to_str_src.len() - 1) as _, b"<toString>\0".as_ptr() as *const _, 0);
-                if ffi::qjs_is_exception(to_str) == 0 {
-                    w.set_property(ctx, "toString", JSValue(to_str));
-                } else {
-                    ffi::qjs_free_value(ctx, to_str);
-                }
-                wrapper
-            }
-        }
-        _ => ffi::qjs_undefined(),
-    }
+    js_value_from_jni_return(ctx, env, ret_raw, return_type, &return_type_sig)
 }

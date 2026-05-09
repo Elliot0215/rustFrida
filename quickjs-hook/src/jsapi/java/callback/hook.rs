@@ -74,6 +74,73 @@ unsafe fn marshal_jni_arg_to_js(
     }
 }
 
+#[inline]
+unsafe fn extract_critical_native_arg(
+    hook_ctx: &hook_ffi::HookContext,
+    is_fp: bool,
+    gp_index: &mut usize,
+    fp_index: &mut usize,
+    stack_index: &mut usize,
+) -> (u64, u64) {
+    if is_fp {
+        let fp_val = if *fp_index < 8 {
+            hook_ctx.d[*fp_index]
+        } else {
+            let sp = hook_ctx.sp as usize;
+            let value = *((sp + *stack_index * 8) as *const u64);
+            *stack_index += 1;
+            value
+        };
+        *fp_index += 1;
+        (0, fp_val)
+    } else {
+        let gp_val = if *gp_index < 8 {
+            hook_ctx.x[*gp_index]
+        } else {
+            let sp = hook_ctx.sp as usize;
+            let value = *((sp + *stack_index * 8) as *const u64);
+            *stack_index += 1;
+            value
+        };
+        *gp_index += 1;
+        (gp_val, 0)
+    }
+}
+
+unsafe fn marshal_critical_native_arg_to_js(
+    ctx: *mut ffi::JSContext,
+    raw: u64,
+    fp_raw: u64,
+    type_sig: Option<&str>,
+) -> ffi::JSValue {
+    match type_sig.and_then(|s| s.as_bytes().first().copied()) {
+        Some(b'Z') => JSValue::bool(raw != 0).raw(),
+        Some(b'B') => JSValue::int(raw as i8 as i32).raw(),
+        Some(b'C') => {
+            let ch = std::char::from_u32(raw as u32).unwrap_or('\0');
+            JSValue::string(ctx, &ch.to_string()).raw()
+        }
+        Some(b'S') => JSValue::int(raw as i16 as i32).raw(),
+        Some(b'I') => JSValue::int(raw as i32).raw(),
+        Some(b'J') => ffi::JS_NewBigUint64(ctx, raw),
+        Some(b'F') => JSValue::float(f32::from_bits(fp_raw as u32) as f64).raw(),
+        Some(b'D') => JSValue::float(f64::from_bits(fp_raw)).raw(),
+        _ => ffi::JS_NewBigUint64(ctx, raw),
+    }
+}
+
+#[inline]
+unsafe fn write_primitive_return_to_context(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    return_type: u8,
+    ret_raw: u64,
+) {
+    if matches!(return_type, b'F' | b'D') {
+        (*ctx_ptr).d[0] = ret_raw;
+    }
+    (*ctx_ptr).x[0] = ret_raw;
+}
+
 // ============================================================================
 // Hook callback (runs in hooked thread, called by ART JNI trampoline)
 // ============================================================================
@@ -111,7 +178,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         param_types,
         class_global_ref,
         quick_trampoline,
-        use_blr,
+        native_entry_trampoline,
     ) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
@@ -141,7 +208,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             hook_data.param_types.clone(),
             hook_data.class_global_ref,
             hook_data.quick_trampoline,
-            hook_data.use_blr,
+            hook_data.native_entry_trampoline,
         )
     }; // lock released
 
@@ -172,6 +239,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                 let arr = ffi::JS_NewArray(ctx);
                 let mut gp_index: usize = 0;
                 let mut fp_index: usize = 0;
+                let mut stack_index: usize = 0;
                 for i in 0..param_count {
                     let type_sig = param_types.get(i).map(|s| s.as_str());
                     let (raw, fp_raw) = extract_jni_arg(
@@ -179,6 +247,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                         is_floating_point_type(type_sig),
                         &mut gp_index,
                         &mut fp_index,
+                        &mut stack_index,
                     );
                     let val = marshal_jni_arg_to_js(ctx, env, raw, fp_raw, type_sig);
                     ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
@@ -255,7 +324,7 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                         js_value_to_u64_or_zero(ctx, result_val)
                     }
                 };
-                (*ctx_ptr).x[0] = ret_u64;
+                write_primitive_return_to_context(ctx_ptr, return_type, ret_u64);
             }
         },
         // JS 抛异常透明递传: 调用 js_call_original 代替直接 invoke_original_jni。
@@ -271,7 +340,8 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         |ctx, js_ctx_val| {
             let result = js_call_original(ctx, js_ctx_val, 0, std::ptr::null_mut());
             if return_type != b'V' {
-                (*ctx_ptr).x[0] = js_result_to_raw(ctx, JSValue(result), return_type);
+                let ret_u64 = js_result_to_raw(ctx, JSValue(result), return_type);
+                write_primitive_return_to_context(ctx_ptr, return_type, ret_u64);
             }
             ffi::qjs_free_value(ctx, result);
             result_was_set.set(true);
@@ -285,7 +355,17 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     // (从 callback 入口到这里没有 GC 触发点，transition ref 仍然有效)
     if !result_was_set.get() {
         let env = hook_ctx_env;
-        if !env.is_null() {
+        if native_entry_trampoline != 0 {
+            let ret = hook_ffi::hook_invoke_trampoline(
+                ctx_ptr,
+                native_entry_trampoline as *mut std::ffi::c_void,
+            );
+            if return_type != b'V' {
+                if !matches!(return_type, b'F' | b'D') {
+                    (*ctx_ptr).x[0] = ret;
+                }
+            }
+        } else if !env.is_null() {
             let hook_ctx = &*ctx_ptr;
             let jargs = build_jargs_from_registers(hook_ctx, param_count, &param_types);
             let jargs_ptr = if param_count > 0 {
@@ -298,13 +378,140 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                 hook_ctx.x[1], return_type, is_static, jargs_ptr, quick_trampoline, false,
             );
             if return_type != b'V' {
-                (*ctx_ptr).x[0] = ret;
+                write_primitive_return_to_context(ctx_ptr, return_type, ret);
             }
         } else {
             (*ctx_ptr).x[0] = 0;
         }
     }
 
+}
+
+/// Callback for @CriticalNative registered entries.
+///
+/// Critical native ABI has no JNIEnv*/jclass receiver:
+///   x0-x7 / d0-d7 = Java primitive arguments directly.
+///
+/// Object parameters/returns are not valid for CriticalNative and are rejected
+/// during installation.
+pub(super) unsafe extern "C" fn java_critical_native_hook_callback(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    user_data: *mut std::ffi::c_void,
+) {
+    if ctx_ptr.is_null() || user_data.is_null() {
+        return;
+    }
+
+    let _in_flight_guard = InFlightJavaHookGuard::enter();
+    let _callback_scope = JavaHookCallbackScope::enter();
+    let _gate_guard = crate::jsapi::java::art_controller::CallbackGateGuard;
+
+    let art_method_addr = user_data as u64;
+    let (
+        ctx_usize,
+        callback_bytes,
+        param_count,
+        return_type,
+        param_types,
+        native_entry_trampoline,
+    ) = {
+        let guard = match JAVA_HOOK_REGISTRY.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let registry = match guard.as_ref() {
+            Some(r) => r,
+            None => {
+                (*ctx_ptr).x[0] = 0;
+                return;
+            }
+        };
+        let hook_data = match registry.get(&art_method_addr) {
+            Some(d) => d,
+            None => {
+                (*ctx_ptr).x[0] = 0;
+                return;
+            }
+        };
+        (
+            hook_data.ctx,
+            hook_data.callback_bytes,
+            hook_data.param_count,
+            hook_data.return_type,
+            hook_data.param_types.clone(),
+            hook_data.native_entry_trampoline,
+        )
+    };
+
+    let result_was_set = std::cell::Cell::new(false);
+
+    invoke_hook_callback_common(
+        ctx_usize,
+        &callback_bytes,
+        "java critical native hook",
+        art_method_addr,
+        |ctx| {
+            let js_ctx = ffi::JS_NewObject(ctx);
+            let hook_ctx = &*ctx_ptr;
+            let atoms = hot_atoms();
+
+            let arr = ffi::JS_NewArray(ctx);
+            let mut gp_index: usize = 0;
+            let mut fp_index: usize = 0;
+            let mut stack_index: usize = 0;
+            for i in 0..param_count {
+                let type_sig = param_types.get(i).map(|s| s.as_str());
+                let (raw, fp_raw) = extract_critical_native_arg(
+                    hook_ctx,
+                    is_floating_point_type(type_sig),
+                    &mut gp_index,
+                    &mut fp_index,
+                    &mut stack_index,
+                );
+                let val = marshal_critical_native_arg_to_js(ctx, raw, fp_raw, type_sig);
+                ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
+            }
+            set_js_value_property_atom(ctx, js_ctx, atoms.args, arr);
+
+            set_js_u64_property_atom(ctx, js_ctx, atoms.env, 0);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.hook_ctx_ptr, ctx_ptr as usize as u64);
+            set_js_u64_property_atom(ctx, js_ctx, atoms.hook_art_method, art_method_addr);
+            set_js_cfunction_property(ctx, js_ctx, "orig", js_call_original, 0);
+
+            js_ctx
+        },
+        |ctx, _js_ctx, result| {
+            result_was_set.set(true);
+            if return_type != b'V' {
+                let ret_u64 = js_result_to_raw(ctx, JSValue(result), return_type);
+                write_primitive_return_to_context(ctx_ptr, return_type, ret_u64);
+            }
+        },
+        |ctx, js_ctx_val| {
+            let result = js_call_original(ctx, js_ctx_val, 0, std::ptr::null_mut());
+            if return_type != b'V' {
+                let ret_u64 = js_result_to_raw(ctx, JSValue(result), return_type);
+                write_primitive_return_to_context(ctx_ptr, return_type, ret_u64);
+            }
+            ffi::qjs_free_value(ctx, result);
+            result_was_set.set(true);
+        },
+    );
+
+    if !result_was_set.get() && native_entry_trampoline != 0 {
+        let ret = hook_ffi::hook_invoke_trampoline(
+            ctx_ptr,
+            native_entry_trampoline as *mut std::ffi::c_void,
+        );
+        if return_type != b'V' {
+            let ret_raw = if matches!(return_type, b'F' | b'D') {
+                (*ctx_ptr).d[0]
+            } else {
+                ret
+            };
+            write_primitive_return_to_context(ctx_ptr, return_type, ret_raw);
+        }
+    }
 }
 
 /// 把 js_call_original 返回的 JSValue 还原为写 x[0] 的 u64。
