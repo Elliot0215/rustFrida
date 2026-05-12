@@ -6,6 +6,7 @@ use nix::unistd::Pid;
 use std::mem::size_of;
 use std::os::unix::io::RawFd;
 
+use crate::proc_mem::ProcMem;
 use crate::process::{
     attach_to_process, call_target_function, read_memory, read_remote_mem, write_bytes, write_memory,
 };
@@ -27,6 +28,14 @@ pub(crate) const QBDI_HELPER_SO: &[u8] = include_bytes!(env!("QBDI_HELPER_SO_PAT
 // aarch64 syscall numbers
 const SYS_PIDFD_OPEN: i64 = 434;
 const SYS_PIDFD_GETFD: i64 = 438;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InjectionResult {
+    pub(crate) host_fd: RawFd,
+    pub(crate) target_pid: i32,
+    pub(crate) loader_ctx_addr: u64,
+    pub(crate) agent_current_thread_eval_impl: u64,
+}
 
 /// 通过 pidfd_getfd 从目标进程提取文件描述符到 host
 fn extract_fd_from_target(pid: i32, target_fd: i32) -> Result<RawFd, String> {
@@ -158,7 +167,7 @@ pub(crate) fn watch_and_inject(
     so_pattern: &str,
     timeout_secs: Option<u64>,
     string_overrides: &std::collections::HashMap<String, String>,
-) -> Result<RawFd, String> {
+) -> Result<InjectionResult, String> {
     use ldmonitor::DlopenMonitor;
     use std::time::Duration;
 
@@ -418,7 +427,7 @@ fn send_exact(sockfd: RawFd, buf: &[u8]) -> Result<(), String> {
 
 /// Host 端执行 loader IPC 握手协议
 /// 返回 REPL 用的 host_fd
-fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String> {
+fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32, loader_ctx_addr: usize) -> Result<InjectionResult, String> {
     // 1. 接收 HELLO 消息: [type:u8][thread_id:i32]
     let mut msg_type = [0u8; 1];
     recv_exact(ctrl_fd, &mut msg_type)?;
@@ -499,12 +508,36 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
         }
     }
 
+    let loader_ctx = read_loader_runtime_context(target_pid, loader_ctx_addr)?;
+    if loader_ctx.agent_current_thread_eval_impl == 0 {
+        unsafe { close(host_repl_fd) };
+        return Err("Loader 未解析 rustfrida_loadjs_current_thread".to_string());
+    }
+
     // 5. 发送 ACK
     send_exact(ctrl_fd, &[message_type::ACK])?;
 
     // ctrl_fd 保持打开用于生命周期管理（BYE 消息）
     // 但对于 rustFrida，REPL 通信走 host_repl_fd
-    Ok(host_repl_fd)
+    Ok(InjectionResult {
+        host_fd: host_repl_fd,
+        target_pid,
+        loader_ctx_addr: loader_ctx_addr as u64,
+        agent_current_thread_eval_impl: loader_ctx.agent_current_thread_eval_impl,
+    })
+}
+
+fn read_loader_runtime_context(pid: i32, loader_ctx_addr: usize) -> Result<RustFridaLoaderContext, String> {
+    let mem = ProcMem::open(pid as u32)?;
+    let mut ctx = RustFridaLoaderContext::default();
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            &mut ctx as *mut RustFridaLoaderContext as *mut u8,
+            std::mem::size_of::<RustFridaLoaderContext>(),
+        )
+    };
+    mem.pread_exact(bytes, loader_ctx_addr as u64)?;
+    Ok(ctx)
 }
 
 /// Frida-style 注入：bootstrapper 在目标进程内探测 libc/linker API，
@@ -513,7 +546,7 @@ fn run_loader_handshake(ctrl_fd: RawFd, target_pid: i32) -> Result<RawFd, String
 pub(crate) fn inject_via_bootstrapper(
     pid: i32,
     string_overrides: &std::collections::HashMap<String, String>,
-) -> Result<RawFd, String> {
+) -> Result<InjectionResult, String> {
     log_info!("正在附加到进程 PID: {} (Frida-style bootstrapper)", pid);
 
     // 附加到目标进程
@@ -668,24 +701,26 @@ pub(crate) fn inject_via_bootstrapper(
     // 写入字符串字面量
     let str_base = loader_libc_addr + size_of::<FridaLibcApi>();
     let entrypoint_str = b"hello_entry\0";
+    let current_thread_eval_str = b"rustfrida_loadjs_current_thread\0";
     let data_str = b"\0";
     let fallback_str = format!("\x00rustfrida-{}\0", pid); // abstract socket: \0 prefix
     write_bytes(pid, str_base, entrypoint_str)?;
-    write_bytes(pid, str_base + entrypoint_str.len(), data_str)?;
-    write_bytes(
-        pid,
-        str_base + entrypoint_str.len() + data_str.len(),
-        fallback_str.as_bytes(),
-    )?;
+    let current_thread_eval_str_addr = str_base + entrypoint_str.len();
+    write_bytes(pid, current_thread_eval_str_addr, current_thread_eval_str)?;
+    let data_str_addr = current_thread_eval_str_addr + current_thread_eval_str.len();
+    write_bytes(pid, data_str_addr, data_str)?;
+    let fallback_str_addr = data_str_addr + data_str.len();
+    write_bytes(pid, fallback_str_addr, fallback_str.as_bytes())?;
 
     // 构造 LoaderContext
     let mut loader_ctx = RustFridaLoaderContext::default();
     loader_ctx.ctrlfds = bootstrap_ctx.ctrlfds;
     loader_ctx.agent_entrypoint = str_base as u64;
-    loader_ctx.agent_data = (str_base + entrypoint_str.len()) as u64;
-    loader_ctx.fallback_address = (str_base + entrypoint_str.len() + data_str.len()) as u64;
+    loader_ctx.agent_data = data_str_addr as u64;
+    loader_ctx.fallback_address = fallback_str_addr as u64;
     loader_ctx.libc = loader_libc_addr as u64;
     loader_ctx.string_table_addr = string_table_addr as u64;
+    loader_ctx.agent_current_thread_eval = current_thread_eval_str_addr as u64;
     write_memory(pid, loader_ctx_addr, &loader_ctx)?;
 
     // 写入 LibcApi（给 loader 用）
@@ -722,10 +757,10 @@ pub(crate) fn inject_via_bootstrapper(
     }
 
     // === Host 端 loader IPC 握手 ===
-    let host_repl_fd = run_loader_handshake(host_ctrl_fd, pid).map_err(|e| {
+    let result = run_loader_handshake(host_ctrl_fd, pid, loader_ctx_addr).map_err(|e| {
         unsafe { close(host_ctrl_fd) };
         e
     })?;
 
-    Ok(host_repl_fd)
+    Ok(result)
 }

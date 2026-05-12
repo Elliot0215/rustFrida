@@ -21,7 +21,10 @@ use crate::args::Args;
 use crate::communication::{send_command, start_socketpair_handler};
 use crate::injection::inject_via_bootstrapper;
 use crate::process::find_pid_by_name;
-use crate::repl::{preconfigure_java_stealth_if_declared, print_eval_result, print_help, run_js_repl};
+use crate::repl::{
+    build_loadjs_init_cmd, preconfigure_java_stealth_if_declared, print_eval_result, print_help, run_js_repl,
+    script_uses_java_api,
+};
 use crate::session::{Session, SessionManager};
 use crate::spawn;
 use crate::{log_error, log_info, log_success, log_warn};
@@ -126,53 +129,96 @@ fn parse_script_flag(parts: &[&str]) -> (Vec<String>, Option<String>) {
 }
 
 /// 在目标进程暂停期间加载脚本（用于 spawn 模式）
-fn load_script_on_session(session: &Session, script_path: &str) {
+fn load_script_on_session(session: &Session, script_path: &str, stop_worker_after_load: bool) -> bool {
     let sender = match session.get_sender() {
         Some(s) => s,
         None => {
             log_error!("[#{}] agent 未连接，无法加载脚本", session.id);
-            return;
+            return false;
         }
     };
     let script = match std::fs::read_to_string(script_path) {
         Ok(s) => s,
         Err(e) => {
             log_error!("[#{}] 读取脚本 '{}' 失败: {}", session.id, script_path, e);
-            return;
+            return false;
         }
     };
 
+    if script.is_empty() {
+        log_info!("[#{}] 脚本为空，跳过加载: {}", session.id, script_path);
+        return false;
+    }
+
     if let Err(e) = preconfigure_java_stealth_if_declared(session, &script) {
         log_error!("[#{}] {}", session.id, e);
-        return;
+        return false;
     }
 
-    // jsinit
-    session.eval_state.clear();
-    if let Err(e) = send_command(sender, "jsinit") {
-        log_error!("[#{}] 发送 jsinit 失败: {}", session.id, e);
-        return;
-    }
-    match session.eval_state.recv_timeout(std::time::Duration::from_secs(10)) {
-        None => {
-            log_warn!("[#{}] 等待引擎初始化超时", session.id);
-            return;
+    if script_uses_java_api(&script) {
+        log_info!("[#{}] 检测到 Java 脚本，切到目标主线程执行", session.id);
+        let filename = std::path::Path::new(script_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("script.js")
+            .to_string();
+        session.eval_state.clear();
+        match crate::remote_agent::eval_js_on_main_thread(session, &script, &filename, true) {
+            Ok(()) => match session
+                .eval_state
+                .recv_timeout(std::time::Duration::from_secs(if stop_worker_after_load {
+                    10
+                } else {
+                    30
+                })) {
+                None => log_warn!("[#{}] 脚本加载超时", session.id),
+                Some(Err(e)) => log_error!("[#{}] 脚本执行失败: {}", session.id, e),
+                Some(Ok(out)) => {
+                    if !out.is_empty() {
+                        log_success!("[#{}] => {}", session.id, out);
+                    }
+                }
+            },
+            Err(e) => log_error!("[#{}] 主线程加载 Java 脚本失败: {}", session.id, e),
         }
-        Some(Err(e)) => {
-            log_error!("[#{}] 引擎初始化失败: {}", session.id, e);
-            return;
-        }
-        Some(Ok(_)) => {}
+        return false;
     }
 
-    // loadjs
     session.eval_state.clear();
-    let cmd = crate::repl::build_loadjs_cmd(&script, Some(script_path));
+    let cmd = if stop_worker_after_load {
+        build_loadjs_init_cmd(&script, Some(script_path))
+    } else {
+        if let Err(e) = send_command(sender, "jsinit") {
+            log_error!("[#{}] 发送 jsinit 失败: {}", session.id, e);
+            return false;
+        }
+        match session.eval_state.recv_timeout(std::time::Duration::from_secs(10)) {
+            None => {
+                log_warn!("[#{}] 等待引擎初始化超时", session.id);
+                return false;
+            }
+            Some(Err(e)) => {
+                log_error!("[#{}] 引擎初始化失败: {}", session.id, e);
+                return false;
+            }
+            Some(Ok(_)) => {}
+        }
+
+        session.eval_state.clear();
+        crate::repl::build_loadjs_cmd(&script, Some(script_path))
+    };
     if let Err(e) = send_command(sender, cmd) {
         log_error!("[#{}] 发送 loadjs 失败: {}", session.id, e);
-        return;
+        return false;
     }
-    match session.eval_state.recv_timeout(std::time::Duration::from_secs(30)) {
+    match session
+        .eval_state
+        .recv_timeout(std::time::Duration::from_secs(if stop_worker_after_load {
+            1
+        } else {
+            30
+        })) {
+        None if stop_worker_after_load => log_info!("[#{}] 脚本预加载仍在执行，先恢复子进程", session.id),
         None => log_warn!("[#{}] 脚本加载超时", session.id),
         Some(Err(e)) => log_error!("[#{}] 脚本执行失败: {}", session.id, e),
         Some(Ok(out)) => {
@@ -181,6 +227,7 @@ fn load_script_on_session(session: &Session, script_path: &str) {
             }
         }
     }
+    false
 }
 
 /// 发送 shutdown 并等待 agent 断连
@@ -217,9 +264,10 @@ fn do_spawn(
         .spawn(move || {
             // ensure_zymbiote_loaded 内部有幂等保护，并发安全
             match spawn::spawn_and_inject(&package, &string_overrides) {
-                Ok((pid, host_fd)) => {
+                Ok((pid, injection)) => {
                     session.pid.store(pid, Ordering::Relaxed);
-                    let _handle = start_socketpair_handler(host_fd, session.clone());
+                    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
+                    let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
                     if !session.wait_connected(30) {
                         log_error!("[#{}] 等待 agent 连接超时", sid);
@@ -237,13 +285,21 @@ fn do_spawn(
                     }
 
                     // 在子进程暂停期间加载脚本
-                    if let Some(ref script_path) = script {
-                        load_script_on_session(&session, script_path);
-                    }
+                    let deferred_java_script = script.as_ref().and_then(|script_path| {
+                        if load_script_on_session(&session, script_path, true) {
+                            Some(script_path.clone())
+                        } else {
+                            None
+                        }
+                    });
 
                     // resume 子进程
                     if let Err(e) = spawn::resume_child(pid as u32) {
                         log_error!("[#{}] 恢复子进程失败: {}", sid, e);
+                    }
+                    if let Some(script_path) = deferred_java_script {
+                        log_info!("[#{}] 子进程已恢复，执行延后 Java 脚本", sid);
+                        load_script_on_session(&session, &script_path, false);
                     }
 
                     log_success!("[#{}] {} 已就绪 (PID: {})", sid, package, pid);
@@ -270,9 +326,10 @@ fn do_attach(
         .name("wwb-attach".into())
         .spawn(move || {
             match inject_via_bootstrapper(pid, &string_overrides) {
-                Ok(host_fd) => {
+                Ok(injection) => {
                     session.pid.store(pid, Ordering::Relaxed);
-                    let _handle = start_socketpair_handler(host_fd, session.clone());
+                    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
+                    let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
                     if !session.wait_connected(30) {
                         log_error!("[#{}] 等待 agent 连接超时", sid);
@@ -288,7 +345,7 @@ fn do_attach(
 
                     // 非 spawn 模式：先连接再加载脚本
                     if let Some(ref script_path) = script {
-                        load_script_on_session(&session, script_path);
+                        load_script_on_session(&session, script_path, false);
                     }
 
                     log_success!("[#{}] {} 已就绪 (PID: {})", sid, label, pid);

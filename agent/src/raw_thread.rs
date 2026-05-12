@@ -13,11 +13,6 @@ struct RawThreadStart {
     func: Option<Box<dyn FnOnce() + Send>>,
 }
 
-struct PthreadStart {
-    name: &'static [u8],
-    func: Option<Box<dyn FnOnce() + Send>>,
-}
-
 pub(crate) fn spawn_detached<F>(name: &'static [u8], func: F) -> Result<pid_t, String>
 where
     F: FnOnce() + Send + 'static,
@@ -52,44 +47,6 @@ where
             Err(e)
         }
     }
-}
-
-#[cfg(feature = "quickjs")]
-pub(crate) fn spawn_pthread_detached<F>(name: &'static [u8], func: F) -> Result<pid_t, String>
-where
-    F: FnOnce() + Send + 'static,
-{
-    type PthreadCreateFn = unsafe extern "C" fn(
-        *mut libc::pthread_t,
-        *const libc::pthread_attr_t,
-        extern "C" fn(*mut libc::c_void) -> *mut libc::c_void,
-        *mut libc::c_void,
-    ) -> libc::c_int;
-    type PthreadDetachFn = unsafe extern "C" fn(libc::pthread_t) -> libc::c_int;
-
-    let create_addr = crate::linker::resolve_loaded_symbol("libc.so", "pthread_create")
-        .ok_or_else(|| "resolve libc pthread_create failed".to_string())?;
-    let detach_addr = crate::linker::resolve_loaded_symbol("libc.so", "pthread_detach")
-        .ok_or_else(|| "resolve libc pthread_detach failed".to_string())?;
-    let pthread_create: PthreadCreateFn = unsafe { std::mem::transmute(create_addr) };
-    let pthread_detach: PthreadDetachFn = unsafe { std::mem::transmute(detach_addr) };
-
-    let start = Box::into_raw(Box::new(PthreadStart {
-        name,
-        func: Some(Box::new(func)),
-    }));
-
-    let mut thread: libc::pthread_t = unsafe { std::mem::zeroed() };
-    let ret = unsafe { pthread_create(&mut thread, std::ptr::null(), pthread_thread_entry, start as *mut _) };
-    if ret != 0 {
-        unsafe {
-            drop(Box::from_raw(start));
-        }
-        return Err(format!("direct pthread_create failed: {}", ret));
-    }
-    let _ = unsafe { pthread_detach(thread) };
-
-    Ok(0)
 }
 
 pub(crate) fn sleep_ms(ms: i64) {
@@ -152,24 +109,4 @@ extern "C" fn raw_thread_entry(arg: usize) -> c_int {
     }
 
     0
-}
-
-#[cfg(feature = "quickjs")]
-extern "C" fn pthread_thread_entry(arg: *mut libc::c_void) -> *mut libc::c_void {
-    let mut start = unsafe { Box::from_raw(arg as *mut PthreadStart) };
-    unsafe {
-        gum_libc_syscall_4(
-            libc::SYS_prctl as c_long,
-            PR_SET_NAME as usize,
-            start.name.as_ptr() as usize,
-            0,
-            0,
-        );
-    }
-
-    if let Some(func) = start.func.take() {
-        func();
-    }
-
-    std::ptr::null_mut()
 }

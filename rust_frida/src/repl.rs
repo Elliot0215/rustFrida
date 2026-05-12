@@ -21,7 +21,7 @@ use crate::{log_error, log_info, log_warn};
 ///
 /// 脚本本身保留原始换行，不做任何 `\n → \r` 替换（wire 协议是长度前缀的二进制帧，
 /// 支持任意字节）。
-pub(crate) fn build_loadjs_cmd(script: &str, script_path: Option<&str>) -> String {
+fn build_loadjs_like_cmd(command: &str, script: &str, script_path: Option<&str>) -> String {
     if let Some(path) = script_path {
         let name = std::path::Path::new(path)
             .file_name()
@@ -29,13 +29,37 @@ pub(crate) fn build_loadjs_cmd(script: &str, script_path: Option<&str>) -> Strin
             .unwrap_or("script.js");
         // filename 内含 `[` / `]` / `\n` 会破坏解析，fallback 到 <eval>
         if name.contains('[') || name.contains(']') || name.contains('\n') {
-            format!("loadjs {}", script)
+            format!("{} {}", command, script)
         } else {
-            format!("loadjs [{}]\n{}", name, script)
+            format!("{} [{}]\n{}", command, name, script)
         }
     } else {
-        format!("loadjs {}", script)
+        format!("{} {}", command, script)
     }
+}
+
+fn script_filename(script_path: &str) -> String {
+    std::path::Path::new(script_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("script.js")
+        .to_string()
+}
+
+pub(crate) fn build_loadjs_cmd(script: &str, script_path: Option<&str>) -> String {
+    build_loadjs_like_cmd("loadjs", script, script_path)
+}
+
+pub(crate) fn build_loadjs_init_cmd(script: &str, script_path: Option<&str>) -> String {
+    build_loadjs_like_cmd("loadjs_init", script, script_path)
+}
+
+pub(crate) enum PreResumeLoad {
+    Loaded,
+}
+
+pub(crate) fn script_uses_java_api(script: &str) -> bool {
+    script.contains("Java.")
 }
 
 pub(crate) fn detect_java_stealth_mode(script: &str) -> Option<i32> {
@@ -274,6 +298,19 @@ impl Helper for JsReplCompleter {}
 ///
 /// 返回 `Ok(())` 仅表示脚本已送达并收到响应（响应内容由 `print_eval_result` 打印）。
 pub(crate) fn load_script_file(session: &Session, script_path: &str, reset: bool) -> Result<(), String> {
+    load_script_file_with_mode(session, script_path, reset, false).map(|_| ())
+}
+
+pub(crate) fn load_script_file_pre_resume(session: &Session, script_path: &str) -> Result<PreResumeLoad, String> {
+    load_script_file_with_mode(session, script_path, false, true)
+}
+
+fn load_script_file_with_mode(
+    session: &Session,
+    script_path: &str,
+    reset: bool,
+    stop_worker_after_load: bool,
+) -> Result<PreResumeLoad, String> {
     let sender = session.get_sender().ok_or_else(|| "agent 未连接".to_string())?;
     let script =
         std::fs::read_to_string(script_path).map_err(|e| format!("读取脚本文件 '{}' 失败: {}", script_path, e))?;
@@ -299,22 +336,53 @@ pub(crate) fn load_script_file(session: &Session, script_path: &str, reset: bool
         log_info!("加载脚本: {}", script_path);
     }
 
+    if script.is_empty() {
+        log_info!("脚本为空，跳过加载: {}", script_path);
+        return Ok(PreResumeLoad::Loaded);
+    }
+
     preconfigure_java_stealth_if_declared(session, &script)?;
 
-    session.eval_state.clear();
-    send_command(sender, "jsinit").map_err(|e| format!("发送 jsinit 失败: {}", e))?;
-    match session.eval_state.recv_timeout(std::time::Duration::from_secs(10)) {
-        None => return Err("等待引擎初始化超时".to_string()),
-        Some(Err(ref e)) if e.contains("已初始化") => {}
-        Some(Err(e)) => return Err(format!("引擎初始化失败: {}", e)),
-        Some(Ok(_)) => {}
+    if script_uses_java_api(&script) {
+        log_info!("检测到 Java 脚本，切到目标主线程执行");
+        let filename = script_filename(script_path);
+        session.eval_state.clear();
+        crate::remote_agent::eval_js_on_main_thread(session, &script, &filename, true)
+            .map_err(|e| format!("主线程加载 Java 脚本失败: {}", e))?;
+        print_eval_result(session, if stop_worker_after_load { 10 } else { 30 });
+        return Ok(PreResumeLoad::Loaded);
     }
 
     session.eval_state.clear();
-    let cmd = build_loadjs_cmd(&script, Some(script_path));
+    let cmd = if stop_worker_after_load {
+        build_loadjs_init_cmd(&script, Some(script_path))
+    } else {
+        send_command(sender, "jsinit").map_err(|e| format!("发送 jsinit 失败: {}", e))?;
+        match session.eval_state.recv_timeout(std::time::Duration::from_secs(10)) {
+            None => return Err("等待引擎初始化超时".to_string()),
+            Some(Err(ref e)) if e.contains("已初始化") => {}
+            Some(Err(e)) => return Err(format!("引擎初始化失败: {}", e)),
+            Some(Ok(_)) => {}
+        }
+
+        session.eval_state.clear();
+        build_loadjs_cmd(&script, Some(script_path))
+    };
     send_command(sender, cmd).map_err(|e| format!("发送 loadjs 失败: {}", e))?;
-    print_eval_result(session, 30);
-    Ok(())
+    if stop_worker_after_load {
+        match session.eval_state.recv_timeout(std::time::Duration::from_secs(1)) {
+            None => log_info!("脚本预加载仍在执行，先恢复子进程"),
+            Some(Err(e)) => return Err(format!("脚本执行失败: {}", e)),
+            Some(Ok(out)) => {
+                if !out.is_empty() {
+                    log_info!("=> {}", out);
+                }
+            }
+        }
+    } else {
+        print_eval_result(session, 30);
+    }
+    Ok(PreResumeLoad::Loaded)
 }
 
 /// 打印 eval 响应：等待 session.eval_state 结果并格式化输出。

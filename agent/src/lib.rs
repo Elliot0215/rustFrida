@@ -250,6 +250,85 @@ fn eval_and_respond(script: &str, filename: &str, empty_err: &[u8]) {
 }
 
 #[cfg(feature = "quickjs")]
+fn init_js_and_respond() {
+    match quickjs_loader::init() {
+        Ok(_) => send_eval_ok("initialized"),
+        Err(e) => send_eval_err(&e),
+    }
+}
+
+#[cfg(feature = "quickjs")]
+fn init_eval_and_respond(script: &str, filename: &str) {
+    match quickjs_loader::init() {
+        Ok(_) => eval_and_respond(script, filename, b"[quickjs] Error: empty script"),
+        Err(ref e) if e.contains("已初始化") => {
+            eval_and_respond(script, filename, b"[quickjs] Error: empty script")
+        }
+        Err(e) => send_eval_err(&e),
+    }
+}
+
+#[cfg(feature = "quickjs")]
+#[no_mangle]
+pub extern "C" fn rustfrida_loadjs_current_thread(
+    script_ptr: *const u8,
+    script_len: usize,
+    filename_ptr: *const u8,
+    filename_len: usize,
+    init_engine: i32,
+) -> i32 {
+    let result = std::panic::catch_unwind(|| {
+        if script_ptr.is_null() && script_len != 0 {
+            send_eval_err("[quickjs] remote script pointer is null");
+            return -1;
+        }
+        if filename_ptr.is_null() && filename_len != 0 {
+            send_eval_err("[quickjs] remote filename pointer is null");
+            return -1;
+        }
+
+        let script_bytes = unsafe { std::slice::from_raw_parts(script_ptr, script_len) };
+        let filename_bytes = unsafe { std::slice::from_raw_parts(filename_ptr, filename_len) };
+        let script = match std::str::from_utf8(script_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                send_eval_err("[quickjs] script is not valid UTF-8");
+                return -1;
+            }
+        };
+        let filename = match std::str::from_utf8(filename_bytes) {
+            Ok(s) => s,
+            Err(_) => {
+                send_eval_err("[quickjs] filename is not valid UTF-8");
+                return -1;
+            }
+        };
+
+        if init_engine != 0 {
+            init_eval_and_respond(script, filename);
+        } else {
+            eval_and_respond(script, filename, b"[quickjs] Error: empty script");
+        }
+        0
+    });
+
+    result.unwrap_or_else(|_| {
+        send_eval_err("[quickjs] current-thread eval panicked");
+        -1
+    })
+}
+
+#[cfg(feature = "quickjs")]
+fn set_java_stealth_and_respond(mode: i64) {
+    match quickjs_loader::init_hook_runtime()
+        .and_then(|_| quickjs_hook::jsapi::java::set_host_stealth_mode(mode).map(|m| m.to_string()))
+    {
+        Ok(mode) => send_eval_ok(&format!("javastealth={}", mode)),
+        Err(e) => send_eval_err(&format!("javastealth failed: {}", e)),
+    }
+}
+
+#[cfg(feature = "quickjs")]
 fn dispatch_js_task<F>(task: F)
 where
     F: FnOnce() + Send + 'static,
@@ -258,7 +337,7 @@ where
         let mut guard = JS_WORKER_TX.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let (tx, rx) = mpsc::channel::<AgentTask>();
-            match raw_thread::spawn_pthread_detached(b"wwb-js\0", move || {
+            match raw_thread::spawn_detached(b"wwb-js\0", move || {
                 while let Ok(task) = rx.recv() {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
                 }
@@ -334,14 +413,7 @@ fn process_cmd(command: &str) {
                 .nth(1)
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0);
-            dispatch_js_task(move || {
-                match quickjs_loader::init_hook_runtime()
-                    .and_then(|_| quickjs_hook::jsapi::java::set_host_stealth_mode(mode).map(|m| m.to_string()))
-                {
-                    Ok(mode) => send_eval_ok(&format!("javastealth={}", mode)),
-                    Err(e) => send_eval_err(&format!("javastealth failed: {}", e)),
-                }
-            });
+            dispatch_js_task(move || set_java_stealth_and_respond(mode));
         }
         #[cfg(feature = "quickjs")]
         Some("artinit") => {
@@ -356,10 +428,28 @@ fn process_cmd(command: &str) {
             });
         }
         #[cfg(feature = "quickjs")]
-        Some("jsinit") => dispatch_js_task(|| match quickjs_loader::init() {
-            Ok(_) => send_eval_ok("initialized"),
-            Err(e) => send_eval_err(&e),
-        }),
+        Some("jsinit") => dispatch_js_task(init_js_and_respond),
+        #[cfg(feature = "quickjs")]
+        Some("loadjs_init") => {
+            let rest = command
+                .strip_prefix("loadjs_init ")
+                .or_else(|| command.strip_prefix("loadjs_init\n"))
+                .or_else(|| command.strip_prefix("loadjs_init"))
+                .unwrap_or("");
+            let (filename, script) = parse_loadjs_payload(rest);
+            let filename = filename.to_string();
+            let script = script.to_string();
+            dispatch_js_task(move || init_eval_and_respond(&script, &filename));
+        }
+        #[cfg(feature = "quickjs")]
+        Some("jsworker_stop") => {
+            let dropped = JS_WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
+            if dropped {
+                send_eval_ok("jsworker_stopped");
+            } else {
+                send_eval_ok("jsworker_not_running");
+            }
+        }
         // javainit: 延迟 JNI 初始化（spawn 模式 resume 后调用）
         // AttachCurrentThread + cache reflect IDs
         #[cfg(feature = "quickjs")]

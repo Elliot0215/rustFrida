@@ -19,6 +19,8 @@ pub(crate) struct Session {
     pub(crate) rpc_state: SyncChannel<Result<String, String>>,
     /// 串行化并发 RPC 调用：rpc_state 是单槽 channel，多个请求并发会互相覆盖
     pub(crate) rpc_lock: Mutex<()>,
+    pub(crate) loader_ctx_addr: std::sync::atomic::AtomicU64,
+    pub(crate) agent_current_thread_eval_impl: std::sync::atomic::AtomicU64,
     pub(crate) connected: AtomicBool,
     pub(crate) disconnected: AtomicBool,
     pub(crate) failed: AtomicBool,
@@ -35,10 +37,18 @@ impl Session {
             complete_state: SyncChannel::new(),
             rpc_state: SyncChannel::new(),
             rpc_lock: Mutex::new(()),
+            loader_ctx_addr: std::sync::atomic::AtomicU64::new(0),
+            agent_current_thread_eval_impl: std::sync::atomic::AtomicU64::new(0),
             connected: AtomicBool::new(false),
             disconnected: AtomicBool::new(false),
             failed: AtomicBool::new(false),
         }
+    }
+
+    pub(crate) fn set_remote_agent_info(&self, loader_ctx_addr: u64, current_thread_eval_impl: u64) {
+        self.loader_ctx_addr.store(loader_ctx_addr, Ordering::Release);
+        self.agent_current_thread_eval_impl
+            .store(current_thread_eval_impl, Ordering::Release);
     }
 
     /// 向 agent 派发 RPC 调用并等待结果。

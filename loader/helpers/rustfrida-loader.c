@@ -152,11 +152,13 @@ typedef struct {
 
   /* rustFrida extensions */
   uint64_t string_table_addr;  /* Remote StringTable address for agent */
+  const char * agent_current_thread_eval;
 
   /* Runtime state (filled by loader) */
   pthread_t worker;
   void * agent_handle;
   void * agent_entrypoint_impl;
+  void * agent_current_thread_eval_impl;
 } RustFridaLoaderContext;
 
 /*
@@ -1326,6 +1328,7 @@ frida_main (void * user_data)
     ctx->agent_entrypoint_impl = rustfrida_find_export (&agent_module, ctx->agent_entrypoint);
     if (ctx->agent_entrypoint_impl == NULL)
       goto dlsym_failed;
+    ctx->agent_current_thread_eval_impl = rustfrida_find_export (&agent_module, ctx->agent_current_thread_eval);
 
     ctx->agent_handle = (void *) agent_module.base;
   }

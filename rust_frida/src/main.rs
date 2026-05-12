@@ -8,6 +8,7 @@ mod logger;
 mod proc_mem;
 mod process;
 mod props;
+mod remote_agent;
 mod repl;
 mod selinux;
 mod server;
@@ -32,13 +33,15 @@ use clap::Parser;
 #[cfg(feature = "qbdi")]
 use communication::send_qbdi_helper;
 use communication::{send_command, start_socketpair_handler};
-use injection::{inject_via_bootstrapper, watch_and_inject};
+use injection::{inject_via_bootstrapper, watch_and_inject, InjectionResult};
 use process::find_pid_by_name;
-use repl::{load_script_file, print_eval_result, print_help, run_js_repl, CommandCompleter};
+use repl::{
+    load_script_file, load_script_file_pre_resume, print_eval_result, print_help, run_js_repl, CommandCompleter,
+    PreResumeLoad,
+};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use session::{Session, SessionManager};
-use std::os::unix::io::RawFd;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use types::get_string_table_names;
@@ -178,12 +181,12 @@ fn main() {
     }
 
     // 根据参数选择注入方式，返回 (target_pid, host_fd)
-    let (target_pid, host_fd): (Option<i32>, RawFd) = if let Some(ref package) = args.spawn {
+    let (target_pid, injection): (Option<i32>, InjectionResult) = if let Some(ref package) = args.spawn {
         // Spawn 模式：注册信号处理函数，确保 Ctrl+C 时还原 Zygote patch
         spawn::register_cleanup_handler();
         // Spawn 模式：注入 Zygote 后启动 App
         match spawn::spawn_and_inject(package, &string_overrides) {
-            Ok((pid, fd)) => (Some(pid), fd),
+            Ok((pid, result)) => (Some(pid), result),
             Err(e) => {
                 log_error!("Spawn 注入失败: {}", e);
                 spawn::cleanup_zygote_patches();
@@ -196,7 +199,7 @@ fn main() {
             log_warn!("SELinux patch 失败（非致命）: {}", e);
         }
         match watch_and_inject(so_pattern, args.timeout, &string_overrides) {
-            Ok(fd) => (resolved_pid, fd),
+            Ok(result) => (Some(result.target_pid), result),
             Err(e) => {
                 log_error!("注入失败: {}", e);
                 std::process::exit(1);
@@ -209,7 +212,7 @@ fn main() {
             log_warn!("SELinux patch 失败（非致命）: {}", e);
         }
         match inject_via_bootstrapper(pid, &string_overrides) {
-            Ok(fd) => (Some(pid), fd),
+            Ok(result) => (Some(pid), result),
             Err(e) => {
                 log_error!("注入失败: {}", e);
                 std::process::exit(1);
@@ -234,9 +237,10 @@ fn main() {
     if let Some(pid) = target_pid {
         session.pid.store(pid, Ordering::Relaxed);
     }
+    session.set_remote_agent_info(injection.loader_ctx_addr, injection.agent_current_thread_eval_impl);
 
     // 启动 socketpair handler（在 host_fd 上读写）
-    let _handle = start_socketpair_handler(host_fd, session.clone());
+    let _handle = start_socketpair_handler(injection.host_fd, session.clone());
 
     // 等待 agent 连接，默认超时 30s（可通过 --connect-timeout 调整）
     {
@@ -310,8 +314,9 @@ fn main() {
             }
             if let Some(script_path) = &args.load_script {
                 log_info!("子进程暂停中，准备加载脚本");
-                if let Err(e) = load_script_file(&session, script_path, false) {
-                    log_error!("{}", e);
+                match load_script_file_pre_resume(&session, script_path) {
+                    Ok(PreResumeLoad::Loaded) => {}
+                    Err(e) => log_error!("{}", e),
                 }
             }
             // resume: hook 已就位，恢复子进程
