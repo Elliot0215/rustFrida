@@ -425,6 +425,10 @@ fn find_module_by_address(addr: u64) -> Option<ModuleInfo> {
     try_find_module_by_address_in_cache(addr).or_else(|| refresh_and_find_module_by_address(addr))
 }
 
+pub(crate) fn is_address_in_loaded_module(addr: u64) -> bool {
+    find_module_by_address(addr).is_some()
+}
+
 fn collect_module_ranges<'a>(entries: impl IntoIterator<Item = &'a ModuleMapEntry>) -> Vec<AggregatedModuleRange> {
     let mut module_indices: HashMap<&str, usize> = HashMap::new();
     let mut modules: Vec<AggregatedModuleRange> = Vec::new();

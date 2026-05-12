@@ -258,7 +258,7 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
 
     let orig_called = pop_native_hook_frame(ctx_ptr, trampoline);
 
-    // Fallback: if the JS callback was skipped (engine busy) or threw an exception,
+    // Fallback: if the JS callback threw an exception before producing a result,
     // treat the hook as transparent and invoke the original function.
     if !result_was_set && trampoline != 0 && !orig_called {
         (*ctx_ptr).x[0] = hook_ffi::hook_invoke_trampoline(ctx_ptr, trampoline as *mut std::ffi::c_void);

@@ -29,7 +29,7 @@ unsafe fn module_info_to_js(ctx: *mut ffi::JSContext, m: &ModuleInfo) -> ffi::JS
 
 /// Module.findExportByName(moduleName, symbolName) → NativePointer | null
 ///
-/// moduleName == null → dlsym(RTLD_DEFAULT, symbolName)
+/// moduleName == null → search all loaded modules through our ELF parser
 /// moduleName != null → module_dlsym(moduleName, symbolName)
 unsafe extern "C" fn js_module_find_export(
     ctx: *mut ffi::JSContext,
@@ -60,19 +60,7 @@ unsafe extern "C" fn js_module_find_export(
     };
 
     let addr: *mut std::ffi::c_void = if arg0.is_null() || arg0.is_undefined() {
-        // null module → search all loaded modules (跳过 RTLD_DEFAULT，soinfo 摘除后会崩溃)
-        let c_sym = CString::new(symbol_name.as_str()).unwrap();
-        let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
-        if let Some(api) = api {
-            (api.dlsym)(
-                libc::RTLD_DEFAULT as _,
-                c_sym.as_ptr() as *const i8,
-                std::ptr::null(),
-                api.trusted_caller,
-            )
-        } else {
-            std::ptr::null_mut()
-        }
+        find_export_in_loaded_modules(&symbol_name)
     } else {
         // Specific module
         let module_name = match arg0.to_string(ctx) {

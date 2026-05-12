@@ -361,7 +361,7 @@ unsafe extern "C" fn resolve_symbol(opaque: *mut c_void, name: *const c_char) ->
         }
     }
 
-    let addr = libc::dlsym(libc::RTLD_DEFAULT, name);
+    let addr = crate::jsapi::module::find_export_in_loaded_modules(symbol.as_ref());
     if !addr.is_null() {
         return addr;
     }
@@ -597,11 +597,7 @@ unsafe extern "C" fn js_cmodule(
         return obj;
     }
 
-    let data = Box::into_raw(Box::new(CModuleData {
-        state,
-        code,
-        map_size,
-    }));
+    let data = Box::into_raw(Box::new(CModuleData { state, code, map_size }));
     ffi::JS_SetOpaque(obj, data as *mut c_void);
 
     let mut symbols: Vec<(String, u64)> = Vec::new();

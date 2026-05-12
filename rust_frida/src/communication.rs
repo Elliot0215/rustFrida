@@ -24,6 +24,7 @@ const FRAME_KIND_EVAL_OK: u8 = 0x83;
 const FRAME_KIND_EVAL_ERR: u8 = 0x84;
 const FRAME_KIND_RPC_OK: u8 = 0x85;
 const FRAME_KIND_RPC_ERR: u8 = 0x86;
+const FRAME_KIND_BYE: u8 = 0x87;
 
 #[derive(Clone)]
 pub(crate) enum HostToAgentMessage {
@@ -235,6 +236,10 @@ fn handle_socket_connection(stream: UnixStream, session: Arc<Session>) {
                             );
                         }
                     }
+                }
+                FRAME_KIND_BYE => {
+                    session.disconnected.store(true, Ordering::Release);
+                    break;
                 }
                 other => {
                     log_error!("未知 agent frame kind: {}", other);

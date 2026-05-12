@@ -474,7 +474,7 @@ unsafe fn autobox_primitive_to_jobject(
 /// 2-ArtMethod 模型: 直接用原始 ArtMethod 地址作为 JNI method ID，
 /// 无需 clone，declaring_class_ 由 GC 自动维护。
 ///
-/// Shared by `js_call_original` (JS callback) and fallback path (JS engine busy).
+/// Shared by `js_call_original` (JS callback) and defensive original-call paths.
 /// Returns the raw u64 return value for writing to HookContext.x[0].
 /// For void methods, returns 0.
 /// app 原方法抛的 Java 异常 **不 clear, 不 take** — 保留 pending 在 JNIEnv,

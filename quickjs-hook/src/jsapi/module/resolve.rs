@@ -70,8 +70,8 @@ unsafe fn get_libart_handle() -> *mut std::ffi::c_void {
 
 /// Get a dlopen handle to an arbitrary module via unrestricted linker API.
 ///
-/// hide_soinfo 摘除 agent soinfo 后，libc::dlopen 会导致 linker 内部空指针崩溃，
-/// 因此跳过 standard dlopen fast path，直接走 unrestricted API。
+/// This is kept only for APIs that still need to load a new shared object
+/// (Module.load/QBDI/JVMTI). Symbol lookup paths below intentionally avoid it.
 unsafe fn module_dlopen(module_name: &str) -> *mut std::ffi::c_void {
     let c_name = CString::new(module_name).unwrap();
 
@@ -105,17 +105,10 @@ unsafe fn module_dlopen(module_name: &str) -> *mut std::ffi::c_void {
     std::ptr::null_mut()
 }
 
-/// Resolve a symbol from an arbitrary module, bypassing linker namespace restrictions.
-///
-/// **Primary path**: directly parse the module's ELF `.symtab`/`.dynsym` from disk.
-/// This bypasses the linker's namespace machinery entirely (which can silently
-/// return NULL for cross-namespace `dlopen("libc.so", RTLD_NOLOAD)` on modern
-/// Android even though the library is loaded).
-///
-/// **Fallback**: unrestricted linker `__loader_dlopen` + `__loader_dlvsym` for
-/// modules whose backing file is not on disk (memfd, synthetic modules).
+/// Resolve a symbol from an arbitrary loaded module by parsing ELF metadata.
+/// This bypasses the system linker entirely: no dlopen, dlsym, dladdr, or
+/// __loader_* entrypoints are called on the lookup path.
 pub(crate) unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::ffi::c_void {
-    // Primary: direct ELF symbol lookup from disk file.
     if let Some((path, base)) = find_module_path_and_base(module_name) {
         let syms = elf_module_find_symbols(&path, base, &[symbol]);
         if let Some(&addr) = syms.get(symbol) {
@@ -123,26 +116,24 @@ pub(crate) unsafe fn module_dlsym(module_name: &str, symbol: &str) -> *mut std::
         }
     }
 
-    // Fallback: unrestricted linker dlopen + dlvsym.
-    // hide_soinfo 摘除 agent soinfo 后 libc::dlsym(RTLD_DEFAULT) 会崩溃，
-    // 因此跳过 fast path 直接走 unrestricted API。
-    let c_sym = CString::new(symbol).unwrap();
-    let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
-    if let Some(api) = api {
-        let handle = module_dlopen(module_name);
-        if !handle.is_null() {
-            let addr = (api.dlsym)(
-                handle,
-                c_sym.as_ptr() as *const i8,
-                std::ptr::null(),
-                api.trusted_caller,
-            );
-            if !addr.is_null() {
-                return addr;
-            }
+    std::ptr::null_mut()
+}
+
+/// Resolve a symbol across all loaded modules by parsing each module's ELF.
+/// This is our RTLD_DEFAULT replacement for JS Module.findExportByName(null,...)
+/// and CModule unresolved imports.
+pub(crate) unsafe fn find_export_in_loaded_modules(symbol: &str) -> *mut std::ffi::c_void {
+    let modules = enumerate_modules_from_maps();
+    let mut seen = HashSet::new();
+    for module in &modules {
+        if !seen.insert(module.path.clone()) {
+            continue;
+        }
+        let syms = elf_module_find_symbols(&module.path, module.base, &[symbol]);
+        if let Some(&addr) = syms.get(symbol) {
+            return addr as *mut std::ffi::c_void;
         }
     }
-
     std::ptr::null_mut()
 }
 
@@ -272,28 +263,24 @@ pub(crate) unsafe fn memfd_dlopen_with_flags(name: &str, fd: i32, flags: i32) ->
     std::ptr::null_mut()
 }
 
-/// Resolve a symbol from libart.so, bypassing linker namespace restrictions.
-///
-/// hide_soinfo 摘除 agent soinfo 后，libc::dlsym(RTLD_DEFAULT) 会导致 linker
-/// 内部空指针崩溃，因此跳过 fast path，直接走 unrestricted dlvsym。
+/// Resolve a symbol from libart.so by parsing ELF metadata.
 pub(crate) unsafe fn libart_dlsym(name: &str) -> *mut std::ffi::c_void {
-    let c_sym = CString::new(name).unwrap();
+    let &(libart_base, _) = LIBART_RANGE.get_or_init(probe_libart_range);
+    if libart_base == 0 {
+        return std::ptr::null_mut();
+    }
 
-    // 直接走 unrestricted dlvsym（跳过 RTLD_DEFAULT fast path）
-    let api = UNRESTRICTED_LINKER_API.get_or_init(|| init_unrestricted_linker_api());
-    if let Some(api) = api {
-        let handle = get_libart_handle();
-        if !handle.is_null() {
-            let addr = (api.dlsym)(
-                handle,
-                c_sym.as_ptr() as *const i8,
-                std::ptr::null(),
-                api.trusted_caller,
-            );
-            if !addr.is_null() {
-                return addr;
-            }
-        }
+    let path = match LIBART_PATH.get() {
+        Some(Some(path)) => path.clone(),
+        _ => match find_module_path_and_base("libart.so") {
+            Some((path, _)) => path,
+            None => return std::ptr::null_mut(),
+        },
+    };
+
+    let syms = elf_module_find_symbols(&path, libart_base, &[name]);
+    if let Some(&addr) = syms.get(name) {
+        return addr as *mut std::ffi::c_void;
     }
 
     std::ptr::null_mut()
@@ -316,20 +303,13 @@ pub(crate) fn is_in_libart(addr: u64) -> bool {
         return false;
     }
     let &(start, end) = LIBART_RANGE.get_or_init(probe_libart_range);
-    if start == 0 && end == 0 {
-        unsafe {
-            let mut info: libc::Dl_info = std::mem::zeroed();
-            if libc::dladdr(addr as *const std::ffi::c_void, &mut info) != 0 {
-                if !info.dli_fname.is_null() {
-                    let name = std::ffi::CStr::from_ptr(info.dli_fname).to_bytes();
-                    return name.windows(9).any(|w| w == b"libart.so");
-                }
-            }
-            false
-        }
-    } else {
-        addr >= start && addr < end
+    if start != 0 || end != 0 {
+        return addr >= start && addr < end;
     }
+
+    find_module_by_address(addr)
+        .map(|module| module.name == "libart.so" || module.path.ends_with("/libart.so"))
+        .unwrap_or(false)
 }
 
 // ============================================================================

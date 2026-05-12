@@ -242,8 +242,7 @@ pub(crate) unsafe extern "C" fn js_call_native(
     }
 
     if !is_cmodule_code_address(addr) {
-        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
-        if unsafe { libc::dladdr(addr as *const std::ffi::c_void, &mut info) } == 0 {
+        if !crate::jsapi::module::is_address_in_loaded_module(addr) {
             return ffi::JS_ThrowRangeError(
                 ctx,
                 b"callNative() address is not in an executable segment\0".as_ptr() as *const _,

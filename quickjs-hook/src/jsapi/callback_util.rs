@@ -174,18 +174,10 @@ impl Drop for JsEngineCallbackGuard {
 
 /// Acquire JS_ENGINE lock for a hook callback.
 ///
-/// Same-thread reentrant callbacks短路返回（当前线程已持有引擎）。
-/// 其他线程: try_lock 非阻塞尝试。拿不到立即返回 None → 调用方走 fallback
-/// (invoke_original_jni，不进 JS callback)。
-///
-/// 为什么不能用阻塞 lock:
-///   Rust Mutex::lock 在 POSIX futex 上阻塞，不参与 ART GC safepoint。
-///   当 JS_ENGINE 持有者执行 $orig → CallNonvirtual*MethodA → ART 需要 GC →
-///   GC STW 要求所有 mutator 到达 safepoint → 阻塞在 Rust Mutex 的线程
-///   无法响应 → GC 死等 → 持有者也在 GC 里等 → 死锁。
-///
-/// try_lock fallback 的代价: 高并发 hook 时部分调用跳过 JS callback 直接走原方法。
-/// 对 HashMap.put 类热点方法这是可接受的 — 不丢功能，只丢少量观测。
+/// Same-thread reentrant callbacks reuse the current JS engine owner context.
+/// Other threads block until the global JS engine is available. JS callbacks are
+/// not a high-frequency path; if a user installs one, it must run instead of
+/// being silently bypassed.
 pub(crate) unsafe fn acquire_js_engine_for_callback(
     ctx: *mut ffi::JSContext,
     _context_name: &str,
@@ -198,10 +190,9 @@ pub(crate) unsafe fn acquire_js_engine_for_callback(
         return Some(JsEngineCallbackGuard::Reentrant);
     }
 
-    let g = match crate::JS_ENGINE.try_lock() {
+    let g = match crate::JS_ENGINE.lock() {
         Ok(g) => g,
-        Err(std::sync::TryLockError::WouldBlock) => return None,
-        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(e) => e.into_inner(),
     };
     crate::mark_js_engine_owner_current_thread();
     ffi::qjs_update_stack_top(ctx);

@@ -203,6 +203,8 @@ typedef struct {
   const uint32_t * gnu_hash;
   size_t nsyms;
   RustFridaSymbolResolver resolver;
+  bool initialized;
+  bool finalized;
   char error[160];
 } RustFridaLinkedModule;
 
@@ -225,6 +227,7 @@ static void frida_enable_close_on_exec (int fd, const FridaLibcApi * libc);
 
 static bool rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule * module);
 static void * rustfrida_find_export (RustFridaLinkedModule * module, const char * symbol);
+static void rustfrida_close_module (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static void rustfrida_unmap_module (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static bool rustfrida_build_symbol_resolver (RustFridaLinkedModule * module, const FridaLibcApi * libc);
 static void rustfrida_set_error (RustFridaLinkedModule * module, const FridaLibcApi * libc, const char * message);
@@ -913,29 +916,91 @@ rustfrida_protect_relro (RustFridaLinkedModule * module, const FridaLibcApi * li
 }
 
 static void
-rustfrida_call_init_array (RustFridaLinkedModule * module)
+rustfrida_call_init_functions (RustFridaLinkedModule * module)
 {
   ElfW(Dyn) * dyn;
+  void (* init_func) (void) = NULL;
   void (** init_array) (void) = NULL;
   size_t init_array_size = 0;
   size_t i;
 
   for (dyn = module->dynamic; dyn != NULL && dyn->d_tag != DT_NULL; dyn++)
   {
-    if (dyn->d_tag == DT_INIT_ARRAY)
-      init_array = (void (**) (void)) (module->base + dyn->d_un.d_ptr);
-    else if (dyn->d_tag == DT_INIT_ARRAYSZ)
-      init_array_size = dyn->d_un.d_val;
+    switch (dyn->d_tag)
+    {
+      case DT_INIT:
+        init_func = (void (*) (void)) (module->base + dyn->d_un.d_ptr);
+        break;
+      case DT_INIT_ARRAY:
+        init_array = (void (**) (void)) (module->base + dyn->d_un.d_ptr);
+        break;
+      case DT_INIT_ARRAYSZ:
+        init_array_size = dyn->d_un.d_val;
+        break;
+      default:
+        break;
+    }
   }
 
-  if (init_array == NULL || init_array_size == 0)
-    return;
+  if (init_func != NULL)
+    init_func ();
 
-  for (i = 0; i != init_array_size / sizeof (init_array[0]); i++)
+  if (init_array != NULL && init_array_size != 0)
   {
-    if (init_array[i] != NULL)
-      init_array[i] ();
+    for (i = 0; i != init_array_size / sizeof (init_array[0]); i++)
+    {
+      if (init_array[i] != NULL)
+        init_array[i] ();
+    }
   }
+
+  module->initialized = true;
+}
+
+static void
+rustfrida_call_fini_functions (RustFridaLinkedModule * module)
+{
+  ElfW(Dyn) * dyn;
+  void (* fini_func) (void) = NULL;
+  void (** fini_array) (void) = NULL;
+  size_t fini_array_size = 0;
+  size_t count;
+
+  if (!module->initialized || module->finalized)
+    return;
+  module->finalized = true;
+
+  for (dyn = module->dynamic; dyn != NULL && dyn->d_tag != DT_NULL; dyn++)
+  {
+    switch (dyn->d_tag)
+    {
+      case DT_FINI:
+        fini_func = (void (*) (void)) (module->base + dyn->d_un.d_ptr);
+        break;
+      case DT_FINI_ARRAY:
+        fini_array = (void (**) (void)) (module->base + dyn->d_un.d_ptr);
+        break;
+      case DT_FINI_ARRAYSZ:
+        fini_array_size = dyn->d_un.d_val;
+        break;
+      default:
+        break;
+    }
+  }
+
+  if (fini_array != NULL && fini_array_size != 0)
+  {
+    count = fini_array_size / sizeof (fini_array[0]);
+    while (count != 0)
+    {
+      void (* fini) (void) = fini_array[--count];
+      if (fini != NULL)
+        fini ();
+    }
+  }
+
+  if (fini_func != NULL)
+    fini_func ();
 }
 
 static void
@@ -1200,7 +1265,7 @@ rustfrida_link_agent (int fd, const FridaLibcApi * libc, RustFridaLinkedModule *
   if (!rustfrida_protect_relro (module, libc))
     goto fail;
 
-  rustfrida_call_init_array (module);
+  rustfrida_call_init_functions (module);
   return true;
 
 fail:
@@ -1243,6 +1308,13 @@ rustfrida_find_export (RustFridaLinkedModule * module, const char * symbol)
 }
 
 static void
+rustfrida_close_module (RustFridaLinkedModule * module, const FridaLibcApi * libc)
+{
+  rustfrida_call_fini_functions (module);
+  rustfrida_unmap_module (module, libc);
+}
+
+static void
 rustfrida_unmap_module (RustFridaLinkedModule * module, const FridaLibcApi * libc)
 {
   if (module->load_start != 0 && module->load_end > module->load_start)
@@ -1251,6 +1323,9 @@ rustfrida_unmap_module (RustFridaLinkedModule * module, const FridaLibcApi * lib
     module->load_start = 0;
     module->load_end = 0;
     module->base = 0;
+    module->dynamic = NULL;
+    module->phdrs = NULL;
+    module->phdr_count = 0;
   }
 }
 
@@ -1270,12 +1345,7 @@ frida_main (void * user_data)
 
   frida_memset (&agent_module, 0, sizeof (agent_module));
   thread_id = frida_gettid ();
-  /* RESIDENT: agent.so 常驻进程内。hide_soinfo 从 linker solist 摘了自己 —
-   * dlclose 会走 "soinfo 不在 list / double unload" 路径 abort, 需要额外
-   * unhide_from_solist + solist_add_soinfo. 实测 solist_add 对已 remove 的
-   * soinfo 直接 SEGV (sonext 语义差异), 暂不 dlclose。Agent 内存 ~3MB 常驻;
-   * 同进程 re-inject 依赖 memfd 新 inode 让 linker 创建第二实例. */
-  unload_policy = FRIDA_UNLOAD_POLICY_RESIDENT;
+  unload_policy = FRIDA_UNLOAD_POLICY_IMMEDIATE;
   ctrlfd = -1;
   agent_codefd = -1;
   agent_ctrlfd = -1;
@@ -1364,7 +1434,9 @@ frida_main (void * user_data)
     /* hello_entry blocks in the agent command loop */
     entry (&args);
 
-    /* Agent returned — close the REPL fd (agent may have already closed it) */
+    /* Agent returned — close the REPL fd so the host observes EOF before dlclose. */
+    if (agent_ctrlfd != -1)
+      frida_raw_close (agent_ctrlfd);
     agent_ctrlfd = -1;
   }
 
@@ -1388,17 +1460,23 @@ dlsym_failed:
   }
 beach:
   {
-    if (unload_policy == FRIDA_UNLOAD_POLICY_IMMEDIATE && ctx->agent_handle != NULL)
-      rustfrida_unmap_module (&agent_module, libc);
+    if (agent_module.load_start != 0)
+    {
+      void * module_handle = (void *) agent_module.base;
+      rustfrida_close_module (&agent_module, libc);
+      if (ctx->agent_handle == module_handle)
+      {
+        ctx->agent_handle = NULL;
+        ctx->agent_entrypoint_impl = NULL;
+        ctx->agent_current_thread_eval_impl = NULL;
+      }
+    }
 
     if (agent_ctrlfd != -1)
       frida_raw_close (agent_ctrlfd);
 
     if (agent_codefd != -1)
       frida_raw_close (agent_codefd);
-
-    if (ctx->agent_handle == NULL)
-      rustfrida_unmap_module (&agent_module, libc);
 
     if (ctrlfd != -1)
     {

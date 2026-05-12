@@ -32,13 +32,14 @@ mod quickjs_loader;
 mod stalker;
 
 use crate::communication::{
-    flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, read_frame, register_stream_fd, send_complete,
-    send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_stream, start_log_writer,
-    write_stream, GLOBAL_STREAM,
+    flush_cached_logs, is_cmd_frame, is_qbdi_helper_frame, log_msg, read_frame, register_stream_fd, send_bye,
+    send_complete, send_eval_err, send_eval_ok, send_hello, send_rpc_err, send_rpc_ok, shutdown_log_writer,
+    shutdown_stream, start_log_writer, write_stream, GLOBAL_STREAM,
 };
 use crate::crash_handler::install_panic_hook;
 use libc::{kill, pid_t, SIGSTOP};
 use std::ffi::c_void;
+use std::os::fd::AsRawFd;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net::UnixStream;
 use std::process;
@@ -104,6 +105,8 @@ static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 pub static OUTPUT_PATH: OnceLock<String> = OnceLock::new();
 type AgentTask = Box<dyn FnOnce() + Send + 'static>;
 static JS_WORKER_TX: Mutex<Option<mpsc::Sender<AgentTask>>> = Mutex::new(None);
+#[cfg(feature = "quickjs")]
+static JS_WORKER_STOPPED: AtomicBool = AtomicBool::new(true);
 
 /// 注入参数结构体（与 rust_frida/src/types.rs 和 loader.c 完全一致）
 #[repr(C)]
@@ -181,12 +184,19 @@ pub extern "C" fn hello_entry(args_ptr: *mut c_void) -> *mut c_void {
             }
         }
     }
+    cleanup_agent_runtime_for_unload();
+    #[cfg(feature = "quickjs")]
+    stop_js_worker_for_unload();
+    shutdown_log_writer();
+    send_bye();
     // 关闭 socket，host 收到 EOF 自然退出
+    let reader_fd = reader.as_raw_fd();
     shutdown_stream();
-
-    // 不调 unhide_from_solist: loader 走 RESIDENT 不 dlclose, 不需要恢复;
-    // 实测 solist_add_soinfo 对已 remove 的 soinfo SEGV (sonext 语义冲突)。
-    // 留着函数, 未来对接可 dlclose 的方案时再启用。
+    unsafe {
+        libc::shutdown(reader_fd, libc::SHUT_RDWR);
+        libc::close(reader_fd);
+    }
+    std::mem::forget(reader);
 
     null_mut()
 }
@@ -335,13 +345,16 @@ where
         let mut guard = JS_WORKER_TX.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             let (tx, rx) = mpsc::channel::<AgentTask>();
+            JS_WORKER_STOPPED.store(false, Ordering::Release);
             match raw_thread::spawn_detached(b"wwb-js\0", move || {
                 while let Ok(task) = rx.recv() {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
                 }
+                JS_WORKER_STOPPED.store(true, Ordering::Release);
             }) {
                 Ok(_) => *guard = Some(tx),
                 Err(e) => {
+                    JS_WORKER_STOPPED.store(true, Ordering::Release);
                     send_eval_err(&format!("[quickjs] JS worker 启动失败: {}", e));
                     return;
                 }
@@ -353,6 +366,24 @@ where
     if sender.send(Box::new(task)).is_err() {
         send_eval_err("[quickjs] JS worker 已退出");
     }
+}
+
+#[cfg(feature = "quickjs")]
+fn stop_js_worker_for_unload() {
+    let dropped = JS_WORKER_TX.lock().unwrap_or_else(|e| e.into_inner()).take().is_some();
+    if dropped {
+        while !JS_WORKER_STOPPED.load(Ordering::Acquire) {
+            raw_thread::sleep_ms(10);
+        }
+    }
+}
+
+fn cleanup_agent_runtime_for_unload() {
+    #[cfg(feature = "quickjs")]
+    if quickjs_loader::is_initialized() {
+        quickjs_loader::cleanup();
+    }
+    crash_handler::uninstall_crash_handlers();
 }
 
 fn process_cmd(command: &str) {
@@ -603,11 +634,7 @@ fn process_cmd(command: &str) {
         // shutdown — 先完整清理并输出日志，最后由 agent 主动关闭 socket
         Some("shutdown") => {
             log_msg("收到 shutdown，开始退出清理\n".to_string());
-            #[cfg(feature = "quickjs")]
-            if quickjs_loader::is_initialized() {
-                quickjs_loader::cleanup();
-            }
-            crash_handler::uninstall_crash_handlers();
+            cleanup_agent_runtime_for_unload();
             log_msg("退出清理完成，准备关闭 socket\n".to_string());
             SHOULD_EXIT.store(true, Ordering::Relaxed);
         }

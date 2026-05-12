@@ -348,11 +348,9 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         },
     );
 
-    // 兜底: JS engine busy (try_lock failed) 或其他原因导致 callback 未执行 →
-    // 调用原方法保持正确语义 (不能返回 0/null，HashMap.put 等需要正确返回值)
+    // 兜底: JS 异常路径应已通过 on_js_exception 设置返回值；如果 registry/context
+    // 异常导致没有返回值，调用原方法保持正确语义。
     let _ = had_js_exception;
-    // fallback: try_lock 失败 → 直接调原方法，不做 NewLocalRef
-    // (从 callback 入口到这里没有 GC 触发点，transition ref 仍然有效)
     if !result_was_set.get() {
         let env = hook_ctx_env;
         if native_entry_trampoline != 0 {
